@@ -290,11 +290,12 @@ class LlamaAttentionExperimental(nn.Module):
 
                         self.final_mask_investigate = final_mask
                         attn_weights = attn_weights + attention_mask
-                        # if q_len == 1:
+                        
                         # During train-time, we want to keep this off, all our train-evals are 1 decode step focused
                         # not generation focused. So, we still want to assess prefill sparsity. 
                         # However, at inference time (generation), we should only use mask_tensor
                         # when q_len == 1
+                        # if q_len == 1:
                         attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)

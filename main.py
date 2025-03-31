@@ -865,7 +865,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_seqlen', type=int, default=512)
     parser.add_argument('--train_batch_size', type=int, default=1)
     parser.add_argument('--train_subset_fac', type=int, default=None)
-    parser.add_argument('--max_norm', type=int, default=20, help='Max Norm')
+    parser.add_argument('--max_norm', type=int, default=100, help='Max Norm')
     parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
 
     # Evaluation Related Arguments

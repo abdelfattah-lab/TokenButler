@@ -1,6 +1,10 @@
 # TokenButler: Token Importance Is Predictable
 
-This project is still WIP and under improvement. Please checkout commit `d94fc426990089c351d062eb65005da2a8d115a2` for functional code!
+This project is still WIP and under improvement. 
+
+For reproducing prefill-style TokenButler paper results: Please checkout commit `d94fc426990089c351d062eb65005da2a8d115a2` for reproducing results from paper; note that the commit-id will work only for prefill tests due to decoding bug.
+
+For better models that function with decode as well -- current main commit is best! The drive link for the latest Llama-class TokenButler models: [TokenButler_Models_31Mar.zip](https://drive.google.com/file/d/1w2wq23dy7vNA5Dn7an-5kHeNTYtc3HKB/view?usp=drive_link). Further, the latest models are also available on huggingface!
 
 <div align="center">
   <img src="https://github.com/abdelfattah-lab/TokenButler/blob/main/figs/tokenbutlerlogo.png?raw=true" width="50%" alt="TokenButler" />
