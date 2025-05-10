@@ -78,6 +78,7 @@ class Qwen2AttentionExperimental(nn.Module):
 
         
     def update_predictor(self):
+        # import pdb; pdb.set_trace()
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
             intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
@@ -352,11 +353,11 @@ class Qwen2AttentionExperimental(nn.Module):
                     estimated_importance=head_importance_tensor,
                     true_importance=attn_head_weights,
                     top_k_ratio=0.5
+                )
         else:
             self.headmsemagn_loss = 0
             if self.calc_hitrates:
                 self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = 0, 0, 0
-                )
             
         if final_mask is not None:
             if self.effective_sparsity is None:

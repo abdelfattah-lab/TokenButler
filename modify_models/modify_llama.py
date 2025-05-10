@@ -26,6 +26,9 @@ from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, 
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
 
+def get_dynamic_cache():
+    return PredictorDynamicCache()
+
 # torch.backends.cuda.enable_flash_sdp(enabled=True)
 # torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
 

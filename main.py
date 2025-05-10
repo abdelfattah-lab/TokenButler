@@ -337,7 +337,6 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     """
     model.eval()
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
-
     # Use a subset of data if traintime_subset or args.eval_subset is specified
     try:
         if traintime_subset:
