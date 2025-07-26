@@ -1,8 +1,11 @@
 import argparse
 import time
 import torch
+import json
+import os
+import datetime
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import tqdm
 from torch.cuda.amp import autocast
 
@@ -99,11 +102,20 @@ def run_long_bench_evaluation(model, tokenizer, args):
     dataset2prompt = DATASET2PROMPT
     dataset2maxlen = DATASET2MAXLEN
 
+    # Create timestamped directory for saving predictions and answers
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join("results", timestamp)
+    os.makedirs(results_dir, exist_ok=True)
+    print(f"Results will be saved to {results_dir}")
+
     results = {}
     for dataset in datasets:
         print(f"Evaluating dataset: {dataset}")
         start_time = time.time()
-        data = load_dataset('THUDM/LongBench', dataset, split='test')
+        if args.eval_subset:
+            data = load_dataset('THUDM/LongBench', dataset, split='test[:5%]')
+        else:
+            data = load_dataset('THUDM/LongBench', dataset, split='test')
 
         prompt_format = dataset2prompt.get(dataset, "{text}")
         max_gen = dataset2maxlen.get(dataset, 256)
@@ -120,16 +132,56 @@ def run_long_bench_evaluation(model, tokenizer, args):
 
         predictions, answers, lengths = [], [], []
         all_classes = None
-        for pred in preds:
+        detailed_results = []
+        
+        for i, pred in enumerate(preds):
             predictions.append(pred["pred"])
             answers.append(pred["answers"])
             if "length" in pred:
                 lengths.append(pred["length"])
             all_classes = pred.get("all_classes", None)
+            
+            # Print prediction and answer
+            print(f"\nSample {i+1}:")
+            print(f"Prediction: {pred['pred']}")
+            print(f"Answer: {pred['answers']}")
+            
+            # Add to detailed results
+            detailed_results.append({
+                "sample_id": i,
+                "prediction": pred["pred"],
+                "answers": pred["answers"],
+                "length": pred.get("length", None)
+            })
+
+        # Save detailed results to file
+        results_file = os.path.join(results_dir, f"{dataset}_results.json")
+        with open(results_file, "w") as f:
+            json.dump(detailed_results, f, indent=2)
+        print(f"Detailed results saved to {results_file}")
 
         score = scorer(dataset, predictions, answers, all_classes)
         print(f"Dataset: {dataset} | Score: {score}")
         results[dataset] = score
+
+    # Write results to file
+    final_results_file = os.path.join(results_dir, "longbench_results.txt")
+    with open(final_results_file, "w") as f:
+        for dataset, score in results.items():
+            f.write(f"{dataset}: {score}\n")
+    print(f"Results saved to {final_results_file}")
+    # Copy the model2maxlen file into the results directory.
+    model2maxlen_path = "longbench_utils/config/model2maxlen.json"
+    if os.path.exists(model2maxlen_path):
+        os.system(f"cp {model2maxlen_path} {results_dir}")
+        print(f"Copied model2maxlen.json to {results_dir}")
+    
+    # Put a file with the command used to run the evaluation in the results directory.
+    command_file = os.path.join(results_dir, "command.txt")
+    with open(command_file, "w") as f:
+        f.write(" ".join(os.sys.argv))
+    print(f"Command used to run the evaluation saved to {command_file}")
+    
 
     return results
 
@@ -142,14 +194,32 @@ def main():
                         help="List of LongBench datasets to evaluate on (e.g. hotpot_qa, narrative_qa)")
     parser.add_argument("--eval_subset", action="store_true",
                         help="Whether to evaluate on a 1% subset for speed")
+    parser.add_argument('--model_parallelism', action='store_true', 
+                        help='Enable model parallelism')
+    parser.add_argument('--gpu', action='store_true', 
+                        help='Enable GPU usage')
 
     args = parser.parse_args()
 
     # Load model and tokenizer
     print(f"Loading model from {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True)
-    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    # config.constant_tokens = True
+    # config.token_sparse_method = "constant_1024tokens"
+    device_map = "auto" if (args.model_parallelism or args.gpu) else None
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        device_map=device_map,
+        low_cpu_mem_usage=True,
+    )
+
+    # Fallback for single-GPU / CPU runs when no device_map is used
+    if device_map is None and args.gpu:
+        model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     # Run evaluation
     results = run_long_bench_evaluation(model, tokenizer, args)
