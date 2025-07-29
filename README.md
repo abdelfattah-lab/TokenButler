@@ -2,7 +2,7 @@
 
 This project is still WIP and under improvement. 
 
-For reproducing prefill-style TokenButler paper results: Please checkout commit `d94fc426990089c351d062eb65005da2a8d115a2` for reproducing results from paper; note that the commit-id will work only for prefill tests due to decoding bug.
+For reproducing prefill-style TokenButler paper results: Please checkout commit `d94fc426990089c351d062eb65005da2a8d115a2` for reproducing results from paper; note that the commit-id will work only for prefill tests due to decoding bug. **When using the older commit for reproducing results, please download the old models from [Drive Link](https://drive.google.com/drive/folders/1psNZ1SU0LaZJ-x5MQGH59CzYSmeT4yRf?usp=sharing). (Newer models do not work with older commits, and vice versa)
 
 For better models that function with decode as well -- current main commit is best! The drive link for the latest Llama-class TokenButler models: [TokenButler_Models_31Mar.zip](https://drive.google.com/file/d/1w2wq23dy7vNA5Dn7an-5kHeNTYtc3HKB/view?usp=drive_link). Further, the latest models are also available on huggingface!
 
