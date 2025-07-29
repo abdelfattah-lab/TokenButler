@@ -29,10 +29,28 @@ import os, csv, hashlib
 # torch.backends.cuda.enable_flash_sdp(enabled=True)
 # torch.backends.cuda.enable_mem_efficient_sdp(enabled=True)
 
+# class LlamaAttentionExperimental(nn.Module):
+    # def __init__(self, config: LlamaConfig, producer=None, layer_idx=0):
+    
 class LlamaAttentionExperimental(nn.Module):
-    def __init__(self, config: LlamaConfig, producer=None, layer_idx=0):
+    """
+    `pred_source_layer` tells every instance which layer’s activations feed the
+    Token/Head‑importance predictors.  All *earlier* layers run fully‑dense
+    attention; the *source* layer itself is dense *and* produces importance
+    tensors; every layer *after* the source may sparsify.
+    """
+    def __init__(
+        self,
+        config: LlamaConfig,
+        *,
+        pred_source_layer: int = 0,
+        producer=None,
+        layer_idx: int = 0,
+    ):
+
         super().__init__()
         self.config = config
+
         self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
         self.num_heads = config.num_attention_heads
@@ -65,6 +83,12 @@ class LlamaAttentionExperimental(nn.Module):
         self.softmax_causal_loss_ce = False
         self.old_predictor = None
 
+        self.pred_source_layer = pred_source_layer
+
+        # Convenience flags used throughout
+        self.is_source_layer  = (self.layer_idx == self.pred_source_layer)
+        self.can_sparsify     = (self.layer_idx >  self.pred_source_layer)
+
         self.low_recall_first = {
             "meta-llama/Llama-3.1-8B": [(22, 2), (20, 2), (12, 10), (21, 2), (20, 16), (8, 17), (8, 5), (30, 15), (21, 29), (23, 16), (6, 10), (1, 8), (28, 15), (9, 5), (10, 5), (23, 2), (0, 16), (15, 19), (17, 15), (31, 10), (4, 26), (7, 27), (19, 31), (1, 15), (12, 19), (13, 10), (2, 15), (24, 20), (20, 14), (20, 29), (5, 10), (17, 30), (31, 6), (12, 27), (14, 19), (16, 29), (27, 9), (25, 17), (14, 2), (1, 16), (24, 6), (5, 27), (2, 25), (13, 27), (13, 19), (7, 26), (24, 17), (17, 17), (4, 19), (13, 20), (25, 2), (18, 30), (7, 10), (10, 17), (15, 26), (25, 20), (9, 8), (9, 17), (18, 29), (22, 29), (28, 10), (4, 18), (23, 18), (12, 11), (6, 20), (16, 17), (7, 24), (6, 13), (16, 30), (24, 24), (23, 20), (5, 13), (14, 20), (5, 11), (16, 31), (17, 13), (22, 18), (11, 5), (6, 27), (20, 18), (27, 24), (29, 10), (23, 24), (8, 26), (21, 16), (4, 13), (5, 5), (22, 14), (29, 15), (26, 24), (15, 22), (27, 17), (26, 20), (2, 11), (3, 15), (11, 8), (5, 24), (15, 20), (29, 11), (26, 13), (0, 19), (3, 13), (17, 19), (21, 21), (3, 25), (18, 26), (15, 2), (22, 7), (17, 29), (28, 11), (3, 10), (8, 8), (30, 21), (19, 29), (14, 22), (2, 6), (26, 6), (30, 14), (5, 20), (12, 26), (11, 21), (22, 21), (12, 30), (29, 21), (5, 25), (15, 30), (12, 22), (14, 10), (4, 9), (22, 27), (7, 9), (13, 22), (7, 11), (18, 13), (6, 18), (3, 7), (14, 30), (1, 12), (31, 13), (13, 26), (1, 19), (11, 30), (26, 22), (25, 7), (30, 30), (9, 16), (7, 7), (4, 14), (21, 30), (31, 14), (14, 26), (18, 14), (20, 30), (4, 27), (21, 7), (12, 25), (12, 2), (23, 27), (0, 8), (2, 13), (27, 13), (27, 6), (19, 19), (29, 8), (13, 23), (0, 22), (3, 30), (30, 11), (2, 10), (18, 15), (7, 5), (30, 31), (18, 24), (23, 22), (6, 11), (20, 21), (29, 26), (31, 21), (29, 4), (21, 13), (0, 25), (14, 23), (17, 14), (9, 18), (21, 31), (6, 25), (3, 8), (20, 27), (25, 9), (20, 20), (16, 24), (26, 16), (22, 24), (6, 7), (28, 6), (13, 11), (21, 18), (3, 19), (25, 24), (29, 17), (29, 14), (27, 27), (29, 22), (29, 30), (13, 25), (7, 25), (17, 24), (10, 8), (0, 13), (12, 9), (15, 28), (28, 22), (19, 13), (3, 9), (5, 23), (20, 13), (9, 13), (27, 28), (2, 19), (11, 13), (3, 11), (22, 23), (31, 26), (28, 18), (31, 22), (1, 22), (16, 15), (10, 12), (6, 26), (26, 17), (13, 9), (18, 8), (1, 13), (21, 27), (31, 8), (28, 28), (2, 22), (21, 17), (12, 23), (14, 12), (20, 24), (1, 9), (20, 23), (15, 25), (19, 4), (9, 26), (14, 25), (20, 22), (6, 22), (24, 7), (20, 31), (20, 11), (3, 16), (12, 1), (4, 25), (26, 11), (9, 29), (14, 31), (23, 29), (18, 16), (17, 8), (23, 14), (19, 18), (28, 8), (1, 3), (31, 9), (16, 20), (8, 13), (26, 27), (18, 20), (17, 31), (2, 29), (6, 23), (10, 13), (2, 20), (11, 31), (13, 28), (5, 14), (1, 10), (23, 21), (17, 9), (24, 27), (23, 17), (16, 18), (19, 9), (24, 26), (15, 9), (16, 19), (16, 26), (13, 14), (28, 17), (16, 13), (9, 6), (1, 18), (0, 17), (10, 26), (21, 9), (19, 16), (16, 28), (11, 26), (24, 23), (1, 20), (3, 18), (2, 28), (20, 4), (6, 19), (1, 5), (5, 22), (2, 9), (8, 16), (18, 10), (14, 11), (8, 18), (1, 21), (12, 13), (28, 21), (20, 3), (22, 5), (30, 18), (30, 29), (0, 23), (0, 4), (17, 27), (15, 11), (27, 11), (1, 11), (21, 4), (7, 23), (18, 19), (1, 4), (28, 26), (8, 11), (30, 13), (23, 9), (3, 14), (23, 7), (19, 10), (28, 14), (21, 5), (14, 8), (14, 9), (6, 24), (4, 24), (1, 14), (19, 14), (14, 13), (24, 16), (15, 15), (11, 29), (19, 27), (0, 26), (5, 19), (13, 13), (26, 2), (28, 27), (26, 23), (26, 8), (12, 3), (2, 17), (25, 21), (2, 16), (18, 27), (12, 20), (22, 15), (26, 25), (5, 29), (31, 18), (11, 16), (24, 28), (25, 3), (1, 24), (19, 2), (26, 15), (25, 16), (9, 19), (31, 27), (13, 30), (27, 31), (27, 19), (0, 24), (26, 7), (24, 11), (18, 18), (17, 5), (14, 29), (16, 4), (27, 29), (15, 13), (3, 23), (18, 11), (19, 15), (2, 26), (25, 15), (26, 30), (13, 21), (21, 22), (27, 30), (31, 30), (27, 23), (6, 6), (27, 10), (23, 10), (2, 8), (24, 5), (30, 20), (27, 16), (4, 23), (2, 23), (30, 8), (2, 14), (4, 30), (0, 3), (14, 28), (26, 29), (6, 5), (24, 21), (5, 9), (27, 7), (5, 26), (6, 2), (31, 17), (7, 14), (2, 21), (13, 17), (7, 30), (2, 18), (29, 29), (0, 14), (25, 6), (0, 30), (22, 3), (21, 15), (13, 15), (25, 30), (1, 17), (29, 31), (4, 31), (18, 23), (27, 8), (22, 1), (12, 8), (13, 18), (24, 30), (21, 10), (25, 11), (25, 23), (20, 5), (27, 21), (0, 9), (24, 29), (3, 27), (2, 24), (20, 25), (2, 30), (24, 14), (15, 14), (12, 29), (17, 20), (3, 26), (28, 30), (29, 6), (8, 22), (13, 7), (27, 20), (3, 28), (25, 22), (10, 16), (19, 20), (25, 26), (10, 29), (12, 28), (22, 31), (25, 19), (23, 5), (6, 29), (5, 16), (9, 23), (25, 27), (22, 11), (23, 13), (13, 31), (26, 10), (29, 19), (4, 11), (30, 27), (14, 17), (15, 29), (13, 2), (6, 14), (3, 20), (24, 19), (11, 23), (16, 9), (14, 6), (15, 7), (4, 29), (25, 14), (10, 4), (20, 9), (17, 28), (14, 18), (17, 25), (16, 14), (28, 9), (17, 18), (8, 21), (13, 29), (4, 20), (10, 20), (0, 27), (23, 15), (7, 1), (19, 24), (12, 14), (21, 11), (3, 29), (1, 23), (23, 11), (14, 15), (11, 15), (25, 8), (8, 25), (8, 12), (19, 28), (4, 5), (10, 23), (23, 19), (8, 4), (12, 18), (11, 11), (5, 30), (3, 22), (16, 27), (25, 28), (12, 4), (10, 25), (3, 24), (18, 28), (7, 20), (23, 31), (14, 3), (17, 10), (3, 6), (22, 25), (14, 14), (30, 22), (8, 10), (27, 26), (15, 27), (26, 21), (20, 6), (9, 11), (9, 20), (22, 6), (30, 26), (11, 24), (6, 30), (1, 29), (24, 10), (9, 1), (25, 29), (21, 24), (20, 26), (29, 9), (1, 30), (12, 21), (7, 16), (19, 26), (29, 28), (21, 23), (18, 9), (28, 19), (8, 30), (0, 28), (15, 21), (9, 7), (31, 20), (7, 8), (1, 28), (21, 14), (20, 19), (24, 8), (22, 22), (2, 1), (11, 20), (25, 25), (6, 12), (18, 5), (20, 10), (15, 4), (3, 4), (27, 3), (28, 29), (7, 31), (29, 1), (7, 29), (19, 25), (23, 1), (23, 28), (9, 30), (5, 15), (8, 23), (20, 28), (22, 17), (29, 12), (16, 7), (20, 15), (22, 19), (14, 21), (30, 28), (30, 9), (18, 3), (18, 17), (2, 27), (5, 7), (28, 13), (0, 29), (5, 12), (11, 18), (8, 31), (22, 9), (5, 18), (0, 11), (10, 22), (0, 18), (24, 15), (21, 28), (7, 12), (3, 21), (25, 10), (27, 25), (21, 6), (17, 26), (20, 1), (7, 13), (14, 27), (27, 22), (10, 7), (10, 24), (6, 9), (31, 31), (18, 25), (0, 10), (17, 6), (13, 3), (21, 19), (4, 22), (5, 31), (21, 12), (4, 12), (11, 28), (1, 27), (19, 8), (0, 20), (16, 8), (14, 1), (27, 14), (6, 4), (22, 10), (16, 25), (26, 28), (1, 2), (12, 24), (18, 1), (11, 12), (8, 28), (3, 2), (9, 25), (1, 25), (19, 17), (12, 17), (28, 1), (16, 21), (11, 19), (31, 12), (14, 24), (18, 21), (31, 19), (1, 26), (10, 31), (26, 26), (31, 29), (9, 24), (9, 22), (6, 16), (23, 4), (17, 3), (29, 18), (19, 5), (27, 5), (6, 17), (29, 27), (5, 6), (23, 3), (31, 7), (11, 22), (14, 4), (13, 1), (3, 12), (8, 29), (4, 7), (15, 12), (27, 15), (17, 21), (7, 28), (28, 4), (22, 28), (10, 28), (8, 24), (24, 18), (9, 31), (23, 25), (2, 31), (9, 15), (31, 25), (18, 7), (23, 6), (30, 7), (26, 19), (30, 10), (22, 4), (16, 1), (10, 2), (0, 21), (31, 16), (3, 17), (15, 8), (16, 16), (31, 1), (4, 10), (23, 26), (2, 4), (23, 30), (2, 12), (26, 3), (15, 1), (0, 5), (5, 28), (7, 22), (3, 31), (17, 7), (3, 3), (29, 2), (25, 12), (30, 4), (10, 14), (15, 18), (5, 2), (26, 14), (23, 23), (13, 8), (24, 2), (24, 22), (9, 12), (20, 12), (19, 23), (4, 1), (29, 7), (28, 7), (19, 1), (26, 1), (28, 31), (23, 12), (10, 10), (21, 25), (25, 1), (22, 13), (8, 7), (18, 22), (31, 28), (15, 3), (15, 10), (1, 31), (31, 3), (19, 7), (26, 31), (12, 12), (31, 24), (30, 16), (30, 19), (12, 15), (30, 17), (7, 17), (25, 13), (29, 25), (4, 16), (10, 15), (21, 20), (15, 17), (27, 12), (0, 12), (4, 15), (21, 8), (8, 1), (24, 12), (6, 28), (24, 31), (24, 3), (8, 2), (5, 1), (4, 3), (27, 1), (26, 12), (10, 11), (28, 16), (10, 18), (8, 27), (17, 16), (27, 2), (27, 18), (10, 30), (4, 2), (11, 4), (21, 3), (24, 25), (28, 12), (22, 26), (30, 12), (6, 1), (30, 1), (4, 17), (11, 7), (30, 3), (18, 31), (11, 27), (2, 3), (19, 22), (17, 23), (21, 26), (19, 30), (28, 25), (7, 6), (11, 25), (12, 7), (15, 23), (4, 6), (14, 7), (16, 23), (0, 31), (8, 15), (24, 13), (8, 6), (22, 12), (17, 2), (24, 1), (17, 11), (24, 9), (25, 18), (20, 7), (5, 4), (5, 17), (25, 5), (9, 27), (25, 31), (20, 8), (6, 31), (19, 21), (6, 15), (13, 24), (16, 10), (28, 20), (10, 27), (31, 4), (30, 25), (17, 22), (30, 6), (8, 20), (20, 17), (13, 16), (12, 5), (4, 28), (10, 19), (9, 3), (19, 6), (29, 3), (29, 20), (0, 6), (15, 24), (7, 4), (22, 16), (0, 2), (9, 2), (18, 6), (18, 12), (17, 12), (15, 16), (7, 3), (16, 22), (1, 6), (30, 2), (30, 23), (10, 6), (5, 8), (6, 8), (16, 5), (12, 6), (31, 11), (19, 11), (9, 28), (29, 13), (9, 21), (26, 9), (23, 8), (9, 10), (22, 20), (28, 2), (2, 2), (8, 19), (28, 23), (9, 9), (11, 17), (30, 5), (13, 12), (0, 15), (7, 18), (1, 1), (14, 16), (10, 21), (28, 3), (26, 18), (31, 5), (16, 12), (2, 5), (4, 21), (3, 1), (0, 1), (11, 6), (1, 7), (22, 30), (8, 9), (4, 4), (17, 1), (5, 3), (31, 23), (9, 4), (29, 5), (29, 23), (30, 24), (11, 2), (16, 3), (16, 6), (19, 3), (0, 7), (11, 14), (4, 8), (5, 21), (11, 3), (18, 2), (15, 5), (16, 2), (16, 11), (11, 1), (3, 5), (29, 24), (26, 4), (27, 4), (13, 6), (12, 31), (7, 19), (28, 5), (9, 14), (31, 15), (31, 2), (8, 14), (6, 21), (11, 10), (6, 3), (13, 5), (28, 24), (10, 9), (19, 12), (7, 15), (18, 4), (7, 21), (2, 7), (29, 16), (14, 5), (13, 4), (11, 9), (22, 8), (17, 4), (12, 16), (15, 31), (21, 1), (10, 3), (8, 3), (15, 6), (25, 4), (24, 4), (26, 5), (10, 1), (7, 2)],
             "meta-llama/Llama-3.2-3B": [(16, 2), (15, 2), (22, 14), (6, 5), (1, 14), (16, 25), (7, 15), (7, 5), (17, 2), (14, 27), (11, 17), (1, 6), (5, 21), (10, 2), (10, 17), (15, 25), (2, 14), (5, 23), (5, 24), (2, 8), (13, 25), (6, 15), (18, 18), (9, 17), (12, 27), (9, 24), (19, 15), (3, 24), (11, 10), (3, 16), (3, 23), (18, 15), (6, 8), (18, 6), (4, 21), (17, 25), (3, 17), (10, 23), (17, 16), (2, 22), (8, 5), (18, 21), (11, 18), (12, 26), (10, 18), (13, 15), (16, 16), (3, 10), (22, 10), (15, 18), (15, 16), (11, 2), (19, 18), (20, 21), (14, 25), (20, 15), (4, 24), (3, 12), (21, 10), (5, 9), (8, 8), (19, 12), (10, 26), (4, 12), (11, 26), (19, 9), (17, 7), (13, 12), (15, 19), (9, 26), (16, 19), (2, 12), (9, 1), (12, 15), (21, 14), (11, 20), (21, 4), (10, 20), (16, 13), (12, 14), (8, 26), (22, 26), (9, 10), (1, 17), (13, 26), (22, 19), (4, 18), (5, 7), (23, 19), (1, 10), (19, 6), (17, 24), (4, 10), (9, 23), (22, 13), (5, 10), (16, 26), (2, 7), (12, 25), (16, 27), (23, 10), (15, 26), (0, 8), (15, 24), (15, 12), (13, 13), (9, 20), (13, 21), (1, 12), (22, 8), (11, 23), (3, 5), (4, 7), (21, 6), (20, 12), (23, 27), (0, 17), (21, 26), (19, 2), (19, 21), (2, 17), (10, 9), (14, 17), (17, 13), (21, 1), (23, 13), (3, 13), (4, 2), (21, 19), (10, 10), (12, 21), (9, 9), (7, 12), (16, 7), (22, 23), (9, 22), (12, 17), (5, 5), (0, 12), (6, 23), (4, 22), (0, 22), (17, 15), (20, 24), (7, 16), (16, 20), (13, 8), (22, 15), (7, 1), (15, 27), (17, 1), (16, 12), (5, 22), (17, 21), (2, 9), (11, 22), (14, 16), (23, 9), (13, 27), (16, 24), (2, 18), (15, 21), (14, 14), (15, 3), (8, 19), (5, 16), (21, 8), (20, 1), (13, 14), (5, 1), (17, 19), (3, 1), (4, 20), (6, 12), (19, 25), (10, 22), (9, 13), (1, 9), (11, 27), (14, 13), (1, 11), (2, 1), (3, 22), (12, 18), (23, 1), (14, 12), (5, 20), (11, 1), (2, 10), (8, 12), (14, 9), (3, 21), (22, 27), (9, 12), (8, 23), (16, 4), (13, 1), (18, 7), (0, 19), (11, 24), (15, 10), (4, 23), (4, 1), (18, 25), (14, 4), (1, 15), (6, 1), (10, 8), (22, 1), (21, 15), (7, 8), (8, 1), (16, 5), (0, 21), (2, 13), (19, 14), (10, 24), (20, 7), (14, 2), (21, 24), (12, 1), (12, 12), (21, 23), (18, 1), (11, 9), (18, 26), (1, 18), (22, 6), (6, 10), (16, 22), (14, 1), (20, 10), (20, 26), (20, 25), (22, 16), (1, 3), (10, 1), (4, 6), (19, 8), (4, 5), (19, 1), (23, 12), (20, 6), (0, 1), (15, 9), (22, 24), (1, 1), (20, 17), (19, 24), (3, 27), (5, 26), (21, 12), (0, 26), (18, 19), (0, 3), (12, 23), (10, 12), (7, 25), (4, 17), (0, 23), (19, 7), (18, 20), (19, 10), (13, 16), (0, 9), (0, 4), (18, 23), (23, 8), (23, 26), (7, 23), (19, 26), (1, 13), (10, 3), (11, 14), (13, 24), (14, 24), (3, 20), (8, 25), (21, 13), (6, 16), (0, 15), (23, 16), (11, 12), (23, 24), (2, 26), (16, 14), (3, 9), (1, 23), (18, 8), (15, 5), (14, 20), (2, 20), (20, 20), (10, 19), (13, 17), (17, 5), (17, 9), (20, 8), (12, 13), (0, 13), (13, 18), (6, 26), (19, 20), (9, 18), (1, 8), (20, 19), (17, 27), (1, 20), (20, 3), (12, 5), (2, 16), (2, 23), (14, 18), (10, 27), (0, 16), (19, 13), (10, 14), (1, 21), (22, 18), (18, 17), (9, 2), (18, 5), (11, 7), (19, 23), (15, 1), (14, 21), (6, 22), (6, 4), (11, 13), (10, 25), (5, 13), (19, 22), (21, 9), (6, 25), (12, 16), (4, 25), (0, 25), (18, 10), (17, 14), (18, 24), (23, 15), (5, 25), (9, 4), (17, 3), (12, 24), (20, 18), (22, 12), (2, 21), (5, 27), (11, 25), (7, 20), (0, 24), (16, 21), (7, 18), (3, 25), (18, 13), (5, 18), (19, 19), (15, 6), (10, 15), (10, 6), (15, 17), (23, 23), (9, 25), (10, 16), (9, 3), (15, 22), (13, 22), (17, 17), (16, 1), (10, 13), (1, 19), (8, 22), (20, 23), (2, 4), (4, 13), (6, 11), (8, 10), (8, 20), (6, 27), (13, 9), (0, 20), (12, 3), (17, 10), (12, 9), (4, 11), (14, 8), (18, 14), (21, 17), (7, 26), (10, 11), (20, 27), (22, 25), (3, 26), (14, 23), (12, 7), (1, 25), (3, 18), (1, 26), (2, 24), (15, 20), (9, 19), (11, 3), (6, 20), (2, 6), (15, 13), (7, 7), (13, 3), (5, 11), (16, 10), (5, 15), (16, 15), (11, 11), (17, 22), (11, 19), (8, 18), (2, 19), (15, 4), (23, 18), (18, 22), (7, 14), (9, 16), (23, 25), (14, 5), (15, 14), (16, 6), (8, 2), (13, 6), (7, 21), (14, 22), (7, 11), (16, 3), (22, 9), (2, 25), (15, 15), (21, 25), (12, 8), (7, 22), (1, 2), (17, 6), (19, 3), (1, 24), (0, 10), (17, 4), (14, 19), (16, 9), (12, 22), (8, 21), (13, 23), (4, 26), (11, 4), (3, 11), (20, 22), (10, 21), (3, 3), (3, 7), (20, 13), (0, 18), (13, 5), (1, 16), (2, 27), (22, 4), (13, 10), (0, 5), (20, 14), (2, 15), (3, 6), (2, 11), (8, 4), (22, 7), (21, 16), (12, 19), (23, 11), (19, 17), (18, 16), (8, 11), (16, 17), (23, 17), (4, 9), (14, 7), (17, 23), (20, 2), (11, 16), (1, 4), (23, 7), (20, 5), (9, 15), (21, 27), (1, 22), (21, 7), (22, 2), (21, 11), (6, 2), (17, 12), (9, 21), (23, 22), (17, 20), (18, 2), (16, 8), (17, 26), (7, 27), (6, 21), (18, 3), (15, 11), (18, 27), (5, 12), (4, 27), (18, 12), (1, 27), (4, 16), (23, 3), (8, 17), (11, 8), (6, 13), (16, 18), (0, 11), (16, 11), (6, 24), (9, 14), (13, 7), (19, 11), (20, 16), (3, 2), (5, 14), (3, 15), (9, 7), (6, 7), (18, 11), (22, 3), (20, 11), (2, 3), (9, 8), (5, 3), (0, 27), (5, 4), (15, 23), (21, 3), (14, 26), (22, 17), (4, 14), (4, 4), (8, 7), (7, 10), (8, 24), (0, 2), (22, 11), (13, 20), (16, 23), (19, 27), (23, 4), (14, 15), (18, 9), (9, 6), (17, 11), (21, 2), (7, 2), (8, 16), (19, 5), (17, 8), (4, 8), (10, 7), (11, 5), (11, 15), (8, 14), (6, 17), (7, 24), (14, 6), (3, 4), (3, 8), (2, 2), (12, 20), (22, 22), (19, 16), (13, 11), (21, 18), (3, 14), (13, 19), (0, 6), (14, 10), (14, 3), (17, 18), (15, 7), (4, 15), (7, 17), (1, 5), (5, 6), (2, 5), (9, 11), (0, 14), (8, 13), (6, 18), (20, 9), (22, 5), (23, 5), (8, 27), (23, 6), (21, 22), (7, 4), (12, 2), (6, 6), (3, 19), (11, 21), (5, 8), (21, 20), (7, 9), (20, 4), (12, 11), (13, 2), (12, 6), (23, 20), (7, 6), (6, 14), (8, 3), (23, 2), (21, 5), (15, 8), (22, 21), (6, 19), (12, 10), (12, 4), (22, 20), (7, 19), (10, 5), (23, 21), (9, 5), (23, 14), (21, 21), (9, 27), (5, 19), (4, 3), (5, 17), (8, 6), (4, 19), (7, 13), (6, 9), (1, 7), (6, 3), (8, 15), (19, 4), (14, 11), (8, 9), (0, 7), (13, 4), (18, 4), (7, 3), (10, 4), (11, 6), (5, 2)],
@@ -77,7 +101,8 @@ class LlamaAttentionExperimental(nn.Module):
         else:
             self.lowrecall_tuples = self.low_recall_first[self.config._name_or_path]
 
-        if self.layer_idx > 0:
+        # if self.layer_idx > 0:
+        if self.can_sparsify:
             self.mseloss = MSELoss(reduction='none')
             self.msemagn_loss = None
             self.headmseloss = MSELoss(reduction='none')
@@ -96,39 +121,6 @@ class LlamaAttentionExperimental(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         self._init_rope()
-
-    # def build_head_keep_ratios(self):
-    #     """
-    #     Returns a tensor  shape [num_heads] with the fraction of keys to keep
-    #     for *this* layer, adjusted by self.lowrecall_tuples.
-    #     """
-    #     # Start from the global target
-    #     keep = torch.full((self.num_heads,), self.sparse_aggression)
-
-    #     # Filter the tuples to the current layer
-    #     bad_heads = [h for (h, l) in self.lowrecall_tuples if l == self.layer_idx]
-
-    #     if not bad_heads:
-    #         return keep      # nothing to adjust
-
-    #     # -----  choose a schedule  ---------------------------------
-    #     # Earlier tuple ⇒ worse ⇒ keep more keys.
-    #     # Example: linear interpolation between [keep_max … keep_min]
-    #     keep_max = 1.00                           # never drop anything on the worst head
-    #     keep_min = self.sparse_aggression         # unchanged for good heads
-
-    #     # Map rank→keep: rank 0 (worst) → keep_max, rank N‑1 → somewhere near keep_min
-    #     n = len(bad_heads)
-    #     for rank, head_idx in enumerate(bad_heads):
-    #         frac = rank / (n - 1 + 1e-5)          # 0 … 1
-    #         keep[head_idx] = keep_max - frac * (keep_max - keep_min)
-
-    #     # ----  (optional) renormalise so the layer‑average is unchanged  ----
-    #     scale = (self.sparse_aggression * self.num_heads) / keep.sum()
-    #     keep *= scale
-    #     keep.clamp_(max=1.0)                      # never >100 % keep
-    #     return keep
-
 
     def _compute_global_head_keep(self):
         """
@@ -186,35 +178,31 @@ class LlamaAttentionExperimental(nn.Module):
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
-        if self.token_sparse_method is not None:
-            try:
-                mname = self.config._name_or_path.split("/")[-1]
-                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
-                threshold_model_dictionary = torch.load(read_path)
-                self.tok_calibration_set = threshold_model_dictionary
-            except:
-                pass
-        if self.token_sparse_method == "LazyLLM":
-            if self.layer_idx <= 9:
-                self.sparse_aggression = 1.0
-            elif self.layer_idx <= 19:
-                self.sparse_aggression = 0.7
-            elif self.layer_idx <= 28:
-                self.sparse_aggression = 0.4
-            else:
-                self.sparse_aggression = 0.1
-        elif "fixed" in self.token_sparse_method:
-            if self.layer_idx == 0:
-                self.sparse_aggression = 1.0
-            else:
-                self.sparse_aggression = 1.0 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-        elif "progressive" in self.token_sparse_method:
-            pc_drop = float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-            self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
+        if self.can_sparsify:              # layers ≤ source are dense
+            self.sparse_aggression = 1.0 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
         else:
-            raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
+            self.sparse_aggression = 1.0
+        #     if self.token_sparse_method is not None:
+        #         try:
+        #             mname = self.config._name_or_path.split("/")[-1]
+        #             read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+        #             threshold_model_dictionary = torch.load(read_path)
+        #             self.tok_calibration_set = threshold_model_dictionary
+        #         except:
+        #             pass
+        #     elif "fixed" in self.token_sparse_method:
+        #         if self.layer_idx == 0:
+        #             self.sparse_aggression = 1.0
+        #         else:
+        #             self.sparse_aggression = 1.0 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
+        #     elif "progressive" in self.token_sparse_method:
+        #         pc_drop = float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
+        #         self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
+        #     else:
+        #         raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
+        # import pdb; pdb.set_trace()
         self.head_keep = self.build_head_keep_ratios() 
-            
+                
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -321,7 +309,9 @@ class LlamaAttentionExperimental(nn.Module):
             min_sparse_index = self.min_sparse_index
             with torch.no_grad():
                 if evalmode == "ExpPred":
-                    if self.layer_idx > 0:
+                    # if self.layer_idx > 23:
+                    #     import pdb; pdb.set_trace()
+                    if self.can_sparsify:
                         q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
                         k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                         importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
@@ -330,7 +320,7 @@ class LlamaAttentionExperimental(nn.Module):
                         if self.calc_hitrates:
                             estimated = nn.functional.softmax(importance_mask + attention_mask, dim=-1)
                             truth     = nn.functional.softmax(attn_weights     + attention_mask, dim=-1)
-                            head_calibration_stage = False
+                            head_calibration_stage = True
                             if head_calibration_stage:
                                 def topk_recall(pred_scores, true_scores, k_tokens):
                                     topk_pred  = pred_scores.topk(k_tokens, dim=-1).indices      # [..., K]
@@ -342,7 +332,11 @@ class LlamaAttentionExperimental(nn.Module):
                                 recalls  = {f"top{int(r*100)}": topk_recall(estimated[:, :, -1:, :], truth[:, :, -1:, :], k)
                                             for r, k in zip(ratios, k_vals)}
 
-                                csv_path = "l3_3b_inst_debug_hitrates.csv"
+                                # csv_path = "L3_3B_PL24_debug_hitrates.csv"
+                                # csv_path = "L3_3B_PL16_debug_hitrates.csv"
+                                # csv_path = "L3_3B_PL8_debug_hitrates.csv"
+                                csv_path = "L3_3B_PL4_debug_hitrates.csv"
+                                # csv_path = "L3_3B_PL24_debug_hitrates.csv"
                                 file_exists = os.path.isfile(csv_path)
 
                                 # Stable, deterministic tag for this batch (8‑char SHA‑1 of the query tokens)
@@ -459,7 +453,7 @@ class LlamaAttentionExperimental(nn.Module):
 
         else:
             if self.flash_attn:
-                if self.layer_idx > 0:
+                if self.can_sparsify:
                     # Token hit-rates cannot be calculated if using flash attention.
                     self.tok_hit_acc = 0
                     q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
@@ -486,7 +480,7 @@ class LlamaAttentionExperimental(nn.Module):
                     attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
             else:
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
-                if self.layer_idx > 0:
+                if self.can_sparsify:
                     q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
                     k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                     importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
@@ -588,7 +582,7 @@ class LlamaAttentionExperimental(nn.Module):
         else:
             attn_output = self.o_proj(attn_output)
 
-        if self.producer is None:
+        if self.producer is None and self.layer_idx == self.pred_source_layer:
             try:
                 q_importance, k_importance = self.sparse_token_predictor(
                     hidden_states,
@@ -622,18 +616,24 @@ class LlamaAttentionExperimental(nn.Module):
                 else:
                     self.head_importances = torch.cat([self.head_importances, head_importances], dim=1)
         
+
+        if not output_attentions:
+            attn_weights = None
+        return attn_output, attn_weights
+
         # if self.layer_idx == 31:
         #     if q_len == 1:
         #         self.dtok += 1
         #         print(f"Primary Key-Value Shape: {past_key_value.predictor_primary_key[0].shape}, Importance: {past_key_value.predictor_importance_key[0].shape}, Tok-Decoded: {self.dtok}")
         #     else:
         #         self.dtok = 0
-
-        if not output_attentions:
-            attn_weights = None
-        return attn_output, attn_weights
-
-def convert_kvcache_experimental(model, config, producer_frequency):
+# def convert_kvcache_experimental(model, config, producer_frequency):
+def convert_kvcache_experimental(
+    model,
+    config,
+    producer_frequency,
+    pred_source_layer: int = 0,
+):
     producer_layer = None
     producer_layer_device = None
     layer_counter = {'idx': 0}
@@ -647,17 +647,41 @@ def convert_kvcache_experimental(model, config, producer_frequency):
             if isinstance(module, LlamaAttention):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
-                if layer_counter['idx'] % producer_frequency == 0:
-                    new_module = LlamaAttentionExperimental(config).to(dtype).to(device)
-                    producer_layer = new_module
-                    producer_layer_device = device
-                else:
+                if layer_counter['idx'] == pred_source_layer:
+                    # unique source layer
                     new_module = LlamaAttentionExperimental(
                         config,
+                        pred_source_layer=pred_source_layer,
+                        layer_idx=layer_counter['idx']
+                    ).to(dtype).to(device)
+                    producer_layer = new_module
+                    producer_layer_device = device
+                elif layer_counter['idx'] > pred_source_layer:
+                    # consumer (sparsifiable) layer
+                    new_module = LlamaAttentionExperimental(
+                        config,
+                        pred_source_layer=pred_source_layer,
                         producer=producer_layer,
                         layer_idx=layer_counter['idx']
                     ).to(dtype).to(device)
+                else:
+                    new_module = LlamaAttentionExperimental(
+                        config,
+                        pred_source_layer=pred_source_layer,
+                        layer_idx=layer_counter['idx']
+                    ).to(dtype).to(device)
                 new_module.load_state_dict(module.state_dict(), strict=False)
+                new_module.producer_frequency = producer_frequency
+                if new_module.is_source_layer:
+                    # minimal defaults so update_predictor() succeeds
+                    if not hasattr(new_module, "num_layers_pred"):
+                        new_module.num_layers_pred = producer_frequency
+                    if not hasattr(new_module, "dDash"):
+                        new_module.dDash = new_module.head_dim     # sane default
+                    if not hasattr(new_module, "intdim"):
+                        new_module.intdim = new_module.hidden_size
+
+                    # new_module.update_predictor()   # ← creates sparse_token_predictor
                 is_producer = layer_counter['idx'] % producer_frequency == 0
                 if is_producer:
                     print(f"Converted Producer layer '{name}' to LlamaAttentionExperimental at layer index {layer_counter['idx']}")
@@ -669,4 +693,37 @@ def convert_kvcache_experimental(model, config, producer_frequency):
     producer_layer = producer_layer.to(producer_layer_device)
     return model
 
+
+
+    # def build_head_keep_ratios(self):
+    #     """
+    #     Returns a tensor  shape [num_heads] with the fraction of keys to keep
+    #     for *this* layer, adjusted by self.lowrecall_tuples.
+    #     """
+    #     # Start from the global target
+    #     keep = torch.full((self.num_heads,), self.sparse_aggression)
+
+    #     # Filter the tuples to the current layer
+    #     bad_heads = [h for (h, l) in self.lowrecall_tuples if l == self.layer_idx]
+
+    #     if not bad_heads:
+    #         return keep      # nothing to adjust
+
+    #     # -----  choose a schedule  ---------------------------------
+    #     # Earlier tuple ⇒ worse ⇒ keep more keys.
+    #     # Example: linear interpolation between [keep_max … keep_min]
+    #     keep_max = 1.00                           # never drop anything on the worst head
+    #     keep_min = self.sparse_aggression         # unchanged for good heads
+
+    #     # Map rank→keep: rank 0 (worst) → keep_max, rank N‑1 → somewhere near keep_min
+    #     n = len(bad_heads)
+    #     for rank, head_idx in enumerate(bad_heads):
+    #         frac = rank / (n - 1 + 1e-5)          # 0 … 1
+    #         keep[head_idx] = keep_max - frac * (keep_max - keep_min)
+
+    #     # ----  (optional) renormalise so the layer‑average is unchanged  ----
+    #     scale = (self.sparse_aggression * self.num_heads) / keep.sum()
+    #     keep *= scale
+    #     keep.clamp_(max=1.0)                      # never >100 % keep
+    #     return keep
 

@@ -127,13 +127,27 @@ def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
 
 def get_producer_layers(model):
     """
-    Traverses the model to find the producer layer (layer_idx=0).cc
+    Return the single layer that feeds the Token/Head‑importance
+    predictors, regardless of its index.
     """
     producer_modules = []
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx == 0:
+        if (
+            module.__class__.__name__.endswith("AttentionExperimental")
+            and getattr(module, "is_source_layer", False)   # <- new
+        ):
             producer_modules.append(module)
     return producer_modules
+
+# def get_producer_layers(model):
+#     """
+#     Traverses the model to find the producer layer (layer_idx=0).cc
+#     """
+#     producer_modules = []
+#     for module in model.modules():
+#         if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx == 0:
+#             producer_modules.append(module)
+#     return producer_modules
     
 
 def set_inference_mode(model, mode: bool):
@@ -933,6 +947,7 @@ if __name__ == '__main__':
     parser.add_argument('--head_attn_reduce_factor', type=int, default=2, help="reduce factor for head predictor attention")
     parser.add_argument('--dDash', type=int, default=16, help='Attn Red-dim')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
+    parser.add_argument('--pred_source_layer', type=int, default=0, help='Source Layer for Predictor')
 
     # Model-Mode (Config, Calibrate) related arguments
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
@@ -1020,7 +1035,7 @@ if __name__ == '__main__':
             from modify_models.modify_llama_baselines import convert_kvcache_experimental
             from modify_models.modify_llama_baselines import LlamaAttentionExperimental
 
-        model = convert_kvcache_experimental(model, config, args.producer_frequency)
+        model = convert_kvcache_experimental(model, config, args.producer_frequency, pred_source_layer=args.pred_source_layer)
 
     elif args.architecture == "mistral":
         print("Running Mistral module replacement")
@@ -1090,7 +1105,8 @@ if __name__ == '__main__':
             module.sliding_window = args.sliding_window
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-                if module.layer_idx % args.producer_frequency == 0:
+                # if module.layer_idx % args.producer_frequency == 0:
+                if module.layer_idx == args.pred_source_layer:
                     module.update_predictor()
 
     if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
@@ -1166,19 +1182,63 @@ if __name__ == '__main__':
 
     result_save_folder = "csvresults" if args.model_mode == "finetune" else "evalresults"
     if args.model_mode == "eval":
-        if args.model_load_path is not None and args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            model_producer_layers = get_producer_layers(model)
-            producer_layer_weights = torch.load(args.model_load_path)
-            for idx, producer_layer_weight in enumerate(producer_layer_weights):
-                try:
-                    model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
-                    if args.model_parallelism:
-                        model_producer_layers[idx].to("cuda:0")
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Error loading producer layer {idx}: {e}")
-                    print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
+        if args.model_mode == "eval" and args.model_load_path:
+            ckpt = torch.load(args.model_load_path, map_location="cpu")
+
+            # ---------- CASE 1: full checkpoint dict ----------
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                full_sd = ckpt["model_state_dict"][0]
+
+                # keep only predictor parameters so we don’t clobber anything else
+                pred_prefix = "sparse_token_predictor"
+                pred_sd = full_sd
+                # pred_sd = {k.split(".", 2)[-1]: v           # strip outer prefix
+                #         for k, v in full_sd.items()
+                #         if pred_prefix in k}
+
+                producer_layer = get_producer_layers(model)[0]
+                missing, unexpected = producer_layer.load_state_dict(
+                    pred_sd, strict=False
+                )
+                print("Predictor weights loaded.",
+                    "missing:", missing, "unexpected:", unexpected)
+
+                if args.model_parallelism:
+                    producer_layer.to("cuda:0")
+
+            # ---------- CASE 2: legacy list / dict of producer sd’s ----------
+            else:
+                producer_layers = get_producer_layers(model)
+                if isinstance(ckpt, list):
+                    assert len(ckpt) == len(producer_layers), \
+                        f"Checkpoint has {len(ckpt)} producer sd’s, " \
+                        f"model expects {len(producer_layers)}"
+                    for layer, sd in zip(producer_layers, ckpt):
+                        layer.load_state_dict(sd, strict=False)
+                elif isinstance(ckpt, dict):
+                    # single producer keyed by something like 'producer0'
+                    prod_sd = next(iter(ckpt.values()))
+                    producer_layers[0].load_state_dict(prod_sd, strict=False)
+                else:
+                    raise TypeError(f"Unrecognised checkpoint format: {type(ckpt)}")
+
+                if args.model_parallelism:
+                    for layer in producer_layers:
+                        layer.to("cuda:0")
+        # if args.model_load_path is not None and args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
+        #     model_producer_layers = get_producer_layers(model)
+        #     producer_layer_weights = torch.load(args.model_load_path)
+        #     import pdb; pdb.set_trace()
+        #     for idx, producer_layer_weight in enumerate(producer_layer_weights):
+        #         try:
+        #             model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+        #             if args.model_parallelism:
+        #                 model_producer_layers[idx].to("cuda:0")
+        #         except Exception as e:
+        #             import traceback
+        #             traceback.print_exc()
+        #             print(f"Error loading producer layer {idx}: {e}")
+        #             print("\n\nContinuing... !! Bad Perf If Unintentional !!\n\n")
             
         set_inference_mode(model, True)
 
