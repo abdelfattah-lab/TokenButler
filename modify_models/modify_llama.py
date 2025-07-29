@@ -335,8 +335,8 @@ class LlamaAttentionExperimental(nn.Module):
                                 # csv_path = "L3_3B_PL24_debug_hitrates.csv"
                                 # csv_path = "L3_3B_PL16_debug_hitrates.csv"
                                 # csv_path = "L3_3B_PL8_debug_hitrates.csv"
-                                csv_path = "L3_3B_PL4_debug_hitrates.csv"
-                                # csv_path = "L3_3B_PL24_debug_hitrates.csv"
+                                # csv_path = "L3_3B_PL4_debug_hitrates.csv"
+                                csv_path = "L3_3B_PL0_debug_hitrates.csv"
                                 file_exists = os.path.isfile(csv_path)
 
                                 # Stable, deterministic tag for this batch (8‑char SHA‑1 of the query tokens)

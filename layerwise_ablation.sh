@@ -18,7 +18,7 @@ python main.py \
     --eval_subset 1000 \
     --eval_wk2_seqlen 1024 \
     --train_batch_size 4 --grad_accum_steps 16 \
-    --model_load_path 
+    --model_load_path /home/ya255/projects/TokenButler/expt_model/TokenButler_LayerPlacement_42_finetune_None_None_500_llama_meta-llama_Llama-3.2-3B_L3_1B_PL0.csv_L3_1B_PL0_False_False_500_False_redpajama_1024_4_5_10_0.001_16_1024_16_False/4_1000_ExpPred_fixed_40pc_False_False_0_False_False_False_None_False_False_4_8_2_32_1024_0_False_False_True_28_0.014285714285714287_20250729-150340.pt
   
 python main.py \
     --proj_name TokenButler_LayerPlacement \

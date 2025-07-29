@@ -33,4 +33,4 @@ def main(csv_path: str = "L3_3B_PL24_debug_hitrates.csv") -> None:
 
 if __name__ == "__main__":
     # Optional CLI: python script.py [path/to/csv]
-    main(sys.argv[1] if len(sys.argv) > 1 else "L3_3B_PL8_debug_hitrates.csv")
+    main(sys.argv[1] if len(sys.argv) > 1 else "L3_3B_PL0_debug_hitrates.csv")
