@@ -7,5 +7,12 @@
     "chatglm2-6b-32k": 31500,
     "chatglm3-6b-32k": 31500,
     "vicuna-v1.5-7b-16k": 15500,
-    "mistral-7b-instruct-v0.2": 31500
+    "mistral-7b-instruct-v0.2": 31500,
+    "phi-3.5-mini-instruct": 4096,
+    "llama-3.2-1b": 1024,
+    "llama-3.1-8b": 4096,
+    "llama-3.2-1b-butler": 4096,
+    "local-llama-3.2-1b-butler": 1024,
+    "llama-3.2-1b-instruct": 4096,
+    "llama-3.2-3b-instruct": 4096
 }

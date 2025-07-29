@@ -54,10 +54,24 @@ class SlidingWindowCache:
         if self.sliding_window is None:
             return None
         req = max(q_len, key_len)
+        # Always guarantee the cache is large enough
         if req > self.max_seq_len:
             self.max_seq_len = req
             self.window = self._create_window(self.max_seq_len)
-        return self.window[:, :, :q_len, :key_len]
+
+        # Select the correct rows: the queries are the *last* q_len tokens
+        row_start = key_len - q_len
+        row_end   = key_len
+        return self.window[:, :, row_start:row_end, :key_len]
+        # req = max(q_len, key_len)
+        # if req > self.max_seq_len:
+        #     self.max_seq_len = req
+        #     self.window = self._create_window(self.max_seq_len)
+        # return self.window[:, :, row_start:row_end, :key_len]
+        # if req > self.max_seq_len:
+        #     self.max_seq_len = req
+        #     self.window = self._create_window(self.max_seq_len)
+        # return self.window[:, :, :q_len, :key_len]
 
 def enforce_sliding_window(mask_tensor, window):
     if window is None:
@@ -196,6 +210,70 @@ def calculate_effective_sparsity(final_mask, attention_mask):
     return effective_sparsity
 
 
+def sorted_index_to_variable_mask(
+    sorted_indices,          # [B,H,Lq,Lk]
+    attention_mask,          # [1,1,Lq,Lk]
+    min_sparse_index,
+    bsz, q_len, key_len,
+    head_keep,               # 1‑D tensor [H] with keep fractions
+    sliding_window=None
+):
+    device = sorted_indices.device
+    H = sorted_indices.size(1)           # num heads (32 in your trace)
+
+    # (1) put head_keep into a broadcast‑ready shape
+    head_keep = head_keep.view(1, H, 1, 1)          # [1, H, 1, 1]
+
+    # (2) query positions (same as before, just cleaner)
+    if q_len == 1:
+        query_pos = torch.full((1, 1, 1, 1), key_len + 1, device=device)
+    else:
+        query_pos = torch.arange(1, q_len + 1, device=device).view(1, 1, q_len, 1)
+
+    # (3) per‑head budget K   →  shape [1, H, Lq, 1]
+    K = torch.ceil(query_pos * head_keep).long().clamp(max=key_len)
+    K = torch.clamp(K, max=key_len)
+
+    # Step 2: Expand attention_mask to [B,H,q_len,key_len]
+    attention_mask_expanded = attention_mask.expand(bsz, -1, -1, -1)
+    attention_mask_expanded = attention_mask_expanded.expand(-1, sorted_indices.size(1), -1, -1)
+    # Convert True -> 1, False -> 0
+    attention_mask_expanded = (~attention_mask_expanded.bool()).int()
+
+    # Step 3: Gather (reorder) mask by sorted_indices
+    gathered_mask = torch.gather(attention_mask_expanded, dim=-1, index=sorted_indices)
+
+    # Step 4: cumsum along sorted dimension
+    gathered_mask_float = gathered_mask.float()
+    cum_sum = torch.cumsum(gathered_mask_float, dim=-1)  # [B,H,q_len,key_len]
+
+    # Step 5: Compare cumsum <= K
+    # Expand K to [B,H,q_len,key_len] for broadcast
+    
+    # K_broadcast = K.view(1, 1, q_len, 1).expand_as(cum_sum)
+    # selected_mask = (cum_sum <= K_broadcast)
+    selected_mask = cum_sum <= K 
+
+    # Step 6: Prepare final mask_tensor with -inf by default
+    mask_tensor = torch.full_like(attention_mask_expanded.float(), float('-inf'))
+
+    # Step 7: Scatter 0 where selected, -inf otherwise
+    scatter_values = torch.zeros_like(gathered_mask_float)
+    scatter_values = scatter_values.masked_fill(~selected_mask, float('-inf'))
+    mask_tensor.scatter_(-1, sorted_indices, scatter_values)
+
+    # Step 8: Force the guaranteed front region unmasked
+    mask_tensor[:, :, :, :min_sparse_index] = 0.0
+
+    # We do NOT forcibly unmask the trailing `sliding_window` here,
+    # because we typically do it with a separate function that
+    # ensures the last `sliding_window` positions are unmasked for each query.
+    # Replace with self.sliding_window where referenced
+    # Where not referenced, reduce budget in calculation.
+
+    return mask_tensor
+
+
 def sorted_index_to_mask(
     sorted_indices,
     attention_mask,
@@ -224,15 +302,15 @@ def sorted_index_to_mask(
         query_positions = torch.arange(q_len, device=device).view(1, 1, q_len, 1).float() + 1.0
     K_original = torch.ceil(query_positions * sparse_aggression).long()  # [1,1,q_len,1]
     K_original = torch.clamp(K_original, max=key_len)
-
-    # Step 1b: Incorporate guaranteed region
-    guaranteed = min_sparse_index
-    if sliding_window is not None:
-        guaranteed += sliding_window
-    # Subtract guaranteed from the original K
-    K_adjusted = K_original - guaranteed
-    # Ensure K_adjusted is at least 0
-    K_adjusted = torch.clamp(K_adjusted, min=0, max=key_len)
+    # Step 1b: subtract *only* the guaranteed prefix.
+    # The trailing sliding‑window region is enforced later via a
+    # separate mask and therefore must **not** reduce K here.
+    guaranteed_prefix = min_sparse_index
+    K_adjusted = torch.clamp(
+        K_original - guaranteed_prefix,
+        min=0,
+        max=key_len
+    )
 
     # Step 2: Expand attention_mask to [B,H,q_len,key_len]
     attention_mask_expanded = attention_mask.expand(bsz, -1, -1, -1)

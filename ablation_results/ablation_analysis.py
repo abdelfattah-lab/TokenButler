@@ -779,35 +779,37 @@ def plot_tokhit_accs():
 
     # Clean up the data
     data['Token-Hit-Acc'] = data['Token-Hit-Acc'].str.rstrip('%').astype(float)
-
-    # Sort data by 'Token-Hit-Acc'
     data = data.sort_values(by='Token-Hit-Acc', ascending=False)
-    # Sort data by PredictorPErc
-    # data = data.sort_values(by='PredictorPerc', ascending=False)
-    # Create a figure and axis objects
-    # fig, ax1 = plt.subplots(figsize=(8, 6))
     fig, ax1 = plt.subplots(figsize=(10, 6))  # Matches violin/error bar plot
-
-
-    # Plot bar chart for Token-Hit-Acc
     bar_width = 0.6
     bar_color = "tab:red"  # Tableau red
     line_color = "tab:blue"  # Tableau blue
 
-
-    # Create the bar chart for Token-Hit-Acc
     ax1.bar(data['Model'], data['Token-Hit-Acc'], color=bar_color, alpha=0.9, label='Token Hit-Rate', width=bar_width)
-    ax1.set_ylabel('Classification Accuracy (%)', fontsize=22, color="black")
-    ax1.tick_params(axis='y', labelcolor=bar_color, labelsize=18)
-    ax1.set_xlabel('Model', fontsize=22)
-    ax1.set_xticklabels([x.replace("-instruct", "-i") for x in data['Model']], rotation=45, ha='right', fontsize=18)
-
-    # Create a second Y-axis for PredictorPerc
+    ax1.set_ylabel('Accuracy (%)', fontsize=26, color="black")
+    ax1.tick_params(axis='y', labelcolor=bar_color, labelsize=26)
+    ax1.set_xlabel('Model', fontsize=26)
+    ax1.set_xticklabels([x.replace("-instruct", "-i") for x in data['Model']], rotation=45, ha='right', fontsize=26)
     ax2 = ax1.twinx()
     ax2.plot(data['Model'], data['PredictorPerc'], color=line_color, marker='o', label='Predictor Ratio', linewidth=2)
-    ax2.set_ylabel('Predictor Size (%)', fontsize=22, color="black")
-    ax2.tick_params(axis='y', labelcolor=line_color, labelsize=18)
+    ax2.set_ylabel('Predictor Size (%)', fontsize=26, color="black")
+    ax2.tick_params(axis='y', labelcolor=line_color, labelsize=26)
+    ax2.set_ylim(0.6, 1.4)
+    ax1.set_ylim(67.5, 77.5)
+    # Add grid and legend
+    ax1.grid(True, linestyle="--", alpha=0.6,)
+    # make grid appear 'behind'
+    ax1.set_axisbelow(True)
+    plt.xticks(fontsize=26)  # Replace `18` with desired font size
+    plt.yticks(fontsize=26)
+    plt.tight_layout()
+    plt.savefig('tokhitacc.pdf')
+    print("Plot saved to tokhitacc.pdf")
 
+    # fig.legend(loc='upper right', bbox_to_anchor=(0.9, 1), bbox_transform=ax1.transAxes, fontsize=18)
+    
+    # Adjust layout and save the plot
+    # plt.title('Token Hit-Rate and Predictor Ratio Across Models', fontsize=22)
     # ax1.bar(data['Model'], data['Token-Hit-Acc'], color='red', alpha=0.7, label='Token Hit-Rate', width=bar_width)
     # ax1.set_ylabel('Token Hit-Rate (%)', fontsize=22, color='red')
     # ax1.tick_params(axis='y', labelcolor='red')
@@ -819,83 +821,190 @@ def plot_tokhit_accs():
     # ax2.plot(data['Model'], data['PredictorPerc'], color='blue', marker='o', label='Predictor Ratio', linewidth=2)
     # ax2.set_ylabel('Predictor Size (%)', fontsize=22, color='blue')
     # ax2.tick_params(axis='y', labelcolor='blue')
+# def plot_predonly_overhead_with_errorbars():
+#     """
+#     Plot overhead of adding the predictor vs sequence length for different models with error bars.
+#     Saves the plot as predonly_overhead_werr.pdf.
+#     """
+#     csv_file_path = "pred_overhead_werr.csv"
+#     data = pd.read_csv(csv_file_path)
 
-    ax2.set_ylim(0.6, 1.4)
-    ax1.set_ylim(67.5, 77.5)
+#     # Extract unique model names
+#     data['model_name'] = data['model_path'].apply(lambda x: x.split("/")[-1])
+#     models = sorted(data['model_name'].unique())
+
+#     # Initialize the plot
+#     plt.figure(figsize=(10, 7))
+
+#     # Plot each model with error bars
+#     for model in models:
+#         model_data = data[data['model_name'] == model]
+#         seq_lens = model_data['seq_len']
+#         overheads = model_data['overhead']
+#         overhead_std = model_data['overhead_std']
+
+#         # Plot the main line
+#         plt.plot(
+#             seq_lens,
+#             overheads,
+#             label=model,
+#             marker='o',
+#             linewidth=2
+#         )
+
+#         # Add shaded error region
+#         plt.fill_between(
+#             seq_lens,
+#             overheads - overhead_std,  # Lower bound
+#             overheads + overhead_std,  # Upper bound
+#             alpha=0.1  # Adjust transparency of the shading
+#         )
 
 
-    # Add grid and legend
-    ax1.grid(True, linestyle="--", alpha=0.6,)
-    # make grid appear 'behind'
-    ax1.set_axisbelow(True)
-    # fig.legend(loc='upper right', bbox_to_anchor=(0.9, 1), bbox_transform=ax1.transAxes, fontsize=18)
-    
-    # Adjust layout and save the plot
-    # plt.title('Token Hit-Rate and Predictor Ratio Across Models', fontsize=22)
-    plt.xticks(fontsize=18)  # Replace `18` with desired font size
-    plt.yticks(fontsize=18)
-    plt.tight_layout()
-    plt.savefig('tokhitacc.pdf')
-    print("Plot saved to tokhitacc.pdf")
+#     # Customize the plot
+#     plt.xlabel('Sequence Length (tokens)', fontsize=28)
+#     plt.ylabel('Predictor Overhead (%)', fontsize=28)
+#     # plt.title('Predictor Overhead vs Sequence Length', fontsize=20)
+#     plt.xscale('log', base=2)
+#     plt.xticks(seq_lens, fontsize=28)
+#     plt.yticks(fontsize=28)
+#     plt.legend(fontsize=28)
+#     plt.grid(True, linestyle='--', alpha=0.5)
 
-def plot_predonly_overhead_with_errorbars():
+#     # Enhance layout and save the plot
+#     # plt.xticks(fontsize=18)  # Replace `18` with desired font size
+#     # plt.yticks(fontsize=18)
+
+#     plt.tight_layout()
+#     plot_path = "predonly_overhead_werr.pdf"
+#     plt.savefig(plot_path)
+#     print(f"Overhead plot with error bars saved to {plot_path}")
+
+
+
+def plot_predonly_overhead_with_errorbars(
+    csv_file_path: str = "pred_overhead_werr.csv",
+    output_path: str = "predonly_overhead_werr",
+):
     """
-    Plot overhead of adding the predictor vs sequence length for different models with error bars.
-    Saves the plot as predonly_overhead_werr.pdf.
+    Plot predictor-only overhead vs. sequence length for multiple models,
+    with shaded ±1 σ error bands.
+
+    The visual style (font sizes, line widths, figure size, …)
+    matches the formatting conventions used in the rest of the paper.
     """
-    csv_file_path = "pred_overhead_werr.csv"
+    # --- Global style --------------------------------------------------------
+    plt.rcParams.update(
+        {
+            "font.size": 18,
+            "axes.linewidth": 1.5,
+            "lines.linewidth": 2.5,
+        }
+    )
+
+    # --- Load & tidy data ----------------------------------------------------
     data = pd.read_csv(csv_file_path)
+    data["model_name"] = data["model_path"].apply(lambda p: p.split("/")[-1])
+    models = sorted(data["model_name"].unique())
 
-    # Extract unique model names
-    data['model_name'] = data['model_path'].apply(lambda x: x.split("/")[-1])
-    models = sorted(data['model_name'].unique())
+    # --- Figure --------------------------------------------------------------
+    plt.figure(figsize=(6, 4))  # consistent with other figures (6 × 4 in)
 
-    # Initialize the plot
-    plt.figure(figsize=(10, 5))
-
-    # Plot each model with error bars
     for model in models:
-        model_data = data[data['model_name'] == model]
-        seq_lens = model_data['seq_len']
-        overheads = model_data['overhead']
-        overhead_std = model_data['overhead_std']
+        model_df = data[data["model_name"] == model].sort_values("seq_len")
 
-        # Plot the main line
-        plt.plot(
-            seq_lens,
-            overheads,
-            label=model,
-            marker='o',
-            linewidth=2
-        )
+        x = model_df["seq_len"]
+        y = model_df["overhead"]
+        y_err = model_df["overhead_std"]
 
-        # Add shaded error region
-        plt.fill_between(
-            seq_lens,
-            overheads - overhead_std,  # Lower bound
-            overheads + overhead_std,  # Upper bound
-            alpha=0.1  # Adjust transparency of the shading
-        )
+        # Central line
+        plt.plot(x, y, marker="o", label=model, linewidth=2.5)
 
+        # Shaded error region
+        plt.fill_between(x, y - y_err, y + y_err, alpha=0.1)
 
-    # Customize the plot
-    plt.xlabel('Sequence Length (tokens)', fontsize=22)
-    plt.ylabel('Predictor Overhead (%)', fontsize=22)
-    # plt.title('Predictor Overhead vs Sequence Length', fontsize=20)
+    # --- Axes & labels -------------------------------------------------------
+    plt.xlabel("Sequence Length (tokens)")
+    plt.ylabel("Predictor Overhead (%)")
+
+    # Log-scale x-axis (base-2) with readable tick labels
+    plt.xscale("log", base=2)
+    current_ticks = plt.xticks()[0]
+    plt.xticks(current_ticks, [f"{int(t)}" for t in current_ticks])
+
     plt.xscale('log', base=2)
-    plt.xticks(seq_lens, fontsize=14)
-    plt.yticks(fontsize=14)
-    plt.legend(fontsize=22)
-    plt.grid(True, linestyle='--', alpha=0.5)
+    # --- Legend & grid -------------------------------------------------------
+    # plt.grid(True, linestyle="--", alpha=0.5)
+    plt.grid(True, linestyle="--", linewidth=1.5, alpha=0.8)
+    # plt.grid(True)
 
-    # Enhance layout and save the plot
-    plt.xticks(fontsize=18)  # Replace `18` with desired font size
-    plt.yticks(fontsize=18)
+    # plt.legend(ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.25))
+    plt.legend(fontsize=16)
 
+    # --- Save & display ------------------------------------------------------
     plt.tight_layout()
-    plot_path = "predonly_overhead_werr.pdf"
-    plt.savefig(plot_path)
-    print(f"Overhead plot with error bars saved to {plot_path}")
+    plt.savefig(f"{output_path}2.pdf", dpi=300, bbox_inches="tight")
+    print(f"Plot saved to {output_path}.pdf")
+    # plt.show()
+
+# def plot_predonly_overhead_with_errorbars():
+#     """
+#     Plot overhead of adding the predictor vs sequence length for different models with error bars.
+#     Saves the plot as predonly_overhead_werr.pdf.
+#     """
+#     csv_file_path = "pred_overhead_werr.csv"
+#     data = pd.read_csv(csv_file_path)
+
+#     # Extract unique model names
+#     data['model_name'] = data['model_path'].apply(lambda x: x.split("/")[-1])
+#     models = sorted(data['model_name'].unique())
+
+#     # Initialize the plot
+#     plt.figure(figsize=(10, 7))
+
+#     # Plot each model with error bars
+#     for model in models:
+#         model_data = data[data['model_name'] == model]
+#         seq_lens = model_data['seq_len']
+#         overheads = model_data['overhead']
+#         overhead_std = model_data['overhead_std']
+
+#         # Plot the main line
+#         plt.plot(
+#             seq_lens,
+#             overheads,
+#             label=model,
+#             marker='o',
+#             linewidth=2
+#         )
+
+#         # Add shaded error region
+#         plt.fill_between(
+#             seq_lens,
+#             overheads - overhead_std,  # Lower bound
+#             overheads + overhead_std,  # Upper bound
+#             alpha=0.1  # Adjust transparency of the shading
+#         )
+
+
+#     # Customize the plot
+#     plt.xlabel('Sequence Length (tokens)', fontsize=28)
+#     plt.ylabel('Predictor Overhead (%)', fontsize=28)
+#     # plt.title('Predictor Overhead vs Sequence Length', fontsize=20)
+#     plt.xscale('log', base=2)
+#     plt.xticks(seq_lens, fontsize=28)
+#     plt.yticks(fontsize=28)
+#     plt.legend(fontsize=28)
+#     plt.grid(True, linestyle='--', alpha=0.5)
+
+#     # Enhance layout and save the plot
+#     # plt.xticks(fontsize=18)  # Replace `18` with desired font size
+#     # plt.yticks(fontsize=18)
+
+#     plt.tight_layout()
+#     plot_path = "predonly_overhead_werr.pdf"
+#     plt.savefig(plot_path)
+#     print(f"Overhead plot with error bars saved to {plot_path}")
 
 def plot_tokhit_acc_v2():
     # Load the CSV file
@@ -939,11 +1048,11 @@ def plot_tokhit_acc_v2():
 # plot_normalized_meanjsdiv_subplots()
 # plot_normalized_tokjsdiv_subplots()
 # plot_percdrift_violin()
-plot_head_agreement()
+# plot_head_agreement()
 # plot_head_agreement_violin_all()
 plot_tokhit_accs()
 # plot_tokhit_acc_v2()
-plot_predonly_overhead_with_errorbars()
+# plot_predonly_overhead_with_errorbars()
 # plot_drift_trajectories_subplots()
 # plot_drift_to_predacc()
 # plot_tokjsdiv_violin()

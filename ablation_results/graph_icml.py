@@ -89,18 +89,18 @@ def plot_graphs(data, metric, output_file):
             subset = subset.sort_values(by='true_token_sparsity')
             line, = ax.plot(
                 subset['true_token_sparsity'], 
-                subset[metric], 
+                100 * subset[metric] if metric != 'perplexity' else subset[metric], 
                 label=wname, 
                 marker="o", 
                 linestyle="-", 
                 linewidth=2.5
             )
 
-        ax.set_title(filemap[file_type], fontsize=24)
-        ax.set_xlabel('Net Token Sparsity (%)', fontsize=22)
+        ax.set_title(filemap[file_type], fontsize=26)
+        ax.set_xlabel('Net Token Sparsity (%)', fontsize=26)
         ax.grid(True, linestyle="--", alpha=0.6)
-        ax.tick_params(axis="x", labelsize=16)
-        ax.tick_params(axis="y", labelsize=16)
+        ax.tick_params(axis="x", labelsize=26)
+        ax.tick_params(axis="y", labelsize=26)
 
         if metric == 'perplexity':
             # Get the max perplexity of method with h2o_true
@@ -109,23 +109,23 @@ def plot_graphs(data, metric, output_file):
             ax.set_ylim(min_perplexity * 0.99, max_perplexity * 1.04)
         else:
             # Get the min accuracy of h2o_true
-            min_accuracy = df[df['wname'] == "H2O"]['average_acc'].min()
-            max_accuracy = df[df['wname'] == "Oracle"]['average_acc'].max()
+            min_accuracy = 100*df[df['wname'] == "H2O"]['average_acc'].min()
+            max_accuracy = 100*df[df['wname'] == "Oracle"]['average_acc'].max()
             ax.set_ylim(min_accuracy * 0.96, max_accuracy * 1.01)
 
     # Hide unused subplots
     for ax in axes[len(data):]:
         ax.axis('off')
 
-    axes[0].set_ylabel(metric.replace('_', ' ').replace("acc", "Accuracy (%)").title(), fontsize=22)
-    axes[3].set_ylabel(metric.replace('_', ' ').replace("acc", "Accuracy (%)").title(), fontsize=22)
+    axes[0].set_ylabel(metric.replace('_', ' ').replace("acc", "Accuracy (%)").title(), fontsize=26)
+    axes[3].set_ylabel(metric.replace('_', ' ').replace("acc", "Accuracy (%)").title(), fontsize=26)
     if metric == 'perplexity':
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(
             handles, 
             labels, 
             loc='upper center', 
-            fontsize=24, 
+            fontsize=26, 
             ncol=len(labels), 
             bbox_to_anchor=(0.5, 1.0)
         )
@@ -136,6 +136,7 @@ def plot_graphs(data, metric, output_file):
         # Delete legend
         plt.tight_layout(rect=[0, 0, 1, 0.93])
     plot_path = os.path.join(output_dir, output_file)
+    print(f"Saving plot to {plot_path}")
     plt.savefig(plot_path)
     plt.close()
 
@@ -271,5 +272,5 @@ if __name__ == "__main__":
     for metric in metrics:
         output_file = f"{metric}_comparison.pdf"
         plot_graphs(combined_data, metric, output_file)
-        output_file = f"{metric}_comparison_percdiff.pdf"
-        plot_graphs_percdiff(combined_data, metric, output_file)
+        # output_file = f"{metric}_comparison_percdiff.pdf"
+        # plot_graphs_percdiff(combined_data, metric, output_file)

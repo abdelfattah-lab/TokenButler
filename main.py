@@ -45,6 +45,9 @@ from torch.cuda.amp import autocast
 import dotenv
 import wandb
 import re
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32  = True
+torch.set_float32_matmul_precision("high")   # PyTorch ≥ 2.0
 
 scaler = GradScaler('cuda', enabled=True)
 global dowandb
@@ -168,9 +171,14 @@ def run_long_bench_evaluation(model, tokenizer, args):
         print(f"Evaluating dataset: {dataset}")
         start_time = time.time()
         if args.eval_subset is None:
-            data = load_dataset('THUDM/LongBench', dataset, split='test')
+            data = load_dataset("THUDM/LongBench", dataset, split="test")
         else:
-            data = load_dataset('THUDM/LongBench', dataset, split='test[:5%]')
+            # load full split, then length‑based sampling
+            data = load_dataset("THUDM/LongBench", dataset, split="test")
+            data = data.sort("length")                            # ascending
+            n_keep = int(0.2 * len(data))     # args.eval_subset like 0.2
+            data = data.select(range(n_keep))                     # shortest N examples
+        print(f"Dataset {dataset} has average character length: {np.asarray(data['length']).mean()} after sub-selection")
         # only take a subset of the data
         prompt_format = dataset2prompt.get(dataset, "{text}")
         max_gen = dataset2maxlen.get(dataset, 256)
@@ -590,8 +598,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         dataset = dataset.remove_columns([col for col in dataset.column_names if col != "input_ids"])
         dataset.set_format(type="torch", columns=["input_ids"])
 
-    torch.cuda.empty_cache()
-    gc.collect()
+    # torch.cuda.empty_cache()
+    # gc.collect()
 
     # Prepare the DataLoader
     if args.train_subset_fac is not None:
@@ -611,7 +619,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     subset = FlattenedDataset(subset, max_seq_len, max_repeat_fraction = 0.033)
 
     print("Length of dataset after flattening: ", len(subset))
-    data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True)
+    data_loader = DataLoader(subset, batch_size=batch_size, shuffle=True, num_workers=min(8, os.cpu_count()), pin_memory=True, persistent_workers=True)
     print("Tokenization complete in ", time.time() - a, " seconds")
     model = model.float()
 
@@ -640,7 +648,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     print("Inference mode: False")
     batch_item = next(iter(data_loader))
     nsamples = len(data_loader)
-    total_steps = nsamples
+    # total_steps = nsamples
+    total_steps = math.ceil(nsamples / args.grad_accum_steps)
     print("\n\n Total Steps: ", total_steps, "\n\n")
     
 
@@ -652,7 +661,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         num_training_steps=total_steps
     )
     eval_freq = args.evalgap
-    grad_norm = 0
+    # grad_norm = 0
+    grad_norm = torch.tensor(0.0)
     min_wk2 = float('inf')
     observed_task_losses = []
     observed_head_losses = []
@@ -686,7 +696,14 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     train_progress = 0
     epoch_loss = 0.0
     running_loss = None
-    progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader), total=len(data_loader))
+    optimizer.zero_grad(set_to_none=True)                  # start with a clean grad buffer
+    progress_bar = tqdm.tqdm(
+        data_loader,
+        desc="Training...",
+        initial=step % len(data_loader),
+        total=len(data_loader)
+    )
+    # progress_bar = tqdm.tqdm(data_loader, desc="Training...", initial=step % len(data_loader), total=len(data_loader))
     for batch_idx, batch in enumerate(progress_bar):
         train_progress += 1
         try:
@@ -734,6 +751,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             tok_hit_corr.append(module.tok_mean_rank_corr)
 
             mse_match_loss = mse_match_loss / nlayers
+            # ‑‑ Scale losses so that summed grads match the original magnitude
+            mse_match_loss = mse_match_loss / args.grad_accum_steps
             observed_task_losses.append(mse_match_loss.item())
             if args.train_headpredictor:
                 observed_head_losses.append(head_match_loss.item())
@@ -747,23 +766,36 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
 
             if args.train_headpredictor:
                 mse_match_loss.backward(retain_graph=True)
-                (100 * head_match_loss).backward()
+                (100 * head_match_loss / args.grad_accum_steps).backward()
             else:
                 mse_match_loss.backward()
 
             step += 1
 
-            for producer_layer in producer_layers:
-                grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_token_predictor.parameters(), max_norm=args.max_norm)
-                if args.train_headpredictor:
-                    head_grad_norm = torch.nn.utils.clip_grad_norm_(producer_layer.sparse_head_predictor.parameters(), max_norm=args.max_norm)
+            # ► Perform optimizer update only every grad_accum_steps batches
+            if (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == nsamples:
+                for producer_layer in producer_layers:
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(
+                    #     producer_layer.sparse_token_predictor.parameters(),
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()),
+                        max_norm=args.max_norm
+                    )
+                    if args.train_headpredictor:
+                        head_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            producer_layer.sparse_head_predictor.parameters(),
+                            max_norm=args.max_norm
+                        )
 
-            if step % args.save_interval == 0:
-                save_checkpoint(args, model, optimizer, scheduler, step=step, epoch=epoch, note="intermediate")
+                if step % args.save_interval == 0:
+                    save_checkpoint(
+                        args, model, optimizer, scheduler,
+                        step=step, epoch=epoch, note="intermediate"
+                    )
 
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
             epoch_loss += mse_match_loss.item()
             if running_loss is None:
@@ -865,9 +897,14 @@ if __name__ == '__main__':
     parser.add_argument('--train_seqlen', type=int, default=512)
     parser.add_argument('--train_batch_size', type=int, default=1)
     parser.add_argument('--train_subset_fac', type=int, default=None)
-    parser.add_argument('--max_norm', type=int, default=100, help='Max Norm')
+    parser.add_argument('--max_norm', type=int, default=10, help='Max Norm')
     parser.add_argument('--pred_lr', type=float, default=1e-3, help='Predictor learning rate')
-
+    parser.add_argument(
+        '--grad_accum_steps',
+        type=int,
+        default=1,
+        help='Accumulate this many batches before optimizer.step()'
+    )
     # Evaluation Related Arguments
     parser.add_argument('--eval_wk2_seqlen', type=int, default=512)
     parser.add_argument('--num_tok_per_page', type=int, default=16, help='Number of tokens per page for Quest')

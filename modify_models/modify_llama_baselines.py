@@ -141,6 +141,59 @@ class LlamaAttentionExperimental(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+    @torch.inference_mode()                        # no grad & small overhead
+    def tactic_prefill(self, key_states: torch.Tensor):
+        B, kvH, T, D = key_states.shape
+        # paper default is m = 32; keep tensor for dtype/device parity
+        self.cluster_sz = torch.tensor(32, device=key_states.device)
+        C               = math.ceil(T / self.cluster_sz.item())     # clusters/head
+
+        # (1)  reshape once, keep fp16 / bf16
+        k = key_states.view(B * kvH, T, D)
+        # (2)  k‑means++‑like init (farthest‑point along sequence stride)
+        # init_idx = torch.linspace(0, T - 1, steps=C, dtype=torch.long,
+        #                           device=k.device)
+        # init     = k.gather(1, init_idx.unsqueeze(-1).expand(-1, -1, D))
+
+        init_idx = torch.linspace(
+            0, T - 1, steps=C, dtype=torch.long, device=k.device
+        )                                           # (C,)
+        # add the missing batch dimension and repeat for every (B·kvH) row
+        init_idx = init_idx.unsqueeze(0).expand(k.size(0), -1)     # (B·kvH, C)
+
+        # gather the vectors that sit at those positions
+        init = k.gather(
+            1,                                           # along sequence axis
+            init_idx.unsqueeze(-1)                       # (B·kvH, C, 1)
+                    .expand(-1, -1, D)                   # (B·kvH, C, D)
+        )
+        # (3)  two Lloyd iterations – empirically halves distortion
+        dist  = (k.unsqueeze(2) - init.unsqueeze(1)).pow_(2).sum(-1)
+        label = dist.argmin(-1)
+        for _ in range(2):
+            cent = torch.zeros_like(init)
+            cnt  = torch.zeros_like(init[..., :1])
+            cent.scatter_add_(1, label[..., None].expand_as(k), k)
+            cnt.scatter_add_(1, label[..., None], torch.ones_like(k[..., :1]))
+            cent = cent / cnt.clamp_min_(1)
+            dist  = (k.unsqueeze(2) - cent.unsqueeze(1)).pow_(2).sum(-1)
+            label = dist.argmin(-1)
+        centroids = cent
+        # (4)  centroid update via scatter_add → fused kernel
+        centroids = torch.zeros_like(init)
+        counts    = torch.zeros_like(init[..., :1])
+        centroids.scatter_add_(1, label[..., None].expand_as(k), k)
+        counts.scatter_add_(1, label[..., None], torch.ones_like(k[..., :1]))
+        centroids = centroids / counts.clamp_min_(1)
+
+        # (5)  store
+        self.cents       = centroids.view(B, kvH, C, D)
+        self.cluster_id  = label.view(B, kvH, T)
+        self.intra_pos   = (torch.arange(T, device=k.device)
+                            .expand(B*kvH, T) -            # trick: cumulative
+                            torch.cumsum(label.roll(1, -1) != label, dim=1)
+                        ).view(B, kvH, T)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -155,8 +208,6 @@ class LlamaAttentionExperimental(nn.Module):
         **kwargs,
     ):
         bsz, q_len, _ = hidden_states.size()
-        # convert hidden_states to same dtype as self.q_proj.weight
-        # hidden_states = hidden_states.to(self.q_proj.weight.dtype)
 
         if q_len != 1: # this is prefill stage for first token output, reset self.token_mask
                        # further, this should guarantee that token_mask is always assigned, as its always prefill first.
@@ -225,35 +276,235 @@ class LlamaAttentionExperimental(nn.Module):
             if q_len != 1:
                 attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
 
+        tactic_P = getattr(self, "tactic_threshold", 0.99)   # default 90 % mass
+                
+        # ---- MagicPig defaults -------------------------------------------
+        self.MP_NUM_SINK   = 4
+        self.MP_NUM_LOCAL  = 4
+        self.MP_K          = 10          # hyperplanes per row
+        self.MP_L          = 8         # number of rows
+        self.MP_HASH_FUNC  = torch.randn(
+                self.head_dim, self.MP_K * self.MP_L, dtype=torch.float16
+        ).to(self.q_proj.weight.device)
+        # will be broadcast to every head; you can seed() for reproducibility
+        # cache for the running hash codes (filled during the loop)
+        self._mp_hash_cache = None       # lazily allocated
         attn_o_precalc = False
         min_sparse_index = self.min_sparse_index
         with torch.no_grad():
             if evalmode == "dense":
                 attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            elif evalmode == "tactic_sim":
+                attn_weights = torch.matmul(
+                    query_states, key_states.transpose(-2, -1)
+                ) / math.sqrt(self.head_dim)
+                groups  = self.num_key_value_groups
+                self.tactic_prefill(key_states)
+                # build / refresh centroids only when cache *grew*
+                if (not hasattr(self, "cents")                or
+                    self.cents is None                       or
+                    self.cents.size(2) != math.ceil(kv_seq_len /
+                                                    self.cluster_sz.item())):
+                    self.tactic_prefill(key_states.detach())
+                if self.layer_idx == 0:
+                    # keep layer‑0 dense – many sparse papers do that
+                    pass
+                else:
+                    P          = getattr(self, "tactic_threshold", 0.9)
+                    # P = 0.8
+                    cents      = self.cents            # [B,kvH,C,D]
+                    cid        = self.cluster_id       # [B,kvH,T]
+                    # cents      = self.producer.cents            # [B,kvH,C,D]
+                    # cid        = self.producer.cluster_id       # [B,kvH,T]
+                    kvH      = cents.size(1)               # 24
+                    heads_q  = query_states.size(1)        # 24
+                    groups_q = heads_q // kvH              # 1 (must divide)
+                    cid_rep  = cid.repeat_interleave(groups_q, dim=1)   # (B,24,T)
+
+                    pos_in_c   = self.intra_pos        # [B,kvH,T]
+                    cluster_sz = int(self.cluster_sz.item()) 
+                    # pos_in_c   = self.producer.intra_pos        # [B,kvH,T]
+                    # cluster_sz = int(self.producer.cluster_sz.item()) 
+                    C          = cents.size(2)
+                    heads = heads_q   
+                    kvH        = cents.size(1)
+                    B, _, T, D = key_states.shape
+                    device, dt = key_states.device, key_states.dtype
+                    kept_k   = torch.empty(B, heads, 0, D, dtype=dt, device=device)
+                    kept_v   = torch.empty_like(kept_k)
+                    kept_idx = torch.empty(B, heads, 0, dtype=torch.long, device=device)
+                    final_mask  = torch.full((B, heads, q_len, T),
+                                            float('-inf'), device=device, dtype=dt)
+                    attn_weights = final_mask.clone()
+                    # ❷ A/x + b parameters (one per head) initialised from prefill
+                    #    Fit on 2 % random sample of logits per head (Alg.1 in paper)
+                    sample = torch.randperm(T, device=device)[: max(1, int(0.02*T))]
+                    k_samp = key_states[:, :, sample, :]                  # [B,kvH,S,D]
+                    kvH = cents.size(1)                     # already defined (= 24 here)
+                    q0 = query_states[:, :kvH, 0:1, :]      # (B, kvH, 1, D)
+                    q0 = q0.expand(-1, kvH, len(sample), -1)
+                    logits_sample = (q0 * k_samp).sum(-1).float()         # [B,kvH,S]
+                    logits_sample = logits_sample.sort(-1).values         # ascending
+                    # logits_sample = logits_sample.sort(-1, descending=True).values
+                    # simple reciprocal fit:  prob ≈ a/(rank)+b
+                    ranks   = torch.arange(1, logits_sample.size(-1)+1,
+                                        device=device).float()
+                    prob    = torch.softmax(logits_sample, -1)
+                    inv_r   = 1.0 / ranks
+                    A       = ((prob - prob.mean(-1, keepdim=True)) * inv_r).sum(-1)
+                    B_par   = prob.mean(-1) - A * inv_r.mean()            # [B,kvH]
+                    # repeat to full num_heads
+                    A     = A.repeat_interleave(groups_q, dim=1)      # (B, 72)
+                    B_par = B_par.repeat_interleave(groups_q, dim=1)  # (B, 72)
+                    heads = heads_q
+
+                    H_R = torch.cumsum(1. / torch.arange(1, C + 1, device=device, dtype=dt), 0)  # (C,)
+                    for t in range(q_len):
+                        q_t = query_states[:, :, t:t+1]
+                        cent_rep = cents.repeat_interleave(groups_q, dim=1)          # (B,H,C,D)
+                        c_scores = torch.matmul(q_t, cent_rep.transpose(-2, -1)).squeeze(2)
+                        c_idx = c_scores.argsort(-1, descending=True)         # (B,H,C)
+                        rank_idx = torch.arange(1, C + 1, device=device, dtype=dt)  # (C,)
+                        cum_mass = A.unsqueeze(-1)*H_R + B_par.unsqueeze(-1)*rank_idx
+                        # smallest R s.t. cum_mass ≥ P
+                        R_est = (cum_mass < P).sum(-1) + 1
+                        R_est = R_est.clamp(min=4, max=C)
+                        N_est = (R_est * self.cluster_sz).clamp_max_(t + 1)
+                        # R_est = (rhs <= (1 - P)).sum(-1).clamp(min=1)
+                        # N_est = (R_est * cluster_sz).clamp_max_(t + 1)        # (B,H)
+                        row_mask = torch.full((B, heads, 1, T), float('-inf'), device=device, dtype=dt)
+                        # ------------------------------------------------------------
+                        # ❸ Build a per‑head map:  cluster_id  ->  rank (1 .. C)
+                        # ------------------------------------------------------------
+
+                        rank_map = torch.empty_like(c_idx)
+                        rank_map.scatter_(2, c_idx,
+                                          torch.arange(1, C + 1, device=device)
+                                               .view(1, 1, -1)
+                                               .expand_as(c_idx))
+                        # Already (B, heads, C) – no further repeat needed
+                        tok_rank  = rank_map.gather(-1, cid_rep)     
+                        # ------------------------------------------------------------
+                        # ❹ Tokens whose cluster rank  ≤  R_est —and— that are causal
+                        # ------------------------------------------------------------
+                        causal_mask  = torch.arange(T, device=device).unsqueeze(0).unsqueeze(0) <= t
+                        gather_mask  = (tok_rank <= R_est.unsqueeze(-1)) & causal_mask          # (B,H,T)
+                        rank_in_mask = torch.cumsum(gather_mask.to(torch.int32), dim=-1)   # (B,H,T)
+                        # keep_cond = gather_mask & (rank_in_mask <= N_est.unsqueeze(-1))
+                        # keep_cond = gather_mask
+                        rank_in_mask = torch.cumsum(
+                            gather_mask.to(torch.int32), dim=-1
+                        )                                                    # (B, heads, T)
+                        keep_cond = gather_mask & (
+                            rank_in_mask <= N_est.unsqueeze(-1)
+                        )          
+                        row_mask.masked_fill_(keep_cond.unsqueeze(2), 0.0)
+                        # logits = torch.matmul(q_t, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                        # logits[:, :, :, : t + 1] += row_mask[:, :, :, : t + 1]
+                        logits = (q_t @ key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                        logits += row_mask
+                        final_mask[:, :, t:t+1, :] = row_mask
+                        attn_weights[:, :, t:t+1, :] = logits
+                        
+
+            elif evalmode == "magicpig":
+                # ---------------------------------------------
+                # 0. Dense dot products (you already had this)
+                # ---------------------------------------------
+                attn_weights = torch.matmul(
+                    query_states, key_states.transpose(-2, -1)
+                ) / math.sqrt(self.head_dim)
+
+                if self.layer_idx == 0:
+                    # keep layer‑0 dense – many sparse papers do that
+                    pass
+                else:
+                    # ------------------------------------------------------------
+                    # 1.  Build / extend the hash cache for *all* past keys
+                    # ------------------------------------------------------------
+                    bsz, n_heads, q_len, kv_seq_len = attn_weights.shape
+                    kv_heads = self.num_key_value_heads
+                    n_heads_k = key_states.size(1)   
+                    device   = attn_weights.device
+
+                    # allocate once:  [B, kvH, L, seq_len]  int16
+                    if (self._mp_hash_cache is None
+                        or self._mp_hash_cache.size(1) != n_heads_k
+                        or self._mp_hash_cache.size(-1) < kv_seq_len):
+                        self._mp_hash_cache = torch.empty(
+                            bsz, n_heads_k, self.MP_L, kv_seq_len,
+                            dtype=torch.int16, device=device
+                        )
+
+                    # hash every *new* key that appeared since last call
+                    with torch.no_grad():
+                        # keys are [B, kvH, seq_len, D]
+                        new_slice = key_states.size(-2)    # kv_seq_len == key_len
+                        k_flat = key_states               \
+                                .permute(0,1,3,2)        \
+                                .reshape(-1, self.head_dim, new_slice)
+                        # sign(k  @  W)  →  {0,1}
+                        h = torch.matmul(
+                                k_flat.transpose(1,2).contiguous().view(-1, self.head_dim),
+                                self.MP_HASH_FUNC
+                            ).gt_(0).view(
+                                -1, new_slice, self.MP_L, self.MP_K
+                            ).to(torch.int16)
+                        # pack K bits per row into a single int16
+                        bits = (h * (1 << torch.arange(self.MP_K, device=device))).sum(-1)
+                        bits = bits.permute(0,2,1).contiguous()          # [B·kvH, L, new]
+                        bits = bits.view(bsz, n_heads_k, self.MP_L, new_slice) 
+                        self._mp_hash_cache[..., :new_slice] = bits
+
+                    # ------------------------------------------------------------
+                    # 2.   Build the keep‑mask “as if decoding”
+                    # ------------------------------------------------------------
+                    comb   = bsz * n_heads
+                    A      = attn_weights.view(comb, q_len, kv_seq_len)
+                    keep   = torch.full_like(A, float('-inf'))
+
+                    sink_idx = torch.arange(min(self.MP_NUM_SINK, kv_seq_len),
+                                            device=device, dtype=torch.long)
+
+                    for i in range(q_len):                        # simulate decode
+                        # -------- mandatory ------------------------------------
+                        keep[:, i, sink_idx] = 0.0
+                        local_start = max(sink_idx[-1].item()+1, i - self.MP_NUM_LOCAL + 1)
+                        if local_start <= i:
+                            local_rng = torch.arange(local_start, i+1, device=device)
+                            keep[:, i, local_rng] = 0.0
+
+                        # -------- LSH retrieval --------------------------------
+                        # hash for the *query* token i (shape [B, kvH, L])
+                        qk = key_states[:, :, i]                  # [B, kvH, D]
+                        qhash = (qk @ self.MP_HASH_FUNC)          \
+                                    .gt_(0).to(torch.int16)       \
+                                    .view(bsz, n_heads_k, self.MP_L, self.MP_K)
+                        qhash = (qhash * (1 << torch.arange(self.MP_K, device=device))).sum(-1)
+
+                        # compare row‑by‑row: broadcast equals
+                        #    cache: [B, kvH, L, kv_seq_len]
+                        #    qhash: [B, kvH, L, 1]
+                        match = (self._mp_hash_cache[..., :kv_seq_len] ==
+                                qhash.unsqueeze(-1))        # [B, n_heads_k, MP_L, kv_seq_len]
+                        lsh_keep = match.any(dim=2)          # [B, n_heads_k, kv_seq_len]
+                        # no need to repeat_kv – we are already at n_heads
+                        lsh_keep = lsh_keep.view(comb, kv_seq_len)
+
+                        keep[:, i].masked_fill_(lsh_keep, 0.0)
+
+                    # final causal warm‑up etc.
+                    keep[:, :, :self.min_sparse_index] = 0.0
+                    # ------------------------------------------------------------
+                    self.final_mask_investigate = keep.clone()  # save for debugging
+                    final_mask = keep.clone()  # save for debugging
+                    attn_weights = attn_weights + keep
             elif evalmode in ["oracle", "random", "init_oracle", "lookahead_oracle"] or "oracle" in evalmode:
                 oracle_attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                 oracle_attn_weights = oracle_attn_weights + attention_mask
                 oracle_attn_weights = nn.functional.softmax(oracle_attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 importance_mask = oracle_attn_weights.detach().float()
-                    # if q_len != 1:
-                    #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_oracle_{self.layer_idx}.pt")
-                    # else:
-                    #     filename = f"impmasks/decode/imp_mask_oracle_{self.layer_idx}.pt"
-                    #     if not os.path.exists(filename):
-                    #         data_dict = {0: importance_mask.cpu()}
-                    #     else:
-                    #         data_dict = torch.load(filename)
-                    #     new_key = len(data_dict)
-                    #     if new_key > 10:
-                    #         exit(0)
-                    #     data_dict[new_key] = importance_mask.cpu()
-                    #     torch.save(data_dict, filename)
-                    # # if q_len != 1:
-                    # #     torch.save(importance_mask, f"impmasks/prefill/imp_mask_oracle_{self.layer_idx}.pt")
-                    # # else:
-                    # #     torch.save(importance_mask, f"impmasks/decode/imp_mask_oracle_{self.layer_idx}.pt")
                 importance_mask = torch.softmax(importance_mask, dim=-1, dtype=torch.float32)
-                    # # if q_len != 1: import pdb; pdb.set_trace()
                 if evalmode == "random":
                     importance_mask = torch.softmax(torch.rand_like(importance_mask) + attention_mask, dim=-1, dtype=torch.float32)
                 if evalmode in ["init_oracle", "lookahead_oracle"]:
@@ -633,7 +884,8 @@ class LlamaAttentionExperimental(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-
+        # if self.layer_idx == 0:
+        # self.tactic_prefill(key_states)
         
         return attn_output, attn_weights
 
@@ -672,3 +924,117 @@ def convert_kvcache_experimental(model, config, producer_frequency):
     recurse_convert(model)
     producer_layer = producer_layer.to(producer_layer_device)
     return model
+
+            # elif evalmode == "tactic_sim":
+            #     attn_weights = torch.matmul(
+            #         query_states, key_states.transpose(-2, -1)
+            #     ) / math.sqrt(self.head_dim)
+            #     groups = self.num_key_value_groups
+            #     if self.layer_idx == 0:
+            #         # keep layer‑0 dense – many sparse papers do that
+            #         pass
+            #     else:
+            #         P = getattr(self, "tactic_threshold", 0.99)
+
+            #         cents = self.producer.cents            # [B, kvH, C, D]
+            #         cid   = self.producer.cluster_id       # [B, kvH, T]
+
+            #         kvH      = cents.size(1)               # 24   (key/value heads)
+            #         heads_q  = query_states.size(1)        # 24   (query heads)
+            #         groups_q = heads_q // kvH              # 1    (must divide exactly)
+
+            #         cid_rep   = cid.repeat_interleave(groups_q, dim=1)  # (B, 72, T)
+            #         cluster_sz = getattr(self, "cluster_sz", 32)        # tokens per cluster
+            #         C          = cents.size(2)                          # clusters per head
+
+            #         B, _, T, D = key_states.shape
+            #         device, dt = key_states.device, key_states.dtype
+
+            #         final_mask  = torch.full((B, heads_q, q_len, T),
+            #                                 float('-inf'), device=device, dtype=dt)
+            #         attn_weights = final_mask.clone()
+
+            #         # ❷ A/x + b parameters (one per head) initialised from pre‑fill
+            #         sample   = torch.randperm(T, device=device)[: max(1, int(0.02 * T))]
+            #         k_samp   = key_states[:, :, sample, :]                    # [B, kvH, S, D]
+
+            #         q0 = query_states[:, :kvH, 0:1, :].expand(-1, kvH, len(sample), -1)
+            #         logits_sample = (q0 * k_samp).sum(-1).float()             # [B, kvH, S]
+            #         logits_sample = logits_sample.sort(-1).values             # ascending
+
+            #         ranks  = torch.arange(1, logits_sample.size(-1) + 1, device=device).float()
+            #         prob   = torch.softmax(logits_sample, -1)
+            #         inv_r  = 1.0 / ranks
+            #         A      = ((prob - prob.mean(-1, keepdim=True)) * inv_r).sum(-1)
+            #         B_par  = prob.mean(-1) - A * inv_r.mean()                 # [B, kvH]
+
+            #         # repeat to full num_heads
+            #         A     = A.repeat_interleave(groups_q, dim=1)              # (B, 72)
+            #         B_par = B_par.repeat_interleave(groups_q, dim=1)          # (B, 72)
+
+            #         H_R = torch.cumsum(
+            #             1.0 / torch.arange(1, C + 1, device=device, dtype=dt), dim=0
+            #         )                                                         # (C,)
+
+            #         cent_rep = cents.repeat_interleave(groups_q, dim=1)       # (B, 72, C, D)
+
+            #         for t in range(q_len):
+            #             q_t = query_states[:, :, t : t + 1]                   # (B, 72, 1, D)
+
+            #             # --- similarity to cluster centroids ----------------------------
+            #             c_scores = torch.matmul(q_t, cent_rep.transpose(-2, -1)).squeeze(2)
+            #             c_idx    = c_scores.argsort(-1, descending=True)      # (B, 72, C)
+
+            #             rhs   = A.unsqueeze(-1) * H_R + B_par.unsqueeze(-1)   # (B, 72, C)
+            #             R_est = (rhs < (1 - P)).sum(-1).add_(1)               # (B, 72)
+            #             N_est = (R_est * cluster_sz).clamp_max_(t + 1)        # (B, 72)
+
+            #             # --- build sparse mask ------------------------------------------
+            #             row_mask = torch.full((B, heads_q, 1, T),
+            #                                 float('-inf'), device=device, dtype=dt)
+
+            #             # *** FIX: restrict token matching to top‑R_est clusters ***
+            #             C_range        = torch.arange(C, device=device)                             # (C,)
+            #             keep_clusters  = C_range.unsqueeze(0).unsqueeze(0) < R_est.unsqueeze(-1)     # (B, 72, C)
+            #             cluster_match  = (cid_rep.unsqueeze(-2) == c_idx.unsqueeze(-1))              # (B, 72, C, T)
+            #             gather_mask    = (cluster_match & keep_clusters.unsqueeze(-1)).any(-2)       # (B, 72, T)
+
+            #             rank_in_mask = torch.cumsum(gather_mask.to(torch.int32), dim=-1)             # (B, 72, T)
+            #             keep_cond    = gather_mask & (rank_in_mask <= N_est.unsqueeze(-1))           # (B, 72, T)
+
+            #             row_mask.masked_fill_(keep_cond.unsqueeze(2), 0.0)
+
+            #             # --- apply mask --------------------------------------------------
+            #             logits = torch.matmul(q_t, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            #             logits += row_mask                                               # simpler, full mask
+
+            #             final_mask[:, :, t : t + 1, :] = row_mask
+            #             attn_weights[:, :, t : t + 1, :] = logits
+
+            #         attn_weights = attn_weights + attention_mask + final_mask
+            # elif evalmode == "tactic":       # ⬅️ new block
+            #     # -- 1. dense raw logits  ----------------------
+            #     logits = torch.matmul(query_states,
+            #                         key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            #     logits = logits + attention_mask    # causal
+                
+            #     # -- 2. soft‑max per head ----------------------
+            #     probs  = torch.softmax(logits.float(), dim=-1).to(value_states.dtype)
+                
+            #     # -- 3. build mask -----------------------------
+            #     keep_mask = torch.zeros_like(probs, dtype=torch.bool)
+                
+            #     # vectorised cumulative sum over last dim
+            #     cum_probs, indices = torch.sort(probs, dim=-1, descending=True)
+            #     cum_probs = torch.cumsum(cum_probs, dim=-1)
+            #     keep_flag = cum_probs < tactic_P
+            #     # always keep first token where cum≥P
+            #     keep_flag[..., 0] = True
+            #     # scatter back to original positions
+            #     keep_mask.scatter_(-1, indices, keep_flag)
+            #     # convert bool→mask (0 or −inf)
+            #     mask_tensor = torch.where(keep_mask, 0.,
+            #                             torch.tensor(float("-inf"), device=probs.device))
+            #     attn_weights = logits + mask_tensor      # reuse scaled logits
+            #     final_mask   = mask_tensor
+            #     self.final_mask_investigate = final_mask
