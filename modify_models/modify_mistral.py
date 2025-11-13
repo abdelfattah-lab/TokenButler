@@ -17,7 +17,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, MistralConfig, MistralAttention, MistralRotaryEmbedding
 
-from utils import repeat_kv, sorted_index_to_mask, SlidingWindowCache, enforce_sliding_window, threshold_to_mask
+from utils import repeat_kv, sorted_index_to_variable_mask, SlidingWindowCache, enforce_sliding_window, threshold_to_mask
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
 from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, HeadImportancePredictor, attention_mse_loss, attention
@@ -48,6 +48,7 @@ class MistralAttentionExperimental(nn.Module):
         self.dDash = None
         self.intdim = None
         self.attn_reduce_factor = None
+        self.head_attn_reduce_factor = None
         self.effective_sparsity = None
         self.min_sparse_index = None
         self.pred_hid_size = self.hidden_size
@@ -57,7 +58,17 @@ class MistralAttentionExperimental(nn.Module):
         self.train_headpredictor = False
         self.calibrate_thresholds = False
         self.test_with_thresholds = False
+        self.late_context_upweight = False
+        self.softmax_causal_loss_mse = False
+        self.softmax_causal_loss_ce = False
         self.old_predictor = None
+
+        self.low_recall_first = {}
+
+        if self.config._name_or_path not in self.low_recall_first:
+            self.lowrecall_tuples = []
+        else:
+            self.lowrecall_tuples = self.low_recall_first[self.config._name_or_path]
 
 
         if self.layer_idx > 0:
@@ -81,6 +92,44 @@ class MistralAttentionExperimental(nn.Module):
         
         self.rotary_emb = MistralRotaryEmbedding(config)
         
+    def _compute_global_head_keep(self):
+        """
+        Build a tensor  shape [num_hidden_layers, num_heads] that contains
+        the fraction of keys to keep for *every* (layer, head) pair,
+        scaled so the **model-wide** average equals self.sparse_aggression.
+        Called once, cached in self._global_head_keep.
+        """
+        L, H = self.num_hidden_layers, self.num_heads
+        keep = torch.full((L, H), float(self.sparse_aggression))
+
+        bad_pairs = self.lowrecall_tuples
+        if not bad_pairs:
+            self._global_head_keep = keep
+            return
+
+        keep_max, keep_min = 1.0, float(self.sparse_aggression)
+        N = len(bad_pairs)
+        for rank, (head_idx, layer_idx) in enumerate(bad_pairs):
+            frac = rank / (N - 1 + 1e-5)
+            keep[layer_idx, head_idx] = keep_max - frac * (keep_max - keep_min)
+
+        total_heads = L * H
+        scale = (self.sparse_aggression * total_heads) / keep.sum()
+        keep *= scale
+        keep.clamp_(max=1.0)
+
+        self._global_head_keep = keep
+
+    def build_head_keep_ratios(self):
+        """
+        Return the [num_heads] vector for *this* layer, using
+        model-global calibration. Safe to call every forward(); the
+        table is computed once and cached.
+        """
+        if not hasattr(self, "_global_head_keep"):
+            self._compute_global_head_keep()
+        return self._global_head_keep[self.layer_idx].to(next(self.parameters()).device)
+
     def update_predictor(self):
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
             self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
@@ -124,6 +173,8 @@ class MistralAttentionExperimental(nn.Module):
             self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
         else:
             raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
+
+        self.head_keep = self.build_head_keep_ratios()
             
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -235,15 +286,25 @@ class MistralAttentionExperimental(nn.Module):
                                     mask_tensor[:, :, :, -self.sliding_window:] = 0.0
                                 # import pdb; pdb.set_trace()
                             else:
-                                mask_tensor = sorted_index_to_mask(sorted_indices, attention_mask, min_sparse_index, bsz, q_len, key_len, self.sparse_aggression, self.sliding_window)
-                        # ### Threshold variance investigation
-                        # if self.sliding_window is not None:
-                        #     if not hasattr(self, "window_cache"):
-                        #         self.window_cache = SlidingWindowCache(max_seq_len=1024,
-                        #                                             sliding_window=self.sliding_window,
-                        #                                             device=mask_tensor.device)
-                        #     window = self.window_cache.get_window(q_len, key_len)
-                        #     mask_tensor = enforce_sliding_window(mask_tensor, window)
+                                mask_tensor = sorted_index_to_variable_mask(
+                                    sorted_indices,
+                                    attention_mask,
+                                    min_sparse_index,
+                                    bsz,
+                                    q_len,
+                                    key_len,
+                                    self.head_keep.to(sorted_indices.device),
+                                    sliding_window=self.sliding_window
+                                )
+                        if self.sliding_window is not None:
+                            if not hasattr(self, "window_cache"):
+                                self.window_cache = SlidingWindowCache(
+                                    max_seq_len=1024,
+                                    sliding_window=self.sliding_window,
+                                    device=mask_tensor.device,
+                                )
+                            window = self.window_cache.get_window(q_len, key_len)
+                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
 
                         self.final_mask_investigate = final_mask
@@ -362,8 +423,11 @@ class MistralAttentionExperimental(nn.Module):
             if self.calc_hitrates:
                 self.head_hit_acc, self.head_mean_rank_corr, self.head_max_rank_corr = 0, 0, 0
 
+        checkeverytime = hasattr(self, 'test_with_thresholds')
+        if checkeverytime:
+            checkeverytime = self.test_with_thresholds
         if final_mask is not None:
-            if self.effective_sparsity is None:
+            if self.effective_sparsity is None or checkeverytime:
                 true_mask = final_mask + attention_mask
                 num_deact = true_mask.bool().sum(dim=-1)                   # Number of tokens disabled.
                 causally_deact = (attention_mask.bool()).sum(dim=-1).expand_as(num_deact)        # Number of tokens disabled causally anyway
