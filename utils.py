@@ -63,15 +63,6 @@ class SlidingWindowCache:
         row_start = key_len - q_len
         row_end   = key_len
         return self.window[:, :, row_start:row_end, :key_len]
-        # req = max(q_len, key_len)
-        # if req > self.max_seq_len:
-        #     self.max_seq_len = req
-        #     self.window = self._create_window(self.max_seq_len)
-        # return self.window[:, :, row_start:row_end, :key_len]
-        # if req > self.max_seq_len:
-        #     self.max_seq_len = req
-        #     self.window = self._create_window(self.max_seq_len)
-        # return self.window[:, :, :q_len, :key_len]
 
 def enforce_sliding_window(mask_tensor, window):
     if window is None:
@@ -252,7 +243,9 @@ def sorted_index_to_variable_mask(
     
     # K_broadcast = K.view(1, 1, q_len, 1).expand_as(cum_sum)
     # selected_mask = (cum_sum <= K_broadcast)
-    selected_mask = cum_sum <= K 
+    K_original = torch.ceil(query_pos * head_keep).long()
+    K_adjusted = torch.clamp(K_original - min_sparse_index, min=0, max=key_len)
+    selected_mask = cum_sum <= K_adjusted
 
     # Step 6: Prepare final mask_tensor with -inf by default
     mask_tensor = torch.full_like(attention_mask_expanded.float(), float('-inf'))

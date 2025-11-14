@@ -62,6 +62,8 @@ class MistralAttentionExperimental(nn.Module):
         self.softmax_causal_loss_mse = False
         self.softmax_causal_loss_ce = False
         self.old_predictor = None
+        self.pairwise_loss = False
+        self.pairwise_topk_ratio = 0.1  # fraction of keys used as pos/neg in pairwise loss
 
         self.low_recall_first = {}
 
@@ -348,65 +350,226 @@ class MistralAttentionExperimental(nn.Module):
                     attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
                     attn_output = attn_output.to(query_states.dtype)
             else:
-                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)   
+            if self.flash_attn:
                 if self.layer_idx > 0:
+                    # Token hit-rates cannot be calculated if using flash attention.
+                    self.tok_hit_acc = 0
                     q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
                     k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                    importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
-                    importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
+                    q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
+                    k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
+                    device_index = query_states.device.index
+                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
+                    with torch.cuda.device(device_index):
+                        attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
+                                                                    key_states.contiguous().to(torch.float16),
+                                                                    value_states.contiguous().to(torch.float16),
+                                                                    q_importance_tensor.contiguous().to(torch.float16),
+                                                                    k_importance_tensor.contiguous().to(torch.float16), 
+                                                                    True
+                                                                    )
+                    self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = 0, 0, 0
+                    attn_output = attn_output.to(query_states.dtype)
+                    if not torch.isnan(mse_loss):
+                        self.msemagn_loss = mse_loss
+                    else:
+                        raise ValueError(f"NaN loss detected: {mse_loss}")
+                else:
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
+            else:
+                # Teacher attention logits (no mask yet)
+                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
+                if self.layer_idx > 0:
+                    # Predictor logits (importance mask)
+                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device)  # [BH, Lq, D']
+                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device)    # [BH, Lk, D']
+                    importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash)                      # [BH, Lq, Lk]
+                    importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len)                                                          # [B, H, Lq, Lk]
+
+                    # ---- build teacher & student logits used for auxiliary loss ----
                     if self.lookahead == 0:
-                        if self.softmax_causal_loss_mse:
-                            self.msemagn_loss = self.mseloss(
-                                torch.softmax(attn_weights + attention_mask, dim=-1), 
-                                torch.softmax(importance_mask + attention_mask, dim=-1)
-                                )
-                        elif self.softmax_causal_loss_ce:
-                            target_dist = F.softmax(attn_weights + attention_mask, dim=-1).detach()
-                            pred_dist = F.softmax(importance_mask + attention_mask, dim=-1)
-                            ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)  
-                            self.msemagn_loss = ce
+                        # standard causal training: apply mask before softmax-based losses
+                        if attention_mask is not None:
+                            teacher_logits = attn_weights + attention_mask      # [B,H,Lq,Lk]
+                            student_logits = importance_mask + attention_mask   # [B,H,Lq,Lk]
                         else:
-                            self.msemagn_loss = self.mseloss(attn_weights, importance_mask)
+                            teacher_logits = attn_weights
+                            student_logits = importance_mask
                     else:
-                        self.msemagn_loss = self.mseloss(attn_weights[:, :, self.lookahead:, :], importance_mask[:, :, :-self.lookahead, :])
-                    if self.late_context_upweight:
-                        # Here, if we do seq_len_q with [1,1,seq_len_q,1], we focus on rewarding longer decodes more
-                        # but,  if we do seq_len_k with [1,1,1,seq_len_k], we focus on rewarding correctness on more recent tokens more
-                        # Since we want longer decode consistency, we will do seq_len_q
-                        seq_len_q = self.msemagn_loss.shape[-2]  # Lk
-                        weighting = torch.linspace(
-                            start=0.1, 
-                            end=1.0, 
-                            steps=seq_len_q, 
-                            device=self.msemagn_loss.device
-                        )
-                        weighting = weighting.view(1, 1, seq_len_q, 1)  # shape [1, 1, 1, Lk]
-                        self.msemagn_loss = self.msemagn_loss * weighting
-                        if self.softmax_causal_loss_mse:
-                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
+                        # lookahead training: align row t (student) with row t+lookahead (teacher)
+                        # we mirror your previous raw-logit MSE semantics (no mask here)
+                        teacher_logits = attn_weights[:, :, self.lookahead:, :]        # [B,H,Lq_eff,Lk]
+                        student_logits = importance_mask[:, :, :-self.lookahead, :]    # [B,H,Lq_eff,Lk]
+
+                    # ---- Loss selection: exactly one of these should be True ----
+                    if self.softmax_causal_loss_mse:
+                        # 1) MSE between teacher and predictor distributions
+                        target_dist = F.softmax(teacher_logits, dim=-1)
+                        pred_dist   = F.softmax(student_logits, dim=-1)
+                        loss = self.mseloss(pred_dist, target_dist)                    # [B,H,Lq_eff,Lk]
+                        self.msemagn_loss = 1024*loss.mean(dim=(-1, -2)).mean()             # scalar
+
+                    elif self.softmax_causal_loss_ce:
+                        # 2) Cross-entropy / KL-like loss between distributions
+                        target_dist = F.softmax(teacher_logits, dim=-1).detach()
+                        pred_dist   = F.softmax(student_logits, dim=-1)
+                        ce = -(target_dist * (pred_dist + 1e-9).log()).sum(dim=-1)     # [B,H,Lq_eff]
+                        self.msemagn_loss = 0.1 * ce.mean()                                  # scalar
+
+                    elif getattr(self, "pairwise_loss", False):
+                        # 3) Pairwise ranking loss (logistic) on teacher-defined pairs.
+                        #
+                        # We want teacher logits WITH the causal mask applied when forming pairs,
+                        # so we don't accidentally pick future / invalid tokens.
+                        if attention_mask is not None:
+                            full_teacher_logits = attn_weights + attention_mask
+                            full_student_logits = importance_mask + attention_mask
                         else:
-                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-2, -1))  # shape [B, H]
+                            full_teacher_logits = attn_weights
+                            full_student_logits = importance_mask
+
+                        if self.lookahead == 0:
+                            teacher_logits_pw = full_teacher_logits            # [B,H,Lq,Lk]
+                            student_logits_pw = full_student_logits            # [B,H,Lq,Lk]
+                            attn_mask_eff   = attention_mask                   # [1,1,Lq,Lk] or None
+                        else:
+                            # Align row t (student) with row t+lookahead (teacher)
+                            teacher_logits_pw = full_teacher_logits[:, :, self.lookahead:, :]      # [B,H,Lq_eff,Lk]
+                            student_logits_pw = full_student_logits[:, :, :-self.lookahead, :]     # [B,H,Lq_eff,Lk]
+                            attn_mask_eff = None if attention_mask is None else attention_mask[:, :, self.lookahead:, :]
+
+                        # Teacher probabilities
+                        teacher_probs = F.softmax(teacher_logits_pw, dim=-1)    # [B,H,Lq_eff,Lk]
+                        B_eff, H_eff, Lq_eff, Lk_eff = teacher_probs.shape
+
+                        # Valid (non-masked) positions: attention_mask == 0
+                        if attn_mask_eff is not None:
+                            # attn_mask_eff: [1,1,Lq_eff,Lk]  -> broadcast to [B,H,Lq_eff,Lk]
+                            valid_mask = (attn_mask_eff == 0).expand(B_eff, H_eff, Lq_eff, Lk_eff)
+                        else:
+                            valid_mask = torch.ones_like(teacher_probs, dtype=torch.bool)
+
+                        # If some rows have no valid keys, we should ignore them in the loss
+                        valid_counts = valid_mask.reshape(-1, Lk_eff).sum(-1)      # [B_eff*H_eff*Lq_eff]
+                        has_valid = (valid_counts > 0).reshape(B_eff, H_eff, Lq_eff)  # [B_eff,H_eff,Lq_eff]
+
+                        # Hyperparameter: fraction of keys to use for pos/neg sampling
+                        topk_ratio = getattr(self, "pairwise_topk_ratio", 0.2)
+                        K = max(1, int(topk_ratio * Lk_eff))
+
+                        # --- choose positives: highest-prob valid tokens ---
+                        # invalid positions get prob -inf so they never appear in topk
+                        probs_for_top = teacher_probs.masked_fill(~valid_mask, float("-inf"))
+                        top_vals, top_idx = probs_for_top.topk(K, dim=-1)       # [B,H,Lq_eff,K]
+
+                        # --- choose negatives: lowest-prob valid tokens ---
+                        # invalid positions get prob +1.0 so they never appear among the lowest
+                        probs_for_bot = teacher_probs.masked_fill(~valid_mask, 1.0)
+                        bot_vals, bot_idx = probs_for_bot.topk(K, dim=-1, largest=False)  # [B,H,Lq_eff,K]
+
+                        # Clamp student logits to avoid inf / NaN in margin
+                        student_logits_pw = student_logits_pw.clamp(min=-1e4, max=1e4)
+
+                        # Gather student scores at those positions
+                        s = student_logits_pw                                      # [B,H,Lq_eff,Lk]
+                        s_pos = s.gather(-1, top_idx)                              # [B,H,Lq_eff,K]
+                        s_neg = s.gather(-1, bot_idx)                              # [B,H,Lq_eff,K]
+
+                        margin = s_pos - s_neg                                     # [B,H,Lq_eff,K]
+                        pairwise = F.softplus(-margin)                             # log(1 + exp(-margin))
+
+                        # Zero out rows with no valid keys (to avoid NaNs from degenerate rows)
+                        if attn_mask_eff is not None:
+                            pairwise = pairwise * has_valid.unsqueeze(-1).to(pairwise.dtype)
+
+                        self.msemagn_loss = pairwise.mean()
+
+                    elif getattr(self, "pairwise_ce_loss", False):
+                        # 3b) Pairwise CE loss: match 2-way distributions over (pos, neg) tokens
+
+                        # Use masked logits so we never pick invalid/future tokens
+                        if attention_mask is not None:
+                            full_teacher_logits = attn_weights + attention_mask
+                            full_student_logits = importance_mask + attention_mask
+                        else:
+                            full_teacher_logits = attn_weights
+                            full_student_logits = importance_mask
+
+                        if self.lookahead == 0:
+                            teacher_logits_pw = full_teacher_logits            # [B,H,Lq,Lk]
+                            student_logits_pw = full_student_logits            # [B,H,Lq,Lk]
+                            attn_mask_eff   = attention_mask                   # [1,1,Lq,Lk] or None
+                        else:
+                            teacher_logits_pw = full_teacher_logits[:, :, self.lookahead:, :]      # [B,H,Lq_eff,Lk]
+                            student_logits_pw = full_student_logits[:, :, :-self.lookahead, :]     # [B,H,Lq_eff,Lk]
+                            attn_mask_eff = None if attention_mask is None else attention_mask[:, :, self.lookahead:, :]
+
+                        # Teacher & predictor probabilities
+                        teacher_probs = F.softmax(teacher_logits_pw, dim=-1)    # [B,H,Lq_eff,Lk]
+                        pred_probs    = F.softmax(student_logits_pw, dim=-1)    # [B,H,Lq_eff,Lk]
+                        B_eff, H_eff, Lq_eff, Lk_eff = teacher_probs.shape
+
+                        # Valid (non-masked) positions
+                        if attn_mask_eff is not None:
+                            valid_mask = (attn_mask_eff == 0).expand(B_eff, H_eff, Lq_eff, Lk_eff)
+                        else:
+                            valid_mask = torch.ones_like(teacher_probs, dtype=torch.bool)
+
+                        valid_counts = valid_mask.reshape(-1, Lk_eff).sum(-1)
+                        has_valid = (valid_counts > 0).reshape(B_eff, H_eff, Lq_eff)
+
+                        # Fraction of keys to use for pos/neg sampling
+                        topk_ratio = getattr(self, "pairwise_topk_ratio", 0.2)
+                        K = max(1, int(topk_ratio * Lk_eff))
+
+                        # Positives: highest-prob valid tokens
+                        probs_for_top = teacher_probs.masked_fill(~valid_mask, float("-inf"))
+                        _, top_idx = probs_for_top.topk(K, dim=-1)                     # [B,H,Lq_eff,K]
+
+                        # Negatives: lowest-prob valid tokens
+                        probs_for_bot = teacher_probs.masked_fill(~valid_mask, 1.0)
+                        _, bot_idx = probs_for_bot.topk(K, dim=-1, largest=False)      # [B,H,Lq_eff,K]
+
+                        # Gather teacher + predictor probs for pos/neg
+                        t_pos = teacher_probs.gather(-1, top_idx)                      # [B,H,Lq_eff,K]
+                        t_neg = teacher_probs.gather(-1, bot_idx)
+                        p_pos = pred_probs.gather(-1, top_idx)
+                        p_neg = pred_probs.gather(-1, bot_idx)
+
+                        # Build 2-way distributions per pair: [ ..., K, 2 ]
+                        t_pair = torch.stack([t_pos, t_neg], dim=-1)
+                        p_pair = torch.stack([p_pos, p_neg], dim=-1)
+
+                        # Normalize along the 2-way dimension
+                        t_pair = t_pair / (t_pair.sum(dim=-1, keepdim=True) + 1e-9)
+                        p_pair = p_pair / (p_pair.sum(dim=-1, keepdim=True) + 1e-9)
+
+                        # CE over the 2-way pair distribution
+                        pair_ce = -(t_pair * (p_pair + 1e-9).log()).sum(dim=-1)       # [B,H,Lq_eff,K]
+
+                        # Zero out rows with no valid keys
+                        if attn_mask_eff is not None:
+                            pair_ce = pair_ce * has_valid.unsqueeze(-1).to(pair_ce.dtype)
+
+                        self.msemagn_loss = pair_ce.mean()
                     else:
-                        if self.softmax_causal_loss_mse:
-                            self.msemagn_loss = self.msemagn_loss.sum(dim=-2).mean(dim=-1)  # shape [B, H]
-                        else:
-                            self.msemagn_loss = self.msemagn_loss.mean(dim=(-1, -2))
-                    self.msemagn_loss = self.msemagn_loss.mean()
+                        raise ValueError("No loss selected for token importance predictor!")
 
-
+                    # ---- Metrics (optional) ----
                     if self.calc_hitrates:
+                        est   = F.softmax(student_logits, dim=-1)
+                        truth = F.softmax(teacher_logits, dim=-1)
                         self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = calculate_hit_metrics(
-                            estimated_importance=nn.functional.softmax(importance_mask + attention_mask, dim=-1),
-                            true_importance=nn.functional.softmax(attn_weights + attention_mask, dim=-1),
+                            estimated_importance=est,
+                            true_importance=truth,
                             top_k_ratio=0.5
                         )
-
+                # Main model attention path: always use teacher logits + causal mask
                 if attention_mask is not None:
                     attn_weights = attn_weights + attention_mask
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
                 attn_output = torch.matmul(attn_weights, value_states)
-
         if self.layer_idx > 0 and self.train_headpredictor:
             head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
             attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)

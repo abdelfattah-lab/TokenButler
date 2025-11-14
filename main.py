@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from random import seed, sample
+from itertools import islice
+from datasets import Dataset
 
 from typing import Any, Dict, List, Optional, Tuple
 from lm_eval.models.huggingface import HFLM
@@ -36,7 +38,7 @@ from huggingface_hub import login
 from utils import FlattenedDataset, plot_thresholds, sanitize_filename, args_to_name
 
 from longbench_utils import scorer, MODEL2MAXLEN, DATASET2PROMPT, DATASET2MAXLEN
-from datasets import load_from_disk
+from datasets import load_from_disk, concatenate_datasets
 
 from torch.utils.data import DataLoader
 from scipy.stats import kendalltau, spearmanr
@@ -597,6 +599,69 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
 
         dataset = dataset.remove_columns([col for col in dataset.column_names if col != "input_ids"])
         dataset.set_format(type="torch", columns=["input_ids"])
+    elif args.finetune_dataset == "custom_mix":
+        dataset_path = f"custom_mix_{tokenizer.name_or_path}"
+        if os.path.exists(dataset_path):
+            dataset = load_from_disk(dataset_path)
+        else:
+            parts = []
+            c4 = load_dataset(
+                "allenai/c4",
+                "realnewslike",
+                split="train[:100000]"
+            )
+            c4 = c4.select_columns(["text"])
+            print("C4 loaded with length: ", len(c4))
+            parts.append(c4)
+
+            owt = load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                "sample-10BT",
+                split="train[:100000]",
+            )
+            owt = owt.select_columns(["text"])
+            print("OpenWebText loaded with length: ", len(owt))
+            parts.append(owt)
+            stream = load_dataset(
+                "codeparrot/codeparrot-clean",
+                split="train",
+                streaming=True,
+            )
+
+            # In case HF ever returns a dict of splits
+            if isinstance(stream, dict):
+                stream = stream["train"]
+
+            buffer = []
+            for ex in islice(stream, 100_000):
+                # Keep only the content field, but rename it to "text"
+                buffer.append({"text": ex["content"]})
+
+            wiki = Dataset.from_list(buffer)
+            print("CodeParrot loaded with length:", len(wiki))
+            parts.append(wiki)
+            mixed = concatenate_datasets(parts)
+            print("Concatenated dataset length: ", len(mixed))
+
+            tokenizer.model_max_length = max_seq_len
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            dataset = mixed.shuffle(seed=42).map(
+                partial(tokenize_fn, tokenizer),
+                batched=True,
+                batch_size=512,
+                num_proc=4,
+                remove_columns=["text"],  # tokenize_fn should output input_ids
+            )
+
+            os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+            dataset.save_to_disk(dataset_path)
+
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names if col != "input_ids"]
+        )
+        dataset.set_format(type="torch", columns=["input_ids"])
 
     # torch.cuda.empty_cache()
     # gc.collect()
@@ -648,7 +713,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     print("Inference mode: False")
     batch_item = next(iter(data_loader))
     nsamples = len(data_loader)
-    # total_steps = nsamples
+    # Number of optimizer steps (i.e., calls to optimizer.step())
     total_steps = math.ceil(nsamples / args.grad_accum_steps)
     print("\n\n Total Steps: ", total_steps, "\n\n")
     
@@ -690,7 +755,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     else:
         step = 0
         epoch = 0
-        
+    opt_step = step // args.grad_accum_steps
     avg_headhit, avg_tokhit = 0, 0
     avg_headhit_corr, avg_tokhit_corr = 0, 0
     train_progress = 0
@@ -769,11 +834,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 (100 * head_match_loss / args.grad_accum_steps).backward()
             else:
                 mse_match_loss.backward()
-
-            step += 1
+            step += 1  # micro-batch step
 
             # ► Perform optimizer update only every grad_accum_steps batches
             if (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == nsamples:
+                opt_step += 1  # optimizer step
                 for producer_layer in producer_layers:
                     # grad_norm = torch.nn.utils.clip_grad_norm_(
                     #     producer_layer.sparse_token_predictor.parameters(),
@@ -787,7 +852,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             max_norm=args.max_norm
                         )
 
-                if step % args.save_interval == 0:
+                if opt_step % args.save_interval == 0:
                     save_checkpoint(
                         args, model, optimizer, scheduler,
                         step=step, epoch=epoch, note="intermediate"
@@ -805,7 +870,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             progress_bar.set_description(f"Training... (Running Loss: {running_loss:.4e})")
             torch.cuda.empty_cache()
             gc.collect()
-            if step % eval_freq == 0:
+            # Optional: make evalgap in optimizer steps rather than micro-batches
+            # If you prefer the old behavior (micro-batch based), keep `if step % eval_freq == 0:`
+            if opt_step > 0 and opt_step % eval_freq == 0 and (
+                (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == nsamples
+            ):
                 print("Subset-eval here.")
                 set_inference_mode(model, True)
                 eval_pplx, _ = evaluate_wikitext2(model=model, tokenizer=tokenizer, args=args, testenc=testenc_wk2, traintime_subset=True, config=config)
@@ -893,7 +962,7 @@ if __name__ == '__main__':
     parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
     
     # Train related arguments
-    parser.add_argument('--finetune_dataset', type=str, default="wikitext", choices=["wikitext", "c4", "c4_realnewslike", "alpaca", "redpajama"], help='Dataset to use for fine-tuning')
+    parser.add_argument('--finetune_dataset', type=str, default="wikitext", choices=["wikitext", "c4", "c4_realnewslike", "alpaca", "redpajama", "custom_mix"], help='Dataset to use for fine-tuning')
     parser.add_argument('--train_seqlen', type=int, default=512)
     parser.add_argument('--train_batch_size', type=int, default=1)
     parser.add_argument('--train_subset_fac', type=int, default=None)
@@ -925,6 +994,8 @@ if __name__ == '__main__':
     parser.add_argument('--late_context_upweight', action='store_true', help='Upweight late context')
     parser.add_argument('--softmax_causal_loss_mse', action='store_true', help='Change loss type to softmax causal MSE')
     parser.add_argument('--softmax_causal_loss_ce', action='store_true', help='Change loss type to softmax causal probability based loss.')
+    parser.add_argument('--pairwise_loss', action='store_true', help='Use pairwise loss for training.')
+    parser.add_argument('--pairwise_ce_loss', action='store_true', help='Use pairwise cross-entropy loss for training.')
     parser.add_argument('--sliding_window', type=int, default=None, help='Sliding window at eval IF comparing to SnapKV, set it to 16: Very Important!!!!!')
     parser.add_argument('--randomize_init', action='store_true', help='Very Experimental! Tries to train predictor on RANDOMLY initialized transformer...')
     parser.add_argument('--train_headpredictor', action='store_true', help='Train Head Predictor')
@@ -1084,6 +1155,8 @@ if __name__ == '__main__':
             module.late_context_upweight = args.late_context_upweight
             module.softmax_causal_loss_mse = args.softmax_causal_loss_mse
             module.softmax_causal_loss_ce = args.softmax_causal_loss_ce
+            module.pairwise_loss = args.pairwise_loss
+            module.pairwise_ce_loss = args.pairwise_ce_loss
             module.min_sparse_index = args.min_sparse_index
             module.lookahead = args.lookahead
             module.num_layers_pred = module.producer_frequency
@@ -1168,7 +1241,7 @@ if __name__ == '__main__':
     if args.model_mode == "eval":
         if args.model_load_path is not None and args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
             model_producer_layers = get_producer_layers(model)
-            producer_layer_weights = torch.load(args.model_load_path)
+            producer_layer_weights = torch.load(args.model_load_path)['model_state_dict']
             for idx, producer_layer_weight in enumerate(producer_layer_weights):
                 try:
                     model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
