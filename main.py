@@ -1080,6 +1080,7 @@ if __name__ == '__main__':
         args.producer_frequency = config.num_layers
     else:
         args.producer_frequency = config.num_hidden_layers
+    print("Using device_map:", device_map)
 
 
     if args.architecture == "llama" and "Yarn-Llama" not in model_path:

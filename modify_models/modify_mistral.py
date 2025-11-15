@@ -330,34 +330,6 @@ class MistralAttentionExperimental(nn.Module):
                     k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
                     q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
                     k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
-                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
-                    device_index = query_states.device.index
-                    with torch.cuda.device(device_index):
-                        attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
-                                                                    key_states.contiguous().to(torch.float16),
-                                                                    value_states.contiguous().to(torch.float16),
-                                                                    q_importance_tensor.contiguous().to(torch.float16),
-                                                                    k_importance_tensor.contiguous().to(torch.float16), 
-                                                                    True
-                                                                    )
-                    self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = 0, 0, 0
-                    attn_output = attn_output.to(query_states.dtype)
-                    if not torch.isnan(mse_loss):
-                        self.msemagn_loss = mse_loss
-                    else:
-                        raise ValueError(f"NaN loss detected: {mse_loss}")
-                else:
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
-                    attn_output = attn_output.to(query_states.dtype)
-            else:
-            if self.flash_attn:
-                if self.layer_idx > 0:
-                    # Token hit-rates cannot be calculated if using flash attention.
-                    self.tok_hit_acc = 0
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                    q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
-                    k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
                     device_index = query_states.device.index
                     assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
                     with torch.cuda.device(device_index):

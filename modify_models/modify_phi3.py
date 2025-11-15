@@ -15,8 +15,13 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, Phi3Config, Phi3Attention, Phi3RotaryEmbedding
-
+from transformers.models.phi3.modeling_phi3 import (
+    apply_rotary_pos_emb,
+    Phi3Config,
+    Phi3Attention,
+    Phi3RotaryEmbedding,
+)
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from utils import repeat_kv, sorted_index_to_variable_mask, SlidingWindowCache, enforce_sliding_window, threshold_to_mask
 from utils import calculate_hit_metrics
 from transformers.cache_utils import DynamicCache
@@ -25,6 +30,53 @@ from predictor import TokenImportancePredictorAttentive, PredictorDynamicCache, 
 
 from triton_kernels.flash_attn import attention
 from triton_kernels.flash_attn_mse_loss import attention_mse_loss
+
+class Phi3LongRoPEScaledRotaryEmbedding(Phi3RotaryEmbedding):
+    def __init__(self, config, dim, device=None):
+        # HF Phi3RotaryEmbedding expects `config` as first arg in your version
+        super().__init__(config, device=device)
+
+        # Now override / add attributes for LongRoPE behavior
+        self.dim = dim
+        self.max_position_embeddings = config.max_position_embeddings
+        self.base = config.rope_theta
+
+        self.short_factor = config.rope_scaling["short_factor"]
+        self.long_factor = config.rope_scaling["long_factor"]
+        self.original_max_position_embeddings = config.original_max_position_embeddings
+
+    @torch.no_grad()
+    def forward(self, x, position_ids, seq_len=None):
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(self.long_factor, dtype=torch.float32, device=x.device)
+        else:
+            ext_factors = torch.tensor(self.short_factor, dtype=torch.float32, device=x.device)
+
+        inv_freq_shape = torch.arange(0, self.dim, 2, dtype=torch.int64, device=x.device).float() / self.dim
+        self.inv_freq = 1.0 / (ext_factors * self.base**inv_freq_shape)
+
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        # Force float32 since bfloat16 loses precision on long contexts
+        # See https://github.com/huggingface/transformers/pull/29285
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+
+            scale = self.max_position_embeddings / self.original_max_position_embeddings
+            if scale <= 1.0:
+                scaling_factor = 1.0
+            else:
+                scaling_factor = math.sqrt(1 + math.log(scale) / math.log(self.original_max_position_embeddings))
+
+            cos = emb.cos() * scaling_factor
+            sin = emb.sin() * scaling_factor
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 
 class Phi3AttentionExperimental(nn.Module):
     def __init__(self, config: Phi3Config, producer=None, layer_idx=0):
@@ -98,9 +150,16 @@ class Phi3AttentionExperimental(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        self.rotary_emb = Phi3RotaryEmbedding(
-            config=self.config
-        )
+        if self.rope_scaling is None:
+            # Your HF Phi3RotaryEmbedding takes config as first arg, so do the same:
+            self.rotary_emb = Phi3RotaryEmbedding(self.config)
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            if scaling_type == "longrope":
+                # ✅ config first, then dim
+                self.rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(self.config, self.head_dim)
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
     def _compute_global_head_keep(self):
         """
@@ -219,14 +278,28 @@ class Phi3AttentionExperimental(nn.Module):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        
-        if use_cache:
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-
+        # --- 2.2: RoPE + cache semantics (match stock Phi-3, incl. LongRoPE & sliding window) ---
         kv_seq_len = key_states.shape[-2]
+        past_kv_len = 0
+        if past_key_value is not None:
+            # DynamicCache exposes `get_usable_length`, custom caches might only expose `get_seq_length`.
+            if hasattr(past_key_value, "get_usable_length"):
+                past_kv_len = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            elif hasattr(past_key_value, "get_seq_length"):
+                past_kv_len = past_key_value.get_seq_length(self.layer_idx)
+            kv_seq_len += past_kv_len
+
+        # For Phi-3-mini-128k-instruct this will be a LongRoPE embedding under the hood.
+        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if use_cache and past_key_value is not None:
+            # Pass RoPE cos/sin into the cache (same as stock Phi-3 behavior).
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
         final_mask = None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -235,17 +308,21 @@ class Phi3AttentionExperimental(nn.Module):
         key_len = key_states.size(2)
         bsz, q_len = query_states.size(0), query_states.size(2)
 
+        # --- 2.3: attention mask when `attention_mask is None` ---
+        # If we weren't given a 4D mask (e.g. calling this module directly),
+        # build the same mask HF would via `_prepare_4d_causal_attention_mask`.
         if attention_mask is None:
-            # We want a [q_len, kv_seq_len] boolean upper-triangular mask
-            causal_mask_2d = torch.ones(q_len, kv_seq_len, 
-                                        device=hidden_states.device, 
-                                        dtype=torch.bool).triu(diagonal=1)
-            # Then shape it to [bsz, 1, q_len, kv_seq_len]
-            causal_mask_4d = causal_mask_2d.unsqueeze(0).expand(bsz, 1, q_len, kv_seq_len)
-            # Now fill -inf where the mask is True
-            attention_mask = torch.full_like(causal_mask_4d, 0, dtype=hidden_states.dtype)
-            if q_len != 1:
-                attention_mask = attention_mask.masked_fill(causal_mask_4d, float("-inf"))
+            sliding_window = getattr(self, "sliding_window", None)
+            if sliding_window is None:
+                sliding_window = getattr(self.config, "sliding_window", None)
+
+            attention_mask = _prepare_4d_causal_attention_mask(
+                None,                    # no 2D pad mask provided
+                (bsz, q_len),            # (batch_size, query_length)
+                hidden_states,           # only dtype/device are used
+                past_kv_len,             # length of KV cache *before* adding current tokens
+                sliding_window=sliding_window,
+            )
 
         if self.inference_mode:
             min_sparse_index = self.min_sparse_index
@@ -328,35 +405,6 @@ class Phi3AttentionExperimental(nn.Module):
             attn_output = torch.matmul(attn_weights, value_states)
 
         else:
-            if self.flash_attn:
-                if self.layer_idx > 0:
-                    # Token hit-rates cannot be calculated if using flash attention.
-                    self.tok_hit_acc = 0
-                    q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                    k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
-                    q_importance_tensor = q_importance_tensor.view(bsz, self.num_heads, q_len, self.dDash)
-                    k_importance_tensor = k_importance_tensor.view(bsz, self.num_heads, key_len, self.dDash)
-                    assert self.lookahead == 0, "Lookahead not supported with flash attention yet. Please disable --flash_attn"
-                    device_index = query_states.device.index
-                    with torch.cuda.device(device_index):
-                        attn_output, mse_loss = attention_mse_loss(query_states.contiguous().to(torch.float16),
-                                                                    key_states.contiguous().to(torch.float16),
-                                                                    value_states.contiguous().to(torch.float16),
-                                                                    q_importance_tensor.contiguous().to(torch.float16),
-                                                                    k_importance_tensor.contiguous().to(torch.float16), 
-                                                                    True
-                                                                    )
-                    self.tok_hit_acc, self.tok_mean_rank_corr, self.tok_max_rank_corr = 0, 0, 0
-                    attn_output = attn_output.to(query_states.dtype)
-                    if not torch.isnan(mse_loss):
-                        self.msemagn_loss = mse_loss
-                    else:
-                        raise ValueError(f"NaN loss detected: {mse_loss}")
-                else:
-                    print(f'shape of query_states: {query_states.shape}')
-                    attn_output = torch.nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=None, is_causal=True)
-                    attn_output = attn_output.to(query_states.dtype)
-            else:
             if self.flash_attn:
                 if self.layer_idx > 0:
                     # Token hit-rates cannot be calculated if using flash attention.
@@ -655,7 +703,14 @@ class Phi3AttentionExperimental(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights
+        # Match the original Phi3Attention interface:
+        # (attn_output, attn_weights, present_key_value)
+        # present_key_value is just `past_key_value` (the Cache object) possibly updated in-place.
+        return attn_output, attn_weights, past_key_value
+        # if not output_attentions:
+        #     attn_weights = None
+
+        # return attn_output, attn_weights
 
 def convert_kvcache_experimental(model, config, producer_frequency):
     producer_layer = None
