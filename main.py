@@ -64,57 +64,139 @@ except:
 
 torch.backends.cuda.enable_flash_sdp(True)
 
+import copy
+import hashlib
+import os
+
+MAX_NAME_LEN = 200  # safely below 255 bytes per component
+
+def _name_from_args_for_fs(args, timestamp: bool):
+    """
+    Safer wrapper around args_to_name that:
+      - removes huge path-like fields from args
+      - truncates long names and appends a hash
+    """
+    # Work on a copy so we don't mutate the real args
+    passargs = copy.deepcopy(args)
+
+    # Any fields that can contain full paths or very long strings
+    for field in ["model_load_path", "model_resume_path", "result_file"]:
+        if hasattr(passargs, field):
+            val = getattr(passargs, field)
+            if isinstance(val, str) and val is not None:
+                # Only keep basename instead of full /mnt/home/... path
+                setattr(passargs, field, os.path.basename(val))
+
+    folder_name, file_name = args_to_name(passargs, timestamp)
+
+    def shorten(s: str) -> str:
+        if len(s) <= MAX_NAME_LEN:
+            return s
+        h = hashlib.sha1(s.encode()).hexdigest()[:8]
+        # keep prefix + hash
+        return s[: MAX_NAME_LEN - 9] + "_" + h
+
+    return shorten(folder_name), shorten(file_name)
+
+# def save_model(args, model, note=None):
+#     if note is None:
+#         timestamp = True
+#     else:
+#         timestamp = False
+#     passargs = args
+#     passargs.model_resume_path = None
+
+#     folder_name, file_name = args_to_name(passargs, timestamp)
+#     folder_path = "expt_model/" + folder_name
+#     if not os.path.exists("expt_model"):
+#         os.makedirs("expt_model")
+#     os.makedirs(folder_path, exist_ok=True)
+#     model_savepath_name = os.path.join(folder_path, file_name)
+#     if note is not None:
+#         model_savepath_name += "_" + note
+#     print(f"Model will be saved at: {model_savepath_name}")
+#     model_producer_layer = get_producer_layers(model)
+#     torch.save([layer_p.state_dict() for layer_p in model_producer_layer], model_savepath_name + ".pt")
 
 def save_model(args, model, note=None):
     if note is None:
         timestamp = True
     else:
         timestamp = False
-    passargs = args
-    passargs.model_resume_path = None
 
-    folder_name, file_name = args_to_name(passargs, timestamp)
-    folder_path = "expt_model/" + folder_name
+    # Use safe naming helper
+    folder_name, file_name = _name_from_args_for_fs(args, timestamp)
+
+    folder_path = os.path.join("expt_model", folder_name)
     if not os.path.exists("expt_model"):
         os.makedirs("expt_model")
     os.makedirs(folder_path, exist_ok=True)
+
     model_savepath_name = os.path.join(folder_path, file_name)
     if note is not None:
         model_savepath_name += "_" + note
+
     print(f"Model will be saved at: {model_savepath_name}")
     model_producer_layer = get_producer_layers(model)
-    torch.save([layer_p.state_dict() for layer_p in model_producer_layer], model_savepath_name + ".pt")
+    torch.save([layer_p.state_dict() for layer_p in model_producer_layer],
+               model_savepath_name + ".pt")
+
+
+# def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
+#     """
+#     Saves a model checkpoint with detailed experimental information in the name.
+    
+#     Args:
+#         args: Experimental arguments for generating the checkpoint name.
+#         model: The model to save.
+#         optimizer: The optimizer state to save.
+#         scheduler: The scheduler state to save.
+#         step: Current training step.
+#         epoch: Current epoch.
+#         note: Additional note to append to the checkpoint file name.
+#     """
+#     # Generate folder and file name based on args
+#     timestamp = note is None
+    
+#     passargs = args
+#     passargs.model_resume_path = None
+#     folder_name, file_name = args_to_name(passargs, timestamp)
+
+#     # Create folder path for checkpoints
+#     folder_path = os.path.join("checkpoints", folder_name)
+#     os.makedirs(folder_path, exist_ok=True)
+
+#     # Append step and epoch to the file name for clarity
+#     checkpoint_file_name = f"{file_name[-40:]}"
+#     model_producer_layer = get_producer_layers(model)
+#     checkpoint_path = os.path.join(folder_path, f"{checkpoint_file_name}.pt")
+
+#     # Save the checkpoint
+#     torch.save({
+#         'wandb_step': wandb.run.step,
+#         'step': step,
+#         'epoch': epoch,
+#         'model_state_dict': [layer_p.state_dict() for layer_p in model_producer_layer],
+#         'optimizer_state_dict': optimizer.state_dict(),
+#         'scheduler_state_dict': scheduler.state_dict()
+#     }, checkpoint_path)
+
+#     print(f"Checkpoint saved at: {checkpoint_path}")
 
 def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
-    """
-    Saves a model checkpoint with detailed experimental information in the name.
-    
-    Args:
-        args: Experimental arguments for generating the checkpoint name.
-        model: The model to save.
-        optimizer: The optimizer state to save.
-        scheduler: The scheduler state to save.
-        step: Current training step.
-        epoch: Current epoch.
-        note: Additional note to append to the checkpoint file name.
-    """
-    # Generate folder and file name based on args
     timestamp = note is None
-    
-    passargs = args
-    passargs.model_resume_path = None
-    folder_name, file_name = args_to_name(passargs, timestamp)
 
-    # Create folder path for checkpoints
+    # Use safe naming helper
+    folder_name, file_name = _name_from_args_for_fs(args, timestamp)
+
     folder_path = os.path.join("checkpoints", folder_name)
     os.makedirs(folder_path, exist_ok=True)
 
-    # Append step and epoch to the file name for clarity
+    # Keep your idea of truncating the file name itself
     checkpoint_file_name = f"{file_name[-40:]}"
     model_producer_layer = get_producer_layers(model)
     checkpoint_path = os.path.join(folder_path, f"{checkpoint_file_name}.pt")
 
-    # Save the checkpoint
     torch.save({
         'wandb_step': wandb.run.step,
         'step': step,
