@@ -6,7 +6,7 @@ python main.py \
     --model_mode finetune \
     --finetune_dataset custom_mix \
     --train_subset_fac 1 \
-    --train_seqlen 2048 \
+    --train_seqlen 1024 \
     --eval_llm_mode ExpPred \
     --grad_accum_steps 8 \
     --result_file "L3_8B_R1.csv" \
@@ -16,7 +16,7 @@ python main.py \
     --dDash 32 \
     --intdim 1024 \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 2048 \
+    --eval_wk2_seqlen 1024 \
     --softmax_causal_loss_ce
 
 ### Llama-3.2-1B Training Script
@@ -51,7 +51,7 @@ python main.py \
     --model_mode finetune \
     --finetune_dataset custom_mix \
     --train_subset_fac 1 \
-    --train_seqlen 2048 \
+    --train_seqlen 1024 \
     --eval_llm_mode ExpPred \
     --grad_accum_steps 8 \
     --result_file "L3_3Bi.csv" \
@@ -61,7 +61,7 @@ python main.py \
     --dDash 16 \
     --intdim 1024 \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 2048 \
+    --eval_wk2_seqlen 1024 \
     --softmax_causal_loss_ce
 
 
@@ -73,7 +73,7 @@ python main.py \
     --model_mode finetune \
     --finetune_dataset custom_mix \
     --train_subset_fac 1 \
-    --train_seqlen 2048 \
+    --train_seqlen 1024 \
     --eval_llm_mode ExpPred \
     --grad_accum_steps 8 \
     --result_file "L3_8Bi.csv" \
@@ -83,32 +83,11 @@ python main.py \
     --dDash 32 \
     --intdim 1024 \
     --eval_subset 1000 \
-    --eval_wk2_seqlen 2048 \
+    --eval_wk2_seqlen 1024 \
     --train_batch_size 1 \
     --softmax_causal_loss_ce
+  
 
-### microsoft/Phi-3-mini-128k-instruct Training Script
-python main.py \
-    --proj_name TokenButler_14Nov \
-    --model_path microsoft/Phi-3-mini-128k-instruct \
-    --token_sparse_method fixed_40pc \
-    --architecture phi3 \
-    --model_mode finetune \
-    --finetune_dataset custom_mix \
-    --train_subset_fac 1 \
-    --train_seqlen 2048 \
-    --eval_llm_mode ExpPred \
-    --grad_accum_steps 8 \
-    --result_file "P3mini_128k.csv" \
-    --wname P3mini_128k \
-    --pred_lr 1e-3 \
-    --train_batch_size 1 \
-    --dDash 32 \
-    --intdim 1024 \
-    --eval_subset 1000 \
-    --eval_wk2_seqlen 2048 \
-    --train_batch_size 1 \
-    --softmax_causal_loss_ce --model_parallelism
 
 ###  Do not bother retraining the models below.
     

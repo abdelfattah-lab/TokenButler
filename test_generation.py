@@ -645,8 +645,10 @@ if __name__ == '__main__':
     if args.architecture == "llama" and "Yarn-Llama" not in model_path:
         print("Running module replacement")
         if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            from modify_models.modify_llama import convert_kvcache_experimental
-            from modify_models.modify_llama import LlamaAttentionExperimental
+            # from modify_models.modify_llama import convert_kvcache_experimental
+            # from modify_models.modify_llama import LlamaAttentionExperimental
+            from modify_models.modify_llama_performance import convert_kvcache_experimental
+            from modify_models.modify_llama_performance import LlamaAttentionExperimental
         else:
             from modify_models.modify_llama_baselines import convert_kvcache_experimental
             from modify_models.modify_llama_baselines import LlamaAttentionExperimental
@@ -733,7 +735,7 @@ if __name__ == '__main__':
 
     if args.model_load_path is not None:
         model_producer_layers = get_producer_layers(model)
-        producer_layer_weights = torch.load(args.model_load_path)
+        producer_layer_weights = torch.load(args.model_load_path)['model_state_dict']
         for idx, producer_layer_weight in enumerate(producer_layer_weights):
             try:
                 model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)

@@ -663,6 +663,94 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         )
         dataset.set_format(type="torch", columns=["input_ids"])
 
+    elif args.finetune_dataset == "custom_mix_long":
+        dataset_path = f"custom_mix_long_{tokenizer.name_or_path}"
+        if os.path.exists(dataset_path):
+            dataset = load_from_disk(dataset_path)
+        else:
+            parts = []
+            # ----- 1) Same short/medium‑context mix as custom_mix -----
+            c4 = load_dataset(
+                "allenai/c4",
+                "realnewslike",
+                split="train[:30000]"
+            )
+            c4 = c4.select_columns(["text"])
+            print("C4 loaded with length: ", len(c4))
+            parts.append(c4)
+
+            owt = load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                "sample-10BT",
+                split="train[:30000]",
+            )
+            owt = owt.select_columns(["text"])
+            print("OpenWebText loaded with length: ", len(owt))
+            parts.append(owt)
+
+            stream = load_dataset(
+                "codeparrot/codeparrot-clean",
+                split="train",
+                streaming=True,
+            )
+            if isinstance(stream, dict):
+                stream = stream["train"]
+
+            buffer = []
+            for ex in islice(stream, 30000):
+                buffer.append({"text": ex["content"]})
+            wiki = Dataset.from_list(buffer)
+            print("CodeParrot loaded with length:", len(wiki))
+            parts.append(wiki)
+
+            # ----- 2) BABILong long‑context sequences (2k/4k/8k/16k) -----
+            # Configs correspond to target context lengths.
+            ctx_sizes = ["2k", "4k", "8k", "16k"]
+            # ctx_sizes = ["8k", "16k"]
+            # BABILong paper describes 10 tasks; you can bump this to 20 if you want.
+            qa_splits = [f"qa{i}" for i in range(1, 11)]
+
+            babilong_splits = []
+            for ctx in ctx_sizes:
+                for qa in qa_splits:
+                    print(f"Loading BABILong ctx={ctx}, split={qa}")
+                    ds = load_dataset("RMT-team/babilong", ctx, split=qa)
+                    # Collapse (input, question, target) into one text field
+                    ds = ds.map(
+                        lambda ex: {
+                            "text": ex["input"] + "\n" + ex["question"] + "\n" + ex["target"]
+                        },
+                        remove_columns=ds.column_names,
+                    )
+                    babilong_splits.append(ds)
+
+            if len(babilong_splits) > 0:
+                babilong = concatenate_datasets(babilong_splits)
+                print("BABILong total length:", len(babilong))
+                parts.append(babilong)
+
+            mixed = concatenate_datasets(parts)
+            print("Concatenated (custom_mix_long) dataset length: ", len(mixed))
+
+            tokenizer.model_max_length = max_seq_len
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            dataset = mixed.shuffle(seed=42).map(
+                partial(tokenize_fn, tokenizer),
+                batched=True,
+                batch_size=512,
+                num_proc=16,
+                remove_columns=["text"],
+            )
+
+            os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+            dataset.save_to_disk(dataset_path)
+
+        dataset = dataset.remove_columns(
+            [col for col in dataset.column_names if col != "input_ids"]
+        )
+        dataset.set_format(type="torch", columns=["input_ids"])
     # torch.cuda.empty_cache()
     # gc.collect()
 
@@ -688,6 +776,20 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     print("Tokenization complete in ", time.time() - a, " seconds")
     model = model.float()
 
+    # for param in model.parameters():
+    #     param.requires_grad = False
+    # producer_layers = get_producer_layers(model)
+    # for producer_layer in producer_layers:
+    #     for param in producer_layer.sparse_token_predictor.parameters():
+    #         param.requires_grad = True
+    #     if args.train_headpredictor:
+    #         for param in producer_layer.sparse_head_predictor.parameters():
+    #             param.requires_grad = True
+    
+    # print("Set producer layer parameters to require gradients.")
+    
+    # optimizer = torch.optim.AdamW(
+
     for param in model.parameters():
         param.requires_grad = False
     producer_layers = get_producer_layers(model)
@@ -697,9 +799,28 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         if args.train_headpredictor:
             for param in producer_layer.sparse_head_predictor.parameters():
                 param.requires_grad = True
-    
+
     print("Set producer layer parameters to require gradients.")
-    
+
+    # Optional: initialize predictor from a pre-trained checkpoint
+    if getattr(args, "predictor_init_path", None):
+        print(f"Initializing predictor from {args.predictor_init_path}")
+        ckpt = torch.load(args.predictor_init_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            # full training checkpoint: use the stored producer layer weights
+            producer_layer_weights = ckpt["model_state_dict"]
+        else:
+            # plain list from save_model()
+            producer_layer_weights = ckpt
+
+        model_producer_layers = get_producer_layers(model)
+        for idx, producer_layer_weight in enumerate(producer_layer_weights):
+            try:
+                model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
+                print(f"Loaded predictor init weights for producer layer {idx}")
+            except Exception as e:
+                print(f"[predictor_init] Error loading producer layer {idx}: {e}")
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.pred_lr
@@ -951,6 +1072,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_mode', type=str, default="eval", choices=["eval", "finetune"])
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load model')
     parser.add_argument('--model_resume_path', type=str, default=None, help='Path to resume training (includes optimizer, scheduler, and step states).')
+    parser.add_argument(
+        '--predictor_init_path',
+        type=str,
+        default=None,
+        help='Path to pre-trained predictor weights (producer layers only; no optimizer/scheduler).',
+    )
     parser.add_argument('--save_interval', type=int, default=500, help='Number of steps after which to save a checkpoint.')
     parser.add_argument('--architecture', type=str, default="llama", choices=["llama", "mistral", "mixtral", "qwen", "glm", "phi3"])
     parser.add_argument('--model_path', type=str, default="meta-llama/Llama-2-7b-hf", help='Selected model')
@@ -962,7 +1089,7 @@ if __name__ == '__main__':
     parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
     
     # Train related arguments
-    parser.add_argument('--finetune_dataset', type=str, default="wikitext", choices=["wikitext", "c4", "c4_realnewslike", "alpaca", "redpajama", "custom_mix"], help='Dataset to use for fine-tuning')
+    parser.add_argument('--finetune_dataset', type=str, default="wikitext", choices=["wikitext", "c4", "c4_realnewslike", "alpaca", "redpajama", "custom_mix", "custom_mix_long"], help='Dataset to use for fine-tuning')
     parser.add_argument('--train_seqlen', type=int, default=512)
     parser.add_argument('--train_batch_size', type=int, default=1)
     parser.add_argument('--train_subset_fac', type=int, default=None)
