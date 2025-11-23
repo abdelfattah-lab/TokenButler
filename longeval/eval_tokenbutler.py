@@ -213,6 +213,7 @@ def configure_experimental_modules(model, args):
             module.num_layers_pred = args.producer_frequency
             module.sliding_window = args.sliding_window
 
+            module.tokenbutler_variant = args.tokenbutler_variant
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
                     module.update_predictor()
@@ -367,6 +368,22 @@ def parse_args() -> Namespace:
     p.add_argument("--sliding_window", type=int, default=None)
     p.add_argument("--train_headpredictor", action="store_true")
     p.add_argument("--flash_attn", action="store_true")
+    
+    p.add_argument(
+        '--tokenbutler',
+        action='store_true',
+        help='Use original TokenButler predictor (baseline: learned Q+K mini-transformer).',
+    )
+    p.add_argument(
+        '--tokenbutler_slice',
+        action='store_true',
+        help='Use TokenButler variant with learned Q and K taken as the first dDash dims of the real key cache.',
+    )
+    p.add_argument(
+        '--tokenbutler_project',
+        action='store_true',
+        help='Use TokenButler variant with learned Q and a learned linear projection of the real key cache.',
+    )
     p.add_argument(
         "--predictor_ckpt",
         type=str,
@@ -409,6 +426,25 @@ if __name__ == "__main__":
         torch.backends.cuda.enable_flash_sdp(True)
     except Exception:
         pass
+
+    variant_flags = [
+        args.tokenbutler,
+        args.tokenbutler_slice,
+        args.tokenbutler_project,
+    ]
+    if sum(bool(x) for x in variant_flags) > 1:
+        raise ValueError(
+            "Please specify at most one of "
+            "--tokenbutler, --tokenbutler_slice, or --tokenbutler_project."
+        )
+    if args.tokenbutler_slice:
+        args.tokenbutler_variant = "tokenbutler_slice"
+    elif args.tokenbutler_project:
+        args.tokenbutler_variant = "tokenbutler_project"
+    else:
+        # Default: original predictor (paper behaviour)
+        args.tokenbutler_variant = "tokenbutler"
+
 
     # Load tokenizer & config
     tokenizer = AutoTokenizer.from_pretrained(

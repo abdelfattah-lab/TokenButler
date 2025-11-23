@@ -256,83 +256,191 @@ class PredictorDynamicCache(DynamicCache):
         return out
 
 
+# class TokenImportancePredictorAttentive(nn.Module):
+#     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
+#                  attn_reduce_factor, dropout=0.1):
 class TokenImportancePredictorAttentive(nn.Module):
-    def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-                 attn_reduce_factor, dropout=0.1):
-        """
-        Optimized Token Importance Predictor with parallel Q-K projections and simplified mapping.
-        
-        Args:
-            config: Configuration object containing model parameters.
-            pred_hid_size (int): Hidden size for the predictor's attention layer.
-            num_heads (int): Number of attention heads.
-            num_hidden_layers (int): Number of transformer layers to predict.
-            dropout (float): Dropout probability.
-            q_downscale (int): Factor to downscale the Q dimension for efficiency.
-            intermediate_dim (int): Intermediate dimension for non-linear transformations in projections.
-        """
+    def __init__(
+        self,
+        config,
+        pred_hid_size,
+        num_heads,
+        num_hidden_layers,
+        dDash,
+        intdim,
+        attn_reduce_factor,
+        dropout: float = 0.1,
+        predictor_variant: str = "tokenbutler",
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = pred_hid_size
         self.num_heads = num_heads
+        # In the original TokenButler code this is "num layers we predict for".
+        # For slice/project we will override it to n_layer_factor.
         self.num_hidden_layers = num_hidden_layers
         self.dropout = dropout
-        self.head_dim = pred_hid_size // (num_heads * 4) # Predictor head dimension is not the same as the model head dimension.
+        self.head_dim = pred_hid_size // (num_heads * 4)
         self.rope_theta = config.rope_theta
         self.dDash = dDash
         self.intermediate_dim = intdim
         self.attn_reduce_factor = attn_reduce_factor
         self.max_position_embeddings = config.max_position_embeddings
         self.flash_attn = False
-        assert pred_hid_size % (num_heads * 4) == 0, "pred_hid_size must be divisible by num_heads * 4."
+        self.predictor_variant = predictor_variant
 
-        # Reduce the hidden size for attention computations
-        self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor  # For example, reduce to 1/4th
-        assert self.hidden_size_reduced % self.num_heads == 0, "Reduced hidden size must be divisible by num_heads"
+        # Real model head dim (for projecting true K cache)
+        num_attn_heads = getattr(config, "num_attention_heads", num_heads)
+        self.model_head_dim = config.hidden_size // num_attn_heads
+
+        assert (
+            pred_hid_size % (num_heads * 4) == 0
+        ), "pred_hid_size must be divisible by num_heads * 4."
+
+        # For slice/project we enforce dDash ≤ head_dim (because we slice/project Ks)
+        if self.predictor_variant in ("tokenbutler_slice", "tokenbutler_project"):
+            if self.dDash > self.model_head_dim:
+                raise ValueError(
+                    f"dDash={self.dDash} must be <= model head dim={self.model_head_dim} "
+                    "for tokenbutler_slice / tokenbutler_project."
+                )
+
+        # Reduced hidden size for the (optional) mini self-attention
+        self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor
+        assert (
+            self.hidden_size_reduced % self.num_heads == 0
+        ), "Reduced hidden size must be divisible by num_heads"
         self.attn_head_dim = self.hidden_size_reduced // self.num_heads
 
-        # Input projection to reduce hidden size
-        self.input_proj = nn.Linear(self.hidden_size, self.hidden_size_reduced, bias=False)
-
-        # Query, Key, Value projections for attention
-        self.q_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
-        self.k_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
-        self.v_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
-        # Output projection to restore hidden size
-        # self.o_proj_attn = nn.Linear(self.hidden_size_reduced, self.hidden_size_reduced, bias=False)
-        self.attn_dropout = nn.Dropout(self.dropout)
-
-        # LayerNorm and Feed-forward network
-        self.norm1 = nn.LayerNorm(self.hidden_size_reduced)
-        self.norm2 = nn.LayerNorm(self.hidden_size)
-
-        self.ffn_hidden_size = 2 * self.hidden_size_reduced  # Typical FFN hidden size
-        self.ffn = nn.Sequential(
-            nn.Linear(self.hidden_size_reduced, self.ffn_hidden_size),
-            nn.GELU(),
-            nn.Linear(self.ffn_hidden_size, self.hidden_size),
-            nn.Dropout(self.dropout)
-        )
-        # Add extra LayerNorm for the importance branch when not using the old design.
+        # Shared LayerNorm for the importance branch
         self.norm_importance = nn.LayerNorm(self.hidden_size)
 
-        # Define Q and K projection layers for all layers in parallel with non-linearity[]
-        # Output shape: [B, L, N * H * D']
-        self.q_proj_importance = nn.Sequential(
-            nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(self.intermediate_dim, num_hidden_layers * num_heads * self.dDash, bias=False)
-        )
-        self.k_proj_importance = nn.Sequential(
-            nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(self.intermediate_dim, num_hidden_layers * num_heads * self.dDash, bias=False)
-        )
+        # ------------------------------------------------------------------
+        # Variant 1: original TokenButler (learned Q + learned K per layer)
+        # ------------------------------------------------------------------
+        if self.predictor_variant == "tokenbutler":
+            # Q and K projections for ALL layers/heads in one big MLP each:
+            # output: [B, L, num_hidden_layers * num_heads * dDash]
+            self.q_proj_importance = nn.Sequential(
+                nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(
+                    self.intermediate_dim,
+                    num_hidden_layers * num_heads * self.dDash,
+                    bias=False,
+                ),
+            )
+            self.k_proj_importance = nn.Sequential(
+                nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(
+                    self.intermediate_dim,
+                    num_hidden_layers * num_heads * self.dDash,
+                    bias=False,
+                ),
+            )
 
-        # Initialize rotary positional embeddings
-        self._init_rope()
+            # Mini-transformer used ONLY in this variant
+            self.input_proj = nn.Linear(
+                self.hidden_size, self.hidden_size_reduced, bias=False
+            )
+
+            self.q_proj_attn = nn.Linear(
+                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
+            )
+            self.k_proj_attn = nn.Linear(
+                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
+            )
+            self.v_proj_attn = nn.Linear(
+                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
+            )
+            self.attn_dropout = nn.Dropout(self.dropout)
+
+            self.norm1 = nn.LayerNorm(self.hidden_size_reduced)
+            self.norm2 = nn.LayerNorm(self.hidden_size)
+
+            self.ffn_hidden_size = 2 * self.hidden_size_reduced
+            self.ffn = nn.Sequential(
+                nn.Linear(self.hidden_size_reduced, self.ffn_hidden_size),
+                nn.GELU(),
+                nn.Linear(self.ffn_hidden_size, self.hidden_size),
+                nn.Dropout(self.dropout),
+            )
+
+            # RoPE for internal self-attn + importance K
+            self._init_rope()
+
+        # ------------------------------------------------------------------
+        # Variant 2: tokenbutler_slice / tokenbutler_project
+        #   - no internal self-attn
+        #   - no learned K in predictor
+        #   - multiple Q-MLPs (one per "slot"), accessed by layer grouping
+        # ------------------------------------------------------------------
+        else:
+            # -------------------------------
+            # tokenbutler_slice / tokenbutler_project
+            # -------------------------------
+            # Hard‑code number of query‑MLPs ("slots") for now.
+            # These are *not* model layers; they are predictors that each
+            # cover a chunk of layers.
+            self.num_query_mlps = 4   # or 8, etc. — your n_layer_factor
+
+            total_layers = self.config.num_hidden_layers
+            # How many layers each slot is responsible for (ceil division).
+            self.layers_per_slot = (total_layers + self.num_query_mlps - 1) // self.num_query_mlps
+
+            # Each slot MLP outputs queries for *its chunk* of layers:
+            # [B, L, hidden] → [B, L, (layers_per_slot * H * dDash)]
+            out_dim_per_slot = self.layers_per_slot * self.num_heads * self.dDash
+
+            self.q_mlps = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
+                        nn.SiLU(),
+                        nn.Linear(
+                            self.intermediate_dim,
+                            out_dim_per_slot,
+                            bias=False,
+                        ),
+                    )
+                    for _ in range(self.num_query_mlps)
+                ]
+            )
+
+            # These are unused in slice/project
+            self.q_proj_importance = None
+            self.k_proj_importance = None
+            self.input_proj = None
+            self.q_proj_attn = None
+            self.k_proj_attn = None
+            self.v_proj_attn = None
+            self.attn_dropout = None
+            self.norm1 = None
+            self.norm2 = None
+            self.ffn_hidden_size = None
+            self.ffn = None
+            self.rotary_emb_attn = None
+            self.rotary_emb_importance = None
+        # Initialize all modules that actually exist
         self._initialize_weights()
         self.device = None
+
+        # For tokenbutler_project: per-(slot, head) projection of *real* KV cache.
+        # Shape: [num_slots, num_heads, head_dim, dDash]
+        if self.predictor_variant == "tokenbutler_project":
+            self.key_cache_proj = nn.Parameter(
+                torch.empty(
+                    self.config.num_hidden_layers,
+                    self.num_heads,
+                    self.model_head_dim,
+                    self.dDash,
+                )
+            )
+            nn.init.xavier_uniform_(self.key_cache_proj)
+        else:
+            self.key_cache_proj = None
+
 
     def _initialize_weights(self):
         for name, module in self.named_modules():
@@ -377,111 +485,266 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.rotary_emb_importance = LlamaRotaryEmbedding(
             config_copy
         )
-
-    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False, layer_idx=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        use_cache=False,
+        layer_idx=None,
+    ):
         """
-        Forward pass for the Optimized Token Importance Predictor.
-        
         Args:
-            hidden_states (torch.Tensor): Input tensor of shape [B, L, HQ].
-            attention_mask (torch.Tensor, optional): Attention mask of shape [B, 1, 1, L] or [B, 1, L, L].
-            position_ids (torch.Tensor, optional): Position IDs.
-            past_key_value (tuple, optional): Past key and value states.
-            use_cache (bool, optional): Whether to use cache.
-        
+            hidden_states: [B, L, hidden_size]
         Returns:
-            torch.Tensor: Importance scores of shape [B, N, H, L, L].
+            q_importance: [B*H, N_slots, Lq, dDash]
+            k_importance: [B*H, N_slots, Lk, dDash] or None
         """
-        layer_idx = 0 # Guaranteed to be 0, as we only have one predictor!
+        layer_idx = 0  # single predictor block
 
-        # Set device if not already set
         if self.device != hidden_states.device:
             self.device = hidden_states.device
             self.to(self.device)
-            
-        B, L, E = hidden_states.size()
-        # (Pdb) print(B, L, E)
-        # 1 422 3072
-        
-        hidden_states = hidden_states.to(self.input_proj.weight.dtype)
-        hidden_states_reduced = self.input_proj(hidden_states)
-        # (Pdb) print(hidden_states_reduced.shape)
-        # torch.Size([1, 422, 384])
-        # Compute q, k, v for attention
-        q = self.q_proj_attn(hidden_states_reduced)
-        k = self.k_proj_attn(hidden_states_reduced)
-        v = self.v_proj_attn(hidden_states_reduced)
-        q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
-        # (Pdb) print(q.shape, k.shape, v.shape)
-        # torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16])
-        if (past_key_value is not None
-            and layer_idx < len(past_key_value.predictor_primary_key)
-            and past_key_value.predictor_primary_key[layer_idx] is not None):
-            offset = past_key_value.predictor_primary_key[layer_idx].shape[2] 
-        else:
-            offset = 0
 
-        kv_seq_len = offset + L
-
-        if position_ids is None:
-            position_ids = torch.arange(offset, offset + L, dtype=torch.long, device=self.device)
-            position_ids = position_ids.unsqueeze(0).expand(B, L)
-
-        cos, sin = self.rotary_emb_attn(v, position_ids)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-        # (Pdb) print(v.shape, position_ids.shape)
-        # torch.Size([1, 24, 422, 16]) torch.Size([1, 422])
-        # (Pdb) print(cos.shape, sin.shape)
-        # torch.Size([1, 422, 16]) torch.Size([1, 422, 16])
-
-        if use_cache and past_key_value is not None:
-            k, v = past_key_value.update_predictor_primary(k.detach(), v.detach(), layer_idx)
-            # print("k shape: ", k.shape, "\t v shape: ", v.shape)
-            kv_seq_len = k.size(2)  
-        attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
-        attn_output = attn_output.to(q.dtype) # torch.Size([1, 422, 384])
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced) # torch.Size([1, 422, 384])
-        attn_output = self.norm1(attn_output)
-        ffn_output = self.ffn(attn_output)
-        hidden_states = self.norm2(hidden_states + ffn_output)
-        # (Pdb) hidden_states.shape
-        # torch.Size([1, 422, 3072])
-        B, L, E = hidden_states.size()
+        B, L, _ = hidden_states.size()
         H = self.num_heads
-        N = self.num_hidden_layers
+        N = self.num_hidden_layers  # for tokenbutler: num layers; for slice/project: num slots
 
-        hidden_states_for_importance = self.norm_importance(hidden_states)
-        q_importance = self.q_proj_importance(hidden_states_for_importance)
-        k_importance = self.k_proj_importance(hidden_states_for_importance)
+        # ------------------------------------------------------------------
+        # Variant 1: original TokenButler (learned Q + learned K)
+        # ------------------------------------------------------------------
+        if self.predictor_variant == "tokenbutler":
+            hidden_states = hidden_states.to(self.input_proj.weight.dtype)
+            hidden_states_reduced = self.input_proj(hidden_states)
 
-        q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
-        k_importance = k_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()  # [B, N, H, L, D']
-        # (Pdb) print(q_importance.shape, k_importance.shape)
-        # torch.Size([1, 28, 24, 422, 16]) torch.Size([1, 28, 24, 422, 16])
-        q_importance = q_importance.view(B, N * H, L, self.dDash)  # [B, NH, L, D']
-        k_importance = k_importance.view(B, N * H, L, self.dDash)  # [B, NH, L, D']
-        # (Pdb) print(q_importance.shape, k_importance.shape)
-        # torch.Size([672, 422, 16]) torch.Size([672, 422, 16])
-        cos, sin = self.rotary_emb_importance(k_importance, position_ids)
-        # (Pdb) print(cos.shape, sin.shape)
-        # torch.Size([1, 422, 16]) torch.Size([1, 422, 16])
-        q_importance, k_importance = apply_rotary_pos_emb(q_importance, k_importance, cos, sin, position_ids)
-        # (Pdb) print(q_importance.shape, k_importance.shape)
-        # torch.Size([1, 672, 422, 16]) torch.Size([1, 672, 422, 16])
+            # mini self-attention over reduced hidden
+            q = self.q_proj_attn(hidden_states_reduced)
+            k = self.k_proj_attn(hidden_states_reduced)
+            v = self.v_proj_attn(hidden_states_reduced)
+            q = q.view(B, L, H, self.attn_head_dim).transpose(1, 2)
+            k = k.view(B, L, H, self.attn_head_dim).transpose(1, 2)
+            v = v.view(B, L, H, self.attn_head_dim).transpose(1, 2)
 
-        if use_cache and past_key_value is not None:
-            k_importance = past_key_value.update_predictor_importance(k_importance.detach(), layer_idx)
-            # print("k_importance shape: ", k_importance.shape, "\t q_importance shape: ", q_importance.shape)
+            if (
+                past_key_value is not None
+                and layer_idx < len(past_key_value.predictor_primary_key)
+                and past_key_value.predictor_primary_key[layer_idx] is not None
+            ):
+                offset = past_key_value.predictor_primary_key[layer_idx].shape[2]
+            else:
+                offset = 0
+
+            if position_ids is None:
+                position_ids = torch.arange(
+                    offset, offset + L, dtype=torch.long, device=self.device
+                )
+                position_ids = position_ids.unsqueeze(0).expand(B, L)
+
+            cos, sin = self.rotary_emb_attn(v, position_ids)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+
+            if use_cache and past_key_value is not None:
+                k, v = past_key_value.update_predictor_primary(
+                    k.detach(), v.detach(), layer_idx
+                )
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True
+            )
+            attn_output = attn_output.to(q.dtype)
+            attn_output = (
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(B, L, self.hidden_size_reduced)
+            )
+            attn_output = self.norm1(attn_output)
+            ffn_output = self.ffn(attn_output)
+
+            hidden_for_importance = self.norm2(hidden_states + ffn_output)
+
+            # --- project to Q/K importance space for ALL layers/heads ---
+            hidden_for_importance = self.norm_importance(hidden_for_importance)
+
+            q_importance = self.q_proj_importance(
+                hidden_for_importance
+            )  # [B,L,N*H*dDash]
+            k_importance = self.k_proj_importance(
+                hidden_for_importance
+            )  # [B,L,N*H*dDash]
+
+            q_importance = q_importance.view(B, L, N, H, self.dDash).permute(
+                0, 2, 3, 1, 4
+            ).contiguous()
+            k_importance = k_importance.view(B, L, N, H, self.dDash).permute(
+                0, 2, 3, 1, 4
+            ).contiguous()
+
+            q_importance = q_importance.view(B * H, N, L, self.dDash)
+            k_importance = k_importance.view(B * H, N, L, self.dDash)
+
+            cos, sin = self.rotary_emb_importance(k_importance, position_ids)
+            q_importance, k_importance = apply_rotary_pos_emb(
+                q_importance, k_importance, cos, sin, position_ids
+            )
+
+            if use_cache and past_key_value is not None:
+                k_importance = past_key_value.update_predictor_importance(
+                    k_importance.detach(), layer_idx
+                )
+
+            k_importance = k_importance.view(B * H, N, -1, self.dDash)
+            return q_importance, k_importance
+
+        # ------------------------------------------------------------------
+        # Variant 2: tokenbutler_slice / tokenbutler_project
+        #   Only Q is learned here; K comes from the real key cache.
+        #   We have N = num_hidden_layers = n_layer_factor Q-MLPs.
+        # ------------------------------------------------------------------
+        else:
+            # tokenbutler_slice / tokenbutler_project:
+            # multiple Q-MLPs; each slot MLP predicts queries for a *chunk* of layers.
+            # Each mlp output is interpreted as [layers_per_slot, H, dDash] per token,
+            # then scattered into per-layer bins.
+            base_linear = self.q_mlps[0][0]
+            hidden_states = hidden_states.to(base_linear.weight.dtype)
+
+            hidden_for_importance = self.norm_importance(hidden_states)
+            B, L, _ = hidden_for_importance.size()
+            H = self.num_heads
+
+            total_layers = self.config.num_hidden_layers
+            layers_per_slot = self.layers_per_slot
+
+            # q_layers: [B, H, total_layers, L, dDash]
+            q_layers = hidden_for_importance.new_empty(
+                B, H, total_layers, L, self.dDash
+            )
+
+            for slot_idx, mlp in enumerate(self.q_mlps):
+                start_layer = slot_idx * layers_per_slot
+                end_layer = min(start_layer + layers_per_slot, total_layers)
+                if start_layer >= end_layer:
+                    break
+                group_len = end_layer - start_layer
+
+                # mlp output: [B, L, layers_per_slot * H * dDash]
+                q_flat = mlp(hidden_for_importance)
+                q_slot = q_flat.view(B, L, layers_per_slot, H, self.dDash)
+                # Last slot may represent fewer real layers: drop extras.
+                q_slot = q_slot[:, :, :group_len, :, :]  # [B, L, group_len, H, dDash]
+                # [B, H, group_len, L, dDash]
+                q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
+
+                q_layers[:, :, start_layer:end_layer, :, :] = q_slot
+
+            # Final shape expected by the attention code: [B*H, total_layers, L, dDash]
+            q_importance = q_layers.view(B * H, total_layers, L, self.dDash)
+            k_importance = None  # K comes from real key cache (slice/project)
+            return q_importance, k_importance
+
+
+    # def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, use_cache=False, layer_idx=None):
+    #     """
+    #     Forward pass for the Optimized Token Importance Predictor.
+        
+    #     Args:
+    #         hidden_states (torch.Tensor): Input tensor of shape [B, L, HQ].
+    #         attention_mask (torch.Tensor, optional): Attention mask of shape [B, 1, 1, L] or [B, 1, L, L].
+    #         position_ids (torch.Tensor, optional): Position IDs.
+    #         past_key_value (tuple, optional): Past key and value states.
+    #         use_cache (bool, optional): Whether to use cache.
+        
+    #     Returns:
+    #         torch.Tensor: Importance scores of shape [B, N, H, L, L].
+    #     """
+    #     layer_idx = 0 # Guaranteed to be 0, as we only have one predictor!
+
+    #     # Set device if not already set
+    #     if self.device != hidden_states.device:
+    #         self.device = hidden_states.device
+    #         self.to(self.device)
             
-        k_importance = k_importance.view(B * H, N, -1, self.dDash)
-        q_importance = q_importance.view(B * H, N, -1, self.dDash)
-        # (Pdb) print(q_importance.shape, k_importance.shape)
-        # torch.Size([24, 28, 422, 16]) torch.Size([24, 28, 422, 16])
-        return q_importance, k_importance
+    #     B, L, E = hidden_states.size()
+    #     # (Pdb) print(B, L, E)
+    #     # 1 422 3072
+        
+    #     hidden_states = hidden_states.to(self.input_proj.weight.dtype)
+    #     hidden_states_reduced = self.input_proj(hidden_states)
+    #     # (Pdb) print(hidden_states_reduced.shape)
+    #     # torch.Size([1, 422, 384])
+    #     # Compute q, k, v for attention
+    #     q = self.q_proj_attn(hidden_states_reduced)
+    #     k = self.k_proj_attn(hidden_states_reduced)
+    #     v = self.v_proj_attn(hidden_states_reduced)
+    #     q = q.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+    #     k = k.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+    #     v = v.view(B, L, self.num_heads, self.attn_head_dim).transpose(1, 2)
+    #     # (Pdb) print(q.shape, k.shape, v.shape)
+    #     # torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16]) torch.Size([1, 24, 422, 16])
+    #     if (past_key_value is not None
+    #         and layer_idx < len(past_key_value.predictor_primary_key)
+    #         and past_key_value.predictor_primary_key[layer_idx] is not None):
+    #         offset = past_key_value.predictor_primary_key[layer_idx].shape[2] 
+    #     else:
+    #         offset = 0
 
+    #     kv_seq_len = offset + L
 
+    #     if position_ids is None:
+    #         position_ids = torch.arange(offset, offset + L, dtype=torch.long, device=self.device)
+    #         position_ids = position_ids.unsqueeze(0).expand(B, L)
+
+    #     cos, sin = self.rotary_emb_attn(v, position_ids)
+    #     q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+    #     # (Pdb) print(v.shape, position_ids.shape)
+    #     # torch.Size([1, 24, 422, 16]) torch.Size([1, 422])
+    #     # (Pdb) print(cos.shape, sin.shape)
+    #     # torch.Size([1, 422, 16]) torch.Size([1, 422, 16])
+
+    #     if use_cache and past_key_value is not None:
+    #         k, v = past_key_value.update_predictor_primary(k.detach(), v.detach(), layer_idx)
+    #         # print("k shape: ", k.shape, "\t v shape: ", v.shape)
+    #         kv_seq_len = k.size(2)  
+    #     attn_output = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+    #     attn_output = attn_output.to(q.dtype) # torch.Size([1, 422, 384])
+    #     attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, self.hidden_size_reduced) # torch.Size([1, 422, 384])
+    #     attn_output = self.norm1(attn_output)
+    #     ffn_output = self.ffn(attn_output)
+    #     hidden_states = self.norm2(hidden_states + ffn_output)
+    #     # (Pdb) hidden_states.shape
+    #     # torch.Size([1, 422, 3072])
+    #     B, L, E = hidden_states.size()
+    #     H = self.num_heads
+    #     N = self.num_hidden_layers
+
+    #     hidden_states_for_importance = self.norm_importance(hidden_states)
+    #     q_importance = self.q_proj_importance(hidden_states_for_importance)
+    #     if self.predictor_variant == "tokenbutler":
+    #         # old path: compute k_importance & RoPE
+    #         k_importance = self.k_proj_importance(hidden_states_for_importance)
+    #         q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()
+    #         k_importance = k_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()
+
+    #         q_importance = q_importance.view(B, N * H, L, self.dDash)
+    #         k_importance = k_importance.view(B, N * H, L, self.dDash)
+
+    #         cos, sin = self.rotary_emb_importance(k_importance, position_ids)
+    #         q_importance, k_importance = apply_rotary_pos_emb(q_importance, k_importance, cos, sin, position_ids)
+
+    #         if use_cache and past_key_value is not None:
+    #             k_importance = past_key_value.update_predictor_importance(
+    #                 k_importance.detach(), layer_idx
+    #             )
+
+    #         k_importance = k_importance.view(B * H, N, -1, self.dDash)
+    #     else:
+    #         # slice/project: no learned K, no extra cache; just reshape Q
+    #         q_importance = q_importance.view(B, L, N, H, self.dDash).permute(0, 2, 3, 1, 4).contiguous()
+    #         k_importance = None  # we will use real key cache later
+
+    #     q_importance = q_importance.view(B * H, N, -1, self.dDash)
+    #     return q_importance, k_importance
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \

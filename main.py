@@ -961,6 +961,8 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
     opt_step = step // args.grad_accum_steps
     avg_headhit, avg_tokhit = 0, 0
     avg_headhit_corr, avg_tokhit_corr = 0, 0
+    avg_headhit_90 = avg_headhit_95 = 0.0
+    avg_tokhit_90  = avg_tokhit_95  = 0.0
     train_progress = 0
     epoch_loss = 0.0
     running_loss = None
@@ -997,8 +999,10 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             mse_match_loss = 0
             head_match_loss = 0
             nlayers = 0
-            headhit_accs, tok_hit_accs, headhit_corr, tok_hit_corr = [], [], [], []
-
+            headhit_accs, tok_hit_accs = [], []
+            headhit_accs_90, headhit_accs_95 = [], []
+            tok_hit_accs_90, tok_hit_accs_95 = [], []
+            headhit_corr, tok_hit_corr = [], []
             for module in model.modules():
                 if module.__class__.__name__.endswith("AttentionExperimental"):
                     if hasattr(module, 'msemagn_loss'):
@@ -1017,6 +1021,15 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             tok_hit_accs.append(module.tok_hit_acc)
                             headhit_corr.append(module.head_mean_rank_corr)
                             tok_hit_corr.append(module.tok_mean_rank_corr)
+                            # Collect hard-token / hard-head stats if present.
+                            if hasattr(module, "tok_hit_acc_90"):
+                                tok_hit_accs_90.append(module.tok_hit_acc_90)
+                            if hasattr(module, "tok_hit_acc_95"):
+                                tok_hit_accs_95.append(module.tok_hit_acc_95)
+                            if hasattr(module, "head_hit_acc_90"):
+                                headhit_accs_90.append(module.head_hit_acc_90)
+                            if hasattr(module, "head_hit_acc_95"):
+                                headhit_accs_95.append(module.head_hit_acc_95)
 
             mse_match_loss = mse_match_loss / nlayers
             # ‑‑ Scale losses so that summed grads match the original magnitude
@@ -1026,11 +1039,18 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 observed_head_losses.append(head_match_loss.item())
             else:
                 observed_head_losses.append(0)
-            if calc_hitrates:
+
+            if calc_hitrates and len(tok_hit_accs) > 0:
                 avg_headhit = 100 * sum(headhit_accs) / len(headhit_accs)
                 avg_tokhit = 100 * sum(tok_hit_accs) / len(tok_hit_accs)
                 avg_headhit_corr = sum(headhit_corr) / len(headhit_corr)
                 avg_tokhit_corr = sum(tok_hit_corr) / len(tok_hit_corr)
+
+                # New “hard token / head” metrics for wandb.
+                avg_tokhit_90 = 100 * sum(tok_hit_accs_90) / len(tok_hit_accs_90) if tok_hit_accs_90 else 0.0
+                avg_tokhit_95 = 100 * sum(tok_hit_accs_95) / len(tok_hit_accs_95) if tok_hit_accs_95 else 0.0
+                avg_headhit_90 = 100 * sum(headhit_accs_90) / len(headhit_accs_90) if headhit_accs_90 else 0.0
+                avg_headhit_95 = 100 * sum(headhit_accs_95) / len(headhit_accs_95) if headhit_accs_95 else 0.0
 
             if args.train_headpredictor:
                 mse_match_loss.backward(retain_graph=True)
@@ -1101,6 +1121,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 model.train()
                 torch.cuda.empty_cache()
                 gc.collect()
+
             if dowandb:
                 if args.train_headpredictor:
                     hloss = (100 * head_match_loss).item()
@@ -1113,6 +1134,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     "Token Hit Acc": avg_tokhit,
                     "Head Hit Corr": avg_headhit_corr,
                     "Token Hit Corr": avg_tokhit_corr,
+                    # New hard-token / hard-head metrics:
+                    "Token Hit Acc@90": avg_tokhit_90,   # teacher tokens > 90th percentile
+                    "Token Hit Acc@95": avg_tokhit_95,   # teacher tokens > 95th percentile
+                    "Head Hit Acc@90": avg_headhit_90,
+                    "Head Hit Acc@95": avg_headhit_95,
                     "task_loss": task_loss.item(),
                     "MSE_Attn_RunningLoss": running_loss,
                     "grad_norm": grad_norm.item(),  # Log gradient norm
@@ -1200,6 +1226,7 @@ if __name__ == '__main__':
 
     # Predictor Design Related Arguments
     parser.add_argument('--lookahead', type=int, default=0)
+    parser.add_argument('--max_loss_rows', type=int, default=None, help='Max loss rows to consider')
     parser.add_argument('--late_context_upweight', action='store_true', help='Upweight late context')
     parser.add_argument('--softmax_causal_loss_mse', action='store_true', help='Change loss type to softmax causal MSE')
     parser.add_argument('--softmax_causal_loss_ce', action='store_true', help='Change loss type to softmax causal probability based loss.')
@@ -1214,6 +1241,22 @@ if __name__ == '__main__':
     parser.add_argument('--dDash', type=int, default=16, help='Attn Red-dim')
     parser.add_argument('--intdim', type=int, default=512, help='Int-Proc Dim')
 
+    # TokenButler predictor variants (token pruning only)
+    parser.add_argument(
+        '--tokenbutler',
+        action='store_true',
+        help='Use original TokenButler predictor (baseline: learned Q+K mini-transformer).',
+    )
+    parser.add_argument(
+        '--tokenbutler_slice',
+        action='store_true',
+        help='Use TokenButler variant with learned Q and K taken as the first dDash dims of the real key cache.',
+    )
+    parser.add_argument(
+        '--tokenbutler_project',
+        action='store_true',
+        help='Use TokenButler variant with learned Q and a learned linear projection of the real key cache.',
+    )
     # Model-Mode (Config, Calibrate) related arguments
     parser.add_argument('--calibrate_thresholds', action='store_true', help='Calibrate Per-Head Token Thresholding.')
     parser.add_argument('--test_with_thresholds', action='store_true', help='Test With Per-Head Token Thresholding, must have calibrated before!')
@@ -1230,6 +1273,31 @@ if __name__ == '__main__':
     np.random.seed(args.seed)
     random.seed(args.seed)
     os.environ["PYTHONHASHSEED"] = str(args.seed)
+
+    # ------------------------------------------------------------------
+    # Decide which TokenButler variant to use
+    #   tokenbutler         → original behaviour (learned Q+K)
+    #   tokenbutler_slice   → learned Q, K = first dDash dims of real key cache
+    #   tokenbutler_project → learned Q, K = Linear(real key cache) → dDash
+    # Only one of the three flags should be set.
+    # ------------------------------------------------------------------
+    variant_flags = [
+        args.tokenbutler,
+        args.tokenbutler_slice,
+        args.tokenbutler_project,
+    ]
+    if sum(bool(x) for x in variant_flags) > 1:
+        raise ValueError(
+            "Please specify at most one of "
+            "--tokenbutler, --tokenbutler_slice, or --tokenbutler_project."
+        )
+    if args.tokenbutler_slice:
+        args.tokenbutler_variant = "tokenbutler_slice"
+    elif args.tokenbutler_project:
+        args.tokenbutler_variant = "tokenbutler_project"
+    else:
+        # Default: original predictor (paper behaviour)
+        args.tokenbutler_variant = "tokenbutler"
 
     print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
 
@@ -1371,6 +1439,8 @@ if __name__ == '__main__':
             module.lookahead = args.lookahead
             module.num_layers_pred = module.producer_frequency
             module.sliding_window = args.sliding_window
+            module.max_loss_rows = args.max_loss_rows
+            module.tokenbutler_variant = args.tokenbutler_variant
 
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:

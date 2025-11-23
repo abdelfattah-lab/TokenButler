@@ -3,7 +3,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node 2 \
   longeval/eval_tokenbutler.py \
   --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
   --architecture llama \
-  --datalen 8192 \
+  --datalen 16384 \
   --dataset_name "ruler/niah_single_1,ruler/niah_single_2,ruler/niah_single_3,\
                 ruler/niah_multikey_1,ruler/niah_multikey_2,\
                 ruler/niah_multiquery,ruler/niah_multivalue,\
@@ -18,12 +18,88 @@ torchrun --standalone --nnodes=1 --nproc_per_node 2 \
   --sliding_window 512 \
   --predictor_ckpt /mnt/home/ya255/projects/TokenButler/checkpoints/TokenButler_14Nov_42_finetune_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8Bi.csv_L3_8Bi_False_False_2000_False_custom_mix_1024_1_1_10_0.001_8_1024_16_False/4_False_False_True_32_0.3875000000000002.pt 
 
-#   --dataset_name ruler/vt,ruler/qa_1,ruler/qa_2 \
-# --dataset_name \
-#   "ruler/niah_single_1,ruler/niah_single_2,ruler/niah_single_3,\
-#    ruler/niah_multikey_1,ruler/niah_multikey_2,ruler/niah_multikey_3,\
-#    ruler/niah_multiquery,ruler/niah_multivalue,ruler/vt,\
-#    ruler/cwe,ruler/fwe,ruler/qa_1,ruler/qa_2"
+
+
+# 
+# 
+
+
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node 2 \
+  longeval/eval_tokenbutler.py \
+  --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --architecture llama \
+  --datalen 16384 \
+  --dataset_name "ruler/niah_multikey_2" \
+  --dDash 32 \
+  --intdim 1024 \
+  --result_dir results_tokbutler/shortm \
+  --eval_llm_mode ExpPred \
+  --token_sparse_method fixed_65pc \
+  --min_sparse_index 256 \
+  --sliding_window 512 \
+  --predictor_ckpt /mnt/home/ya255/projects/TokenButler/checkpoints/TokenButler_14Nov_42_finetune_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8Bi.csv_L3_8Bi_False_False_2000_False_custom_mix_1024_1_1_10_0.001_8_1024_16_False/4_False_False_True_32_0.3875000000000002.pt 
+
+# | model                                 | dataset               |   baseline |   samples |
+# |:--------------------------------------|:----------------------|-----------:|----------:|
+# | meta-llama/Meta-Llama-3.1-8B-Instruct | ruler/niah_multikey_2 |    0.34375 |        96 |
+# | mean                                  | mean                  |    0.34375 |        96 |
+
+# | model                                 | dataset               |   baseline |   samples |
+# |:--------------------------------------|:----------------------|-----------:|----------:|
+# | meta-llama/Meta-Llama-3.1-8B-Instruct | ruler/niah_multikey_2 |   0.583333 |        96 |
+# | mean                                  | mean                  |   0.583333 |        96 |
+
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node 2 \
+  longeval/eval_tokenbutler.py \
+  --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --architecture llama \
+  --datalen 16384 \
+  --dataset_name "ruler/niah_multikey_2" \
+  --dDash 32 \
+  --intdim 1024 \
+  --result_dir results_tokbutler/longm \
+  --eval_llm_mode ExpPred \
+  --token_sparse_method fixed_65pc \
+  --min_sparse_index 256 \
+  --sliding_window 16000 \
+  --predictor_ckpt /mnt/home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None__mnt_home_ya255_projects_TokenButler_checkpoints_TokenButler_14Nov_42_finetune_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8Bi.csv_L3_8Bi_F_cb1cc44e/4_1000_ExpPred_fixed_40pc_False_False_0_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20251119-143523.pt
+
+# | model                                 | dataset           |   baseline |   samples |
+  # --predictor_ckpt /mnt/home/ya255/projects/TokenButler/checkpoints/TokenButler_14Nov_42_finetune_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8Bi.csv_L3_8Bi_False_False_2000_False_custom_mix_1024_1_1_10_0.001_8_1024_16_False/4_False_False_True_32_0.3875000000000002.pt 
+# |:--------------------------------------|:------------------|-----------:|----------:|
+# | meta-llama/Meta-Llama-3.1-8B-Instruct | long_bench/qasper |    0.19062 |       200 |
+# | mean                                  | mean              |    0.19062 |       200 |
+
+  # --predictor_ckpt /mnt/home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_InitV2_PairCE.csv_L3_8BiLong_InitV2_PairCE_True_False_2000_False_custom_mix_long_16384_1_1_1_34677806/4_1000_ExpPred_fixed_40pc_False_False_0_False_False_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20251119-193841.pt
+# | model                                 | dataset           |   baseline |   samples |
+# |:--------------------------------------|:------------------|-----------:|----------:|
+# | meta-llama/Meta-Llama-3.1-8B-Instruct | long_bench/qasper |    0.22314 |       200 |
+# | mean                                  | mean              |    0.22314 |       200 |
+
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node 2 \
+  longeval/eval_tokenbutler.py \
+  --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --architecture llama \
+  --datalen 16384 \
+  --dataset_name "long_bench/qasper" \
+  --dDash 32 \
+  --intdim 1024 \
+  --result_dir results_tokbutler/longm \
+  --eval_llm_mode ExpPred \
+  --token_sparse_method fixed_65pc \
+  --min_sparse_index 128 \
+  --sliding_window 512 \
+  --predictor_ckpt /mnt/home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_InitV2_PairCE.csv_L3_8BiLong_InitV2_PairCE_True_False_2000_False_custom_mix_long_16384_1_1_1_34677806/4_1000_ExpPred_fixed_40pc_False_False_0_False_False_False_False_True_None_False_False_4_8_2_32_1024_False_False_True_32_0.3875000000000002_20251119-193841.pt
+
+
+  # --dataset_name "ruler/niah_single_1,ruler/niah_single_2,ruler/niah_single_3,\
+  #               ruler/niah_multikey_1,ruler/niah_multikey_2,\
+  #               ruler/niah_multiquery,ruler/niah_multivalue,\
+  #               ruler/multiturn_1,ruler/multiturn_2,\
+  #               ruler/fwe,ruler/qa_1,ruler/qa_2,ruler/vt" \
 
 python demo_gen.py \
   --model_path meta-llama/Llama-3.1-8B-Instruct \
@@ -83,4 +159,24 @@ python test_generation.py \
     --model_load_path /mnt/home/ya255/projects/TokenButler/checkpoints/TokenButler_14Nov_42_finetune_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8Bi.csv_L3_8Bi_False_False_2000_False_custom_mix_1024_1_1_10_0.001_8_1024_16_False/4_False_False_True_32_0.3875000000000002.pt
     
     
+
+
+
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node 2 \
+  longeval/eval_tokenbutler.py \
+  --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --architecture llama \
+  --datalen 16384 \
+  --dataset_name "ruler/niah_multikey_2" \
+  --dDash 32 \
+  --intdim 1024 \
+  --result_dir results_tokbutler/shortm \
+  --eval_llm_mode ExpPred \
+  --token_sparse_method fixed_65pc \
+  --min_sparse_index 256 \
+  --sliding_window 512 \
+  --tokenbutler_project \
+  --predictor_ckpt /mnt/home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_project.csv_L3_8BiLong_project_True_False_2000_False_custom_mix_long_16384_1_1_10_0.001_8_16_7efef68c/ExpPred_fixed_40pc_False_False_0_256_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_False_False_True_tokenbutler_project_32_0.3875000000000002_20251120-195257.pt
+
 
