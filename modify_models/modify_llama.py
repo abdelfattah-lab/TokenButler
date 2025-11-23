@@ -74,6 +74,14 @@ class LlamaAttentionExperimental(nn.Module):
         self.mode = "balanced"  # "extreme_recall" or "balanced"
         self.pairwise_topk_ratio = 0.02  # fraction of keys used as pos/neg in pairwise loss
         self.tokenbutler_variant = "tokenbutler"
+        # --- sparsity control knobs (decode‑time only) ---
+        # For fixed_xpc: target_sparsity is fraction of *candidate* tokens pruned (0‑1).
+        # For fixed_ytok: target_keep_tokens is the number of *candidate* tokens kept.
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+        # Decode‑time gating: prefill + first generated token stay dense.
+        self._dense_kv_cutoff = 0
+        self.always_dense_decode_tokens = 1
 
         if self.mode == "extreme_recall": # top4
             self.low_recall_first = {
@@ -173,42 +181,198 @@ class LlamaAttentionExperimental(nn.Module):
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
-                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
+                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred,
+                dropout=0.1, dDash=self.dDash, intdim=self.intdim,
+                attn_reduce_factor=self.head_attn_reduce_factor
             ).to('cuda:0')
             self.sparse_head_predictor.flash_attn = self.flash_attn
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
-        if self.token_sparse_method is not None:
+        method = self.token_sparse_method
+
+        # Optional: load per‑head threshold calibration if available.
+        if method is not None:
             try:
                 mname = self.config._name_or_path.split("/")[-1]
-                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                read_path = f"threshold_calibs/{mname}/{method}.pkl"
                 threshold_model_dictionary = torch.load(read_path)
                 self.tok_calibration_set = threshold_model_dictionary
-            except:
+            except Exception:
                 pass
-        if self.token_sparse_method == "LazyLLM":
-            if self.layer_idx <= 9:
-                self.sparse_aggression = 1.0
-            elif self.layer_idx <= 19:
-                self.sparse_aggression = 0.7
-            elif self.layer_idx <= 28:
-                self.sparse_aggression = 0.4
+
+        # Reset sparsity state for this layer.
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+        self.sparse_aggression = None
+        self.head_keep = None
+
+        if method.startswith("fixed_"):
+            # fixed_xpc / fixed_ytok
+            spec = method.split("_", 1)[1]
+
+            # fixed_xpc: x is *sparsity* (fraction of candidate tokens pruned).
+            if spec.endswith("pc"):
+                if self.layer_idx == 0:
+                    # Never prune layer 0.
+                    self.target_sparsity = 0.0
+                    self.sparse_aggression = 1.0
+                else:
+                    x = float(spec[:-2])
+                    self.target_sparsity = x / 100.0              # prune fraction on candidates
+                    self.sparse_aggression = 1.0 - self.target_sparsity  # keep fraction on candidates
+
+                # Per‑head keep ratios, globally renormalised to the keep fraction.
+                self.head_keep = self.build_head_keep_ratios()
+
+            # fixed_ytok: keep exactly y *candidate* tokens per head/query.
+            elif spec.endswith("tok"):
+                if self.layer_idx == 0:
+                    self.target_keep_tokens = None  # dense
+                    self.sparse_aggression = 1.0
+                else:
+                    y = int(spec[:-3])
+                    self.target_keep_tokens = max(1, y)
+                    # No per‑head re‑weighting here; keep uniform behaviour.
+                    self.sparse_aggression = None
+                    self.head_keep = None
             else:
-                self.sparse_aggression = 0.1
-        elif "fixed" in self.token_sparse_method:
-            if self.layer_idx == 0:
-                self.sparse_aggression = 1.0
-            else:
-                self.sparse_aggression = 1.0 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-        elif "progressive" in self.token_sparse_method:
-            pc_drop = float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-            self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
+                raise ValueError(f"Unknown fixed sparsity spec '{spec}' in token_sparse_method='{method}'")
         else:
-            raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
-        self.head_keep = self.build_head_keep_ratios() 
-            
+            # We no longer support LazyLLM / progressive schemes here.
+            raise ValueError(
+                f"Unsupported token sparsity method '{method}'. "
+                "Use 'fixed_xpc' (e.g. fixed_65pc) or 'fixed_ytok' (e.g. fixed_128tok)."
+            )
+
+    def _should_apply_sparse_decode(self, q_len: int, kv_seq_len: int) -> bool:
+        """
+        Decode‑time gating:
+          - Prefill (q_len > 1) is always dense.
+          - The *first* decode token after prefill is also dense.
+          - Pruning starts from the second decode step.
+        """
+        if q_len != 1:
+            # Only single‑token decode steps are sparsified.
+            return False
+
+        # If we never saw a prefill for this sequence, treat the first decode
+        # call as dense and remember its kv_seq_len as the cutoff.
+        if self._dense_kv_cutoff == 0:
+            self._dense_kv_cutoff = kv_seq_len
+            return False
+
+        # After prefill, forward() sets _dense_kv_cutoff = prefill_len + 1.
+        # We start pruning once kv_seq_len grows beyond that.
+        return kv_seq_len > self._dense_kv_cutoff
+
+    def _build_decode_mask_fixed(
+        self,
+        importance_scores: torch.Tensor,
+        attention_mask: torch.Tensor,
+        min_sparse_index: Optional[int],
+    ) -> torch.Tensor:
+        """
+        Build a decode‑time sparsity mask for fixed_xpc / fixed_ytok.
+
+        importance_scores: [B, H, 1, K] – predictor softmax over keys.
+        attention_mask:    [B, 1, 1, K] – 0 or -inf.
+
+        Returns:
+            mask_tensor: [B, H, 1, K] with values in {0, -inf}, where -inf marks
+            tokens pruned by TokenButler (excluding sink + sliding‑window tokens).
+        """
+        bsz, num_heads, q_len, key_len = importance_scores.shape
+        assert q_len == 1, "Decode‑time mask only makes sense for q_len == 1"
+        device = importance_scores.device
+        dtype = importance_scores.dtype
+
+        # Candidate tokens:
+        #   - not masked by attention_mask
+        #   - not in the sink region [0:min_sparse_index)
+        #   - not in the sliding‑window tail (always‑keep region)
+        attn_valid = (attention_mask[:, :, -1:, :] == 0)  # [B,1,1,K]
+        candidate_mask = attn_valid.expand(bsz, num_heads, 1, key_len)
+
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            candidate_mask[..., :clamp_idx] = False
+
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            candidate_mask[..., -win:] = False
+
+        if not candidate_mask.any():
+            # Nothing we are allowed to drop – stay dense.
+            return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+
+        method = self.token_sparse_method or ""
+        candidate_counts = candidate_mask.sum(dim=-1, keepdim=True)  # [B,H,1,1]
+
+        # How many *candidate* tokens do we keep per (B, H, row)?
+        if "pc" in method:
+            if self.sparse_aggression is None:
+                raise ValueError("sparse_aggression must be set for fixed_xpc")
+            # Per‑head keep ratios [H] with global normalisation.
+            if getattr(self, "head_keep", None) is not None:
+                head_keep = self.head_keep.to(device)
+            else:
+                head_keep = torch.full(
+                    (self.num_heads,), float(self.sparse_aggression), device=device
+                )
+            head_keep = head_keep.clamp(min=0.0, max=1.0).view(1, self.num_heads, 1, 1)
+            keep_counts = (head_keep * candidate_counts.float()).floor()
+            keep_counts = keep_counts.clamp(min=1)
+            keep_counts = torch.minimum(keep_counts, candidate_counts)
+            keep_counts = keep_counts.long()
+
+        elif "tok" in method:
+            if self.target_keep_tokens is None or self.target_keep_tokens <= 0:
+                return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+            y = self.target_keep_tokens
+            keep_counts = torch.minimum(
+                candidate_counts,
+                torch.full_like(candidate_counts, y, dtype=torch.long),
+            )
+            keep_counts = keep_counts.clamp(min=1)
+        else:
+            raise ValueError(f"token_sparse_method '{method}' is not a fixed_* scheme")
+
+        # Rank candidate tokens by importance (descending), ignoring non‑candidates.
+        scores = importance_scores.clone()
+        scores = scores.masked_fill(~candidate_mask, float("-inf"))
+        _, sorted_idx = scores.sort(dim=-1, descending=True)  # [B,H,1,K]
+
+        # # Invert the sort to get per‑key rank.
+        # B, H, _, K = sorted_idx.shape
+        # arange_K = torch.arange(K, device=device).view(1, 1, 1, K)
+        # rank = torch.empty_like(sorted_idx)
+        # rank.scatter_(-1, sorted_idx, arange_K)
+        B, H, q_len, key_len = sorted_idx.shape
+        # rank[b, h, q, j] will hold the rank position of key j for that (b,h,q)
+        rank = torch.empty_like(sorted_idx, dtype=torch.long)
+        # Build src with the same shape as the index tensor along non-scatter dims
+        arange_K = torch.arange(key_len, device=sorted_idx.device, dtype=torch.long)
+        arange_K = arange_K.view(1, 1, 1, key_len).expand_as(sorted_idx)  # [B,H,1,K]
+        rank.scatter_(-1, sorted_idx, arange_K)
+        # Keep:
+        #   - all non‑candidate tokens, plus
+        #   - the top 'keep_counts' candidate tokens.
+        keep_mask = (~candidate_mask) | (rank < keep_counts)
+
+        mask_tensor = torch.zeros_like(importance_scores, dtype=dtype, device=device)
+        mask_tensor = mask_tensor.masked_fill(~keep_mask, float("-inf"))
+
+        # Explicitly clear sink + sliding‑window regions (always keep).
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            mask_tensor[..., :clamp_idx] = 0.0
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            mask_tensor[..., -win:] = 0.0
+
+        return mask_tensor
+
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -278,7 +442,7 @@ class LlamaAttentionExperimental(nn.Module):
             value_states = self.v_proj(hidden_states)
 
         evalmode = self.eval_llm_mode
-        num_tokens_to_keep = int(q_len * self.sparse_aggression)
+        # query_states/key_states/value_states will be reshaped to [B, H, L, D].
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -290,6 +454,15 @@ class LlamaAttentionExperimental(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         kv_seq_len = key_states.shape[-2]
+
+        # Track where we are in the sequence for decode‑time sparsity.
+        # Heuristic: a call with q_len > 1 and kv_seq_len == q_len is a full prefill
+        # for a fresh sequence.  We then keep this prefill *and* the first decode
+        # token dense, and only apply TokenButler pruning afterwards.
+        if self.inference_mode and use_cache and q_len > 1 and kv_seq_len == q_len:
+            # New sequence prefill: remember the length and give the next
+            # 'always_dense_decode_tokens' decode steps dense attention.
+            self._dense_kv_cutoff = kv_seq_len + self.always_dense_decode_tokens
         final_mask = None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -460,25 +633,28 @@ class LlamaAttentionExperimental(nn.Module):
                             perhead_thresholds = self.tok_calibration_set[self.layer_idx - 1].to(unadj_importance_mask.device) # 0 does not have calibration data.
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
-                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
-                            sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            if q_len == 1:
-                                mask_tensor = torch.zeros_like(importance_mask)
-                                sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
-                                mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
-                                mask_tensor[:, :, :, :min_sparse_index] = 0.0
-                                if self.sliding_window is not None:
-                                    mask_tensor[:, :, :, -self.sliding_window:] = 0.0
+                            # Main inference path: dense prefill + dense first decode
+                            # token, then fixed sparsity on later decode tokens.
+                            importance_scores = torch.softmax(importance_mask + attention_mask, dim=-1)
+
+                            apply_sparse = (
+                                self.token_sparse_method is not None
+                                and self._should_apply_sparse_decode(q_len, kv_seq_len)
+                            )
+
+                            if not apply_sparse:
+                                # Either prefill or first decode step → no TokenButler pruning.
+                                mask_tensor = torch.zeros_like(importance_scores)
                             else:
-                                mask_tensor = sorted_index_to_variable_mask(
-                                                                            sorted_indices,
-                                                                            attention_mask,
-                                                                            min_sparse_index,
-                                                                            bsz, q_len, key_len,
-                                                                            self.head_keep.to(sorted_indices.device),
-                                                                            sliding_window=self.sliding_window
-                                                                            )
+                                if q_len != 1:
+                                    # Safety net: we never sparsify multi‑token blocks in decode mode.
+                                    mask_tensor = torch.zeros_like(importance_scores)
+                                else:
+                                    mask_tensor = self._build_decode_mask_fixed(
+                                        importance_scores,
+                                        attention_mask,
+                                        min_sparse_index,
+                                    )
 
                         # Apply per‑row sliding‑window after sparsity selection
                         if self.sliding_window is not None:
@@ -499,8 +675,8 @@ class LlamaAttentionExperimental(nn.Module):
                         # not generation focused. So, we still want to assess prefill sparsity. 
                         # However, at inference time (generation), we should only use mask_tensor
                         # when q_len == 1
-                        # if q_len == 1:
-                        attn_weights = attn_weights + mask_tensor
+                        if q_len == 1:
+                            attn_weights = attn_weights + mask_tensor
                     else:
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
                         attn_weights = attn_weights + attention_mask
@@ -825,13 +1001,28 @@ class LlamaAttentionExperimental(nn.Module):
             checkeverytime = self.test_with_thresholds
         if final_mask is not None:
             if self.effective_sparsity is None or checkeverytime:
-            # if True:
-                true_mask = final_mask + attention_mask
-                num_deact = true_mask.bool().sum(dim=-1)                   # Number of tokens disabled.
-                causally_deact = (attention_mask.bool()).sum(dim=-1).expand_as(num_deact)        # Number of tokens disabled causally anyway
-                additional_deact = (num_deact - causally_deact)
-                num_active = (~attention_mask.bool()).sum(dim=-1).expand_as(num_deact)    # Number of tokens active at this position if zero-sparsity
-                effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
+                true_mask = final_mask + attention_mask  # {0, -inf}
+
+                # Candidate tokens for *TokenButler* sparsity:
+                #   - would have been active without TokenButler
+                #   - are not sink tokens
+                #   - are not in the sliding‑window tail.
+                candidate_mask = (~attention_mask.bool())
+                if self.min_sparse_index is not None and self.min_sparse_index > 0:
+                    clamp_idx = min(self.min_sparse_index, true_mask.size(-1))
+                    candidate_mask[..., :clamp_idx] = False
+                if self.sliding_window is not None and self.sliding_window > 0:
+                    win = min(self.sliding_window, true_mask.size(-1))
+                    candidate_mask[..., -win:] = False
+
+                if candidate_mask.any():
+                    total_deact = (true_mask.bool() & candidate_mask).sum(dim=-1)
+                    causal_deact = (attention_mask.bool() & candidate_mask).sum(dim=-1)
+                    additional_deact = (total_deact - causal_deact)
+                    num_candidates = candidate_mask.sum(dim=-1)
+                    effective_sparsity = 100 * (additional_deact.float() / num_candidates.float()).mean().item()
+                else:
+                    effective_sparsity = 0.0
                 self.effective_sparsity = effective_sparsity
                 print(f"Layer {self.layer_idx}: Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
         if self.layer_idx == 0:

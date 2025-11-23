@@ -69,6 +69,9 @@ class LlamaAttentionExperimental(nn.Module):
         self.pairwise_topk_ratio = 0.2  # fraction of keys used as pos/neg in pairwise loss
         self.tokenbutler_variant = "tokenbutler"  # "tokenbutler" | "tokenbutler_slice" | "tokenbutler_project"
  
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+
         if self.mode == "extreme_recall": # top4
             self.low_recall_first = {
                 # "meta-llama/Llama-3.1-8B-Instruct": [(31, 10), (21, 2), (22, 2), (9, 5), (1, 8), (11, 8), (8, 5), (20, 2), (17, 15), (12, 11), (2, 10), (24, 20), (20, 14), (12, 19), (10, 5), (1, 15), (15, 19), (8, 17), (31, 6), (13, 19), (27, 9), (20, 16), (5, 11), (21, 29), (0, 16), (30, 15), (23, 20), (7, 27), (2, 15), (4, 19), (13, 10), (12, 10), (17, 17), (3, 10), (5, 5), (1, 16), (4, 18), (15, 2), (13, 20), (6, 13), (16, 17), (6, 11), (14, 19), (23, 2), (9, 17), (5, 10), (23, 16), (25, 7), (28, 11), (24, 17), (10, 17), (5, 27), (7, 10), (26, 20), (0, 19), (6, 10), (25, 17), (30, 21), (27, 29), (28, 15), (22, 14), (9, 8),(3, 7), (5, 25), (24, 24), (18, 26), (22, 7), (25, 20), (7, 11), (28, 10), (19, 29), (11, 5), (15, 26), (6, 20), (27, 24), (20, 18), (25, 29), (12, 26), (14, 26), (26, 13), (17, 13), (6, 27), (6, 18), (27, 13), (16, 30), (18, 29), (17, 14), (5, 20), (8, 8), (14, 20), (27, 17), (17, 30), (5, 13), (22, 27), (23, 18), (13, 27), (9, 29), (29, 14), (12, 22), (23, 24), (25, 24), (26, 29), (2, 19), (7, 25), (15, 22), (3, 30), (4, 27), (25, 9), (24, 29), (1, 19), (4, 26), (17, 29), (1, 10), (14, 2), (26, 24), (4, 13), (18, 30), (30, 11), (6, 25), (28, 6), (29, 17), (3, 13), (13, 23), (14, 22), (19, 14), (21, 21), (3, 19), (18, 13), (15, 20), (25, 2), (13, 25), (24, 30), (13, 22), (2, 11), (31, 13), (12, 27), (3, 15), (14, 10), (29, 15), (22, 24), (3, 26), (23, 25), (5, 24), (31, 26), (29, 21), (18, 14), (14, 25), (7, 26), (16, 31), (31, 8), (0, 26), (29, 26), (16, 29), (8, 13), (23, 27), (29, 10), (21, 27), (15, 25), (2, 21), (2, 6), (6, 19), (15, 30), (31, 14), (29, 11), (11, 31), (20, 25), (30, 14), (18, 10), (14, 4), (15, 28), (7, 24), (4, 9), (23, 31), (19, 18), (5, 23), (25, 30), (27, 30), (29, 22), (31, 9), (20, 30), (7, 9), (8, 26), (20, 20),(13, 26), (11, 21), (16, 4), (12, 23), (30, 30), (28, 18), (10, 29), (17, 3), (26, 16), (20, 29), (22, 25), (30, 31), (1, 13), (18, 24), (12, 25), (26, 30), (28, 22), (21, 13), (4, 25), (22, 18), (11, 9), (11, 13), (26, 17), (12, 30), (31, 21), (24, 6), (1, 20), (8, 18), (1, 21), (13, 9),(2, 22), (24, 27), (22, 23), (31, 22), (14, 30), (26, 6), (13, 28), (2, 28), (19, 31), (12, 9), (29, 30), (21, 16), (28, 28), (9, 18), (27, 27),(0, 30), (1, 22), (16, 24), (14, 31), (3, 25), (2, 26), (20, 27), (27, 31), (31, 27), (19, 4), (29, 27), (11, 29), (0, 22), (19, 19), (29, 8), (20, 13), (3, 20), (28, 26), (6, 23), (27, 28), (23, 7), (22, 21), (13, 14), (1, 9), (7, 23), (9, 16), (14, 23), (23, 29), (3, 8), (9, 19), (17, 19), (22, 28), (25, 16), (17, 27), (4, 21), (26, 27), (11, 30), (17, 24), (20, 23), (21, 7), (28, 14), (21, 17), (17, 28), (30, 27), (9, 13), (2, 20), (21, 30), (25, 28), (17, 31), (4, 3), (16, 28), (3, 9), (21, 31), (19, 27), (1, 26), (16, 13), (2, 30), (4, 14), (10, 26), (28, 27), (14, 28), (10, 6), (26, 22), (1, 18), (16, 15), (8, 16), (5, 30), (4, 30), (20, 22), (17, 20), (20, 21), (2, 13), (18, 15), (3, 28), (6, 24), (23, 22), (16, 18), (11, 26), (19, 10), (22, 29), (4, 23), (18, 20), (5, 14), (3, 18), (0, 8), (21, 18), (5, 7), (18, 27), (24, 23), (0, 13), (21, 22), (10, 13), (27, 16), (23, 21), (23, 28), (2, 29), (18, 3), (20, 24), (29, 4), (3, 23), (20, 26), (2, 25), (19, 13), (21, 28), (1, 28), (1, 30), (31, 30), (28, 21), (5, 19), (2, 9), (7, 5), (3, 21), (19, 16), (28, 17), (16, 26), (8, 6), (29, 28), (30, 29), (1, 3), (7, 30), (11, 28), (9, 26), (13, 30), (24, 26), (28, 30), (6, 26), (16, 20), (19, 28), (19, 26), (31, 25), (5, 29), (25, 27), (5, 28), (20, 1), (14, 29), (0, 25), (21, 1), (31, 17), (4, 24), (18, 28), (0, 17), (17, 26), (7, 20), (16, 1), (5, 26), (1, 24), (1, 12), (29, 29), (8, 21), (24, 28), (19, 9), (29, 6), (5, 21),(27, 23), (13, 13), (14, 12), (5, 1), (7, 7), (12, 29), (0, 23), (3, 22), (26, 28), (6, 30), (20, 28), (1, 29), (9, 30), (18, 1), (22, 31), (16,27), (20, 31), (23, 11), (18, 18), (12, 20), (21, 25), (13, 18), (30, 28), (26, 19), (11, 16), (19, 24), (2, 23), (0, 24), (30, 20), (25, 26), (15, 15), (0, 28), (30, 18), (19, 20), (0, 29), (30, 8), (8, 22), (0, 4), (26, 23), (26, 14), (18, 8), (14, 13), (21, 4), (6, 29), (30, 26), (13, 21), (26, 25), (25, 31), (12, 13), (18, 23), (25, 23), (7, 21), (24, 7), (6, 22), (4, 20), (27, 21), (3, 14), (31, 18), (16, 14), (24, 16), (4, 29), (10, 27), (13, 17), (18, 19), (15, 11), (19, 12), (25, 21), (2, 18), (26, 1), (0, 27), (21, 15), (3, 29), (2, 17), (12, 4), (24, 31), (22, 11), (1, 14), (12, 28), (22, 22), (5, 9), (27, 26), (27, 19), (17, 18), (15, 29), (14, 9), (27, 20), (0, 9), (29, 25), (30, 23), (30, 13), (12, 3),(3, 27), (28, 9), (16, 19), (12, 14), (29, 19), (23, 15), (3, 6), (14, 14), (25, 15), (17, 8), (5, 3), (26, 15), (15, 14), (21, 23), (9, 20), (13, 29), (9, 24), (26, 21), (22, 5), (27, 6), (0, 14), (23, 13), (23, 26), (17, 25), (3, 11), (13, 11), (21, 24), (16, 22), (14, 5), (31, 20), (10, 16), (24, 25), (27, 22), (2, 16), (21, 5), (25, 22), (10, 22), (10, 30), (13, 15), (5, 18), (17, 9), (10, 12), (17, 10), (26, 8), (6, 7), (14, 18), (11, 19), (3, 31), (23, 17), (30, 22), (4, 11), (28, 19), (14, 21), (10, 28), (18, 25), (12, 12), (19, 25), (24, 19), (17, 5), (27, 10), (31, 29), (2, 27), (14, 17), (5, 22), (1, 4), (26, 11), (0, 10), (11, 22), (9, 2), (15, 21), (1, 23), (20, 9), (0, 18), (18, 16), (14, 15), (24, 21), (8, 24), (28, 8), (8, 30), (22, 15), (8, 2), (22, 17), (11, 24), (15, 13), (0, 20), (9, 23), (30, 2), (11, 20), (10, 20), (16, 6), (2, 24), (1,11), (13, 5), (7, 28), (7, 29), (10, 8), (21, 26), (19, 15), (9, 28), (29, 9), (27, 8), (4, 28), (27, 2), (25, 14), (18, 31), (25, 25), (12, 1),(7, 3), (6, 17), (13, 31), (10, 24), (7, 31), (17, 2), (30, 25), (16, 23), (20, 11), (5, 31), (19, 17), (11, 15), (4, 17), (24, 14), (1, 1), (28, 29), (15, 9), (25, 11), (7, 14), (31, 28), (7, 1), (8, 29), (22, 3), (11, 23), (9, 21), (8, 23), (12, 18), (18, 9), (25, 3), (15, 27), (4, 31),(10, 25), (23, 1), (29, 20), (11, 3), (1, 31), (9, 22), (25, 19), (26, 10), (8, 14), (7, 16), (1, 5), (12, 21), (3, 16), (6, 6), (9, 27), (14, 24), (26, 26), (4, 1), (2, 31), (29, 23), (14, 8), (5, 16), (20, 3), (16, 9), (27, 11), (21, 11), (6, 14), (22, 26), (28, 13), (12, 2), (3, 24), (2, 14), (15, 24), (19, 3), (9, 25), (6, 3), (27, 25), (11, 17), (10, 23), (29, 31), (18, 17), (24, 4), (6, 21), (1, 27), (21, 19), (28, 25), (24,11), (9, 31), (21, 10), (11, 27), (26, 3), (31, 19), (5, 17), (20, 15), (1, 7), (12, 17), (8, 28), (18, 6), (23, 9), (24, 1), (31, 23), (1, 17),(30, 24), (28, 20), (0, 21), (0, 11), (31, 2), (14, 11), (18, 22), (24, 5), (23, 19), (0, 31), (27, 3), (22, 6), (25, 8), (24, 10), (19, 2), (16, 25), (21, 6), (23, 10), (20, 10), (8, 11), (1, 2), (12, 15), (18, 11), (30, 17), (29, 18), (30, 16), (23, 14), (8, 20), (2, 7), (22, 19), (16, 11), (8, 19), (31, 11), (14, 3), (10, 19), (6, 1), (13, 4), (24, 22), (17, 1), (15, 23), (24, 15), (12, 8), (21, 9), (0, 3), (28, 31), (18, 5), (6, 5), (3, 2), (19, 22), (24, 8), (7, 19), (3, 17), (18, 21), (23, 23), (13, 7), (22, 30), (7, 17), (2, 8), (2, 2), (8, 27), (5, 15), (27, 14), (31, 5), (3, 4), (31, 24), (8, 31), (6, 16), (29, 16), (22, 10), (11, 6), (7, 2), (17, 22), (10, 3), (9, 6), (26, 18), (25, 1), (10, 9), (10, 21),(6, 28), (25, 10), (6, 31), (15, 17), (25, 6), (30, 19), (16, 16), (19, 7), (18, 2), (5, 6), (13, 3), (26, 31), (27, 15), (20, 5), (22, 9), (14,27), (16, 8), (3, 5), (6, 2), (24, 18), (10, 31), (16, 21), (17, 21), (11, 2), (21, 14), (6, 12), (26, 7), (28, 24), (9, 7), (27, 7), (23, 30), (25, 18), (27, 1), (15, 18), (7, 15), (9, 1), (2, 5), (23, 3), (3, 3), (9, 11), (13, 8), (17, 23), (11, 14), (24, 3), (4, 4), (19, 5), (13, 1), (22, 16), (23, 5), (20, 17), (8, 25), (28, 23), (22, 8), (20, 6), (11, 18), (1, 6), (18, 12), (8, 4), (7, 12), (20, 19), (16, 7), (4, 22), (20, 4), (17, 12), (4, 16), (6, 9), (30, 6), (11, 7), (10, 7), (16, 10), (10, 10), (4, 12), (28, 2), (17, 16), (15, 8), (13, 24), (22, 20), (30, 4), (7,4), (5, 12), (1, 25), (20, 12), (26, 2), (11, 10), (25, 12), (22, 13), (17, 7), (13, 2), (4, 15), (19, 8), (22, 12), (10, 11), (7, 6), (2, 1), (19, 23), (10, 4), (10, 15), (6, 4), (29, 12), (19, 11), (31, 15), (4, 6), (6, 15), (25, 13), (31, 12), (7, 13), (17, 6), (11, 12), (7, 22), (30, 12), (24, 12), (19, 30), (0, 7), (11, 25), (2, 4), (15, 16), (15, 4), (15, 3), (26, 9), (15, 7), (18, 7), (14, 7), (19, 21), (12, 24), (27, 18), (30, 9), (29, 5), (14, 16), (5, 4), (29, 24), (11, 4), (23, 4), (13, 16), (31, 4), (0, 15), (26, 12), (29, 7), (28, 12), (23, 12), (9, 15), (0, 6), (4, 8), (8, 10), (0, 5), (8, 15), (11, 11), (8, 12), (6, 8), (28, 7), (7, 18), (30, 1), (0, 2), (31, 31), (30, 7), (27, 12), (9, 14), (8, 7), (16, 2), (7, 8), (21, 3), (15, 1), (5, 8), (22, 1), (12, 6), (28, 4), (16, 3), (2, 3), (21, 12), (16, 12), (9, 12), (4, 10), (26, 4), (10, 18), (18, 4), (4, 7), (24, 13), (10, 14), (12, 5), (29, 2), (25, 4), (15, 5), (12, 7), (30, 3), (13, 12), (15, 12), (31, 16), (31, 7), (16, 5), (28, 16), (10, 2), (3, 1), (12, 16), (21, 20), (0, 12), (23, 8), (31, 3), (29, 13), (15, 10), (28, 5), (3, 12), (17, 4), (17, 11), (9, 9), (30, 10), (19, 6), (21, 8), (4, 5), (24, 2), (9, 10), (11, 1), (28, 1), (14, 1), (24, 9), (0, 1), (14, 6), (23, 6), (2, 12), (29, 1), (30, 5), (15, 6), (31, 1), (9, 4), (25, 5), (27, 5), (12, 31), (15, 31), (5, 2), (8, 9), (9, 3), (28, 3), (19, 1), (20, 8), (29, 3), (22, 4), (8, 3), (13, 6), (27, 4), (4, 2), (20, 7), (26, 5), (8, 1), (10, 1),     ],
@@ -172,35 +175,165 @@ class LlamaAttentionExperimental(nn.Module):
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
-        if self.token_sparse_method is not None:
+        method = self.token_sparse_method
+
+        # Optional: load per-head threshold calibration if available.
+        if method is not None:
             try:
                 mname = self.config._name_or_path.split("/")[-1]
-                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                read_path = f"threshold_calibs/{mname}/{method}.pkl"
                 threshold_model_dictionary = torch.load(read_path)
                 self.tok_calibration_set = threshold_model_dictionary
-            except:
+            except Exception:
                 pass
-        if self.token_sparse_method == "LazyLLM":
-            if self.layer_idx <= 9:
-                self.sparse_aggression = 1.0
-            elif self.layer_idx <= 19:
-                self.sparse_aggression = 0.7
-            elif self.layer_idx <= 28:
-                self.sparse_aggression = 0.4
+
+        # Reset sparsity state for this layer.
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+        self.sparse_aggression = None
+        self.head_keep = None
+
+        if method.startswith("fixed_"):
+            # fixed_xpc / fixed_ytok
+            spec = method.split("_", 1)[1]
+
+            # fixed_xpc: x is *sparsity* (fraction of candidate tokens pruned).
+            if spec.endswith("pc"):
+                if self.layer_idx == 0:
+                    # Never prune layer 0.
+                    self.target_sparsity = 0.0
+                    self.sparse_aggression = 1.0
+                else:
+                    x = float(spec[:-2])
+                    self.target_sparsity = x / 100.0                  # prune fraction on candidates
+                    self.sparse_aggression = 1.0 - self.target_sparsity  # keep fraction on candidates
+
+                # Per-head keep ratios, globally renormalised to the keep fraction.
+                self.head_keep = self.build_head_keep_ratios()
+
+            # fixed_ytok: keep exactly y *candidate* tokens per head/query.
+            elif spec.endswith("tok"):
+                if self.layer_idx == 0:
+                    self.target_keep_tokens = None  # dense
+                    self.sparse_aggression = 1.0
+                else:
+                    y = int(spec[:-3])
+                    self.target_keep_tokens = max(1, y)
+                    # No per-head re‑weighting here; keep uniform behaviour.
+                    self.sparse_aggression = None
+                    self.head_keep = None
             else:
-                self.sparse_aggression = 0.1
-        elif "fixed" in self.token_sparse_method:
-            if self.layer_idx == 0:
-                self.sparse_aggression = 1.0
-            else:
-                self.sparse_aggression = 1.0 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-        elif "progressive" in self.token_sparse_method:
-            pc_drop = float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-            self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
+                raise ValueError(
+                    f"Unknown fixed sparsity spec '{spec}' in token_sparse_method='{method}'"
+                )
         else:
-            raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
-        self.head_keep = self.build_head_keep_ratios() 
-            
+            # You *can* extend this if you still want LazyLLM/progressive here,
+            # but with the new semantics we only support fixed_xpc / fixed_ytok.
+            raise ValueError(
+                f"Unsupported token sparsity method '{method}'. "
+                "Use 'fixed_xpc' (e.g. fixed_65pc) or 'fixed_ytok' (e.g. fixed_128tok)."
+            )
+
+    def _build_decode_mask_fixed(
+        self,
+        importance_scores: torch.Tensor,     # [B, H, 1, K]
+        attention_mask: torch.Tensor,        # [B, 1, 1, K] (0 or -inf)
+        min_sparse_index: Optional[int],
+    ) -> torch.Tensor:
+        """
+        Build a decode‑time sparsity mask for fixed_xpc / fixed_ytok.
+
+        importance_scores: [B, H, 1, K] – importance per key (pre or post‑softmax).
+        attention_mask:    [B, 1, 1, K] – 0 or -inf.
+
+        Returns:
+            mask_tensor: [B, H, 1, K] with values {0, -inf}, where -inf marks
+            tokens pruned by TokenButler (excluding sink + sliding‑window tokens).
+        """
+        bsz, num_heads, q_len, key_len = importance_scores.shape
+        assert q_len == 1, "Decode‑time mask only makes sense for q_len == 1"
+        device = importance_scores.device
+        dtype = importance_scores.dtype
+
+        # Candidate tokens:
+        #   - not masked by attention_mask
+        #   - not in the sink region [0:min_sparse_index)
+        #   - not in the sliding‑window tail (always‑keep region)
+        attn_valid = (attention_mask[:, :, -1:, :] == 0)  # [B,1,1,K]
+        candidate_mask = attn_valid.expand(bsz, num_heads, 1, key_len)
+
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            candidate_mask[..., :clamp_idx] = False
+
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            candidate_mask[..., -win:] = False
+
+        if not candidate_mask.any():
+            # Nothing we are allowed to drop – stay dense.
+            return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+
+        method = self.token_sparse_method or ""
+        candidate_counts = candidate_mask.sum(dim=-1, keepdim=True)  # [B,H,1,1]
+
+        # How many *candidate* tokens do we keep per (B, H)?
+        if "pc" in method:
+            if self.sparse_aggression is None:
+                raise ValueError("sparse_aggression must be set for fixed_xpc")
+
+            if getattr(self, "head_keep", None) is not None:
+                head_keep = self.head_keep.to(device)
+            else:
+                head_keep = torch.full(
+                    (self.num_heads,), float(self.sparse_aggression), device=device
+                )
+            head_keep = head_keep.clamp(min=0.0, max=1.0).view(1, self.num_heads, 1, 1)
+            keep_counts = (head_keep * candidate_counts.float()).floor()
+            keep_counts = keep_counts.clamp(min=1)
+            keep_counts = torch.minimum(keep_counts, candidate_counts)
+            keep_counts = keep_counts.long()
+        elif "tok" in method:
+            if self.target_keep_tokens is None or self.target_keep_tokens <= 0:
+                return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+            y = self.target_keep_tokens
+            keep_counts = torch.minimum(
+                candidate_counts,
+                torch.full_like(candidate_counts, y, dtype=torch.long),
+            )
+            keep_counts = keep_counts.clamp(min=1)
+        else:
+            raise ValueError(f"token_sparse_method '{method}' is not a fixed_* scheme")
+
+        # Rank candidate tokens by importance (descending), ignoring non‑candidates.
+        scores = importance_scores.clone()
+        scores = scores.masked_fill(~candidate_mask, float("-inf"))
+        _, sorted_idx = scores.sort(dim=-1, descending=True)  # [B,H,1,K]
+
+        B, H, q_len, key_len = sorted_idx.shape
+        # rank[b, h, q, j] will hold the rank position of key j for that (b,h,q)
+        rank = torch.empty_like(sorted_idx, dtype=torch.long)
+        # Build src with the same shape as the index tensor along non-scatter dims
+        arange_K = torch.arange(key_len, device=sorted_idx.device, dtype=torch.long)
+        arange_K = arange_K.view(1, 1, 1, key_len).expand_as(sorted_idx)  # [B,H,1,K]
+        rank.scatter_(-1, sorted_idx, arange_K)
+        # Keep:
+        #   - all non‑candidate tokens, plus
+        #   - the top 'keep_counts' candidate tokens.
+        keep_mask = (~candidate_mask) | (rank < keep_counts)
+
+        mask_tensor = torch.zeros_like(importance_scores, dtype=dtype, device=device)
+        mask_tensor = mask_tensor.masked_fill(~keep_mask, float("-inf"))
+
+        # Explicitly clear sink + sliding‑window regions (always keep).
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            mask_tensor[..., :clamp_idx] = 0.0
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            mask_tensor[..., -win:] = 0.0
+
+        return mask_tensor
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -318,11 +451,17 @@ class LlamaAttentionExperimental(nn.Module):
         evalmode = getattr(self, "eval_llm_mode", "ExpPred")
         is_inference = bool(getattr(self, "inference_mode", False))
 
-        # prefill / decode detection (HF generate usually: prefill q_len>1, decode q_len==1)
-        is_decode = use_cache and (q_len == 1)
+        # HF generate pattern:
+        #   • prefill:  use_cache=True, past_key_value is None,  q_len > 1  → dense
+        #   • decode:   use_cache=True, past_key_value not None, q_len == 1 → sparse
+        is_decode = (
+            use_cache
+            and (q_len == 1)
+            and (past_key_value is not None)
+        )
 
         # ======================================================================
-        # 1) Dense path: training, prefill, first layer, or non‑ExpPred modes
+        # 1) Dense path: training, prefill, first layer, or non-ExpPred modes
         # ======================================================================
         use_sparse_decode = (
             is_inference
@@ -330,6 +469,7 @@ class LlamaAttentionExperimental(nn.Module):
             and self.layer_idx > 0
             and evalmode == "ExpPred"
         )
+
 
         final_mask = None
         # 🔴 IMPORTANT: match dtype with query_states
@@ -410,6 +550,7 @@ class LlamaAttentionExperimental(nn.Module):
                     ]  # [H, Dh, dDash]
 
                     key_for_proj = key_states.to(proj_weight.device)
+                    key_for_proj = key_for_proj.to(proj_weight.dtype)
                     k_proj = torch.einsum("bhlk,hkd->bhld", key_for_proj, proj_weight)
                     if k_proj.device != key_states.device:
                         k_proj = k_proj.to(key_states.device)
@@ -442,60 +583,21 @@ class LlamaAttentionExperimental(nn.Module):
                         key_len,
                     )
                 else:
-                    # Softmax over importance + existing attention mask (causal/pad)
-                    # so that low‑prob keys are pruned.
                     if attention_mask is not None:
                         importance_probs = torch.softmax(importance_scores + attention_mask, dim=-1)
                     else:
                         importance_probs = torch.softmax(importance_scores, dim=-1)
 
-                    # Sort keys by predicted importance
-                    # [B, H, 1, Lk] -> sorted indices along last dim
-                    _, sorted_indices = importance_probs.sort(dim=-1, descending=True)
-                    sorted_indices = sorted_indices[:, :, -q_len:, :]  # q_len==1 → just [B,H,1,Lk]
-
-                    if q_len == 1:
-                        # q_len==1 path from your original code: keep top `sparse_aggression` fraction
+                    if self.token_sparse_method is None:
+                        # No TokenButler sparsity configured → dense.
                         mask_tensor = torch.zeros_like(importance_probs)
-
-                        cut = int(self.sparse_aggression * key_len)
-                        cut = max(cut, 0)
-                        cut = min(cut, key_len)
-
-                        # indices to *drop* (everything after cut)
-                        drop_indices = sorted_indices[:, :, :, cut:]
-                        mask_tensor.scatter_(-1, drop_indices, float("-inf"))
-
-                        # Always keep prefix up to min_sparse_index
-                        if min_sparse_index > 0:
-                            mask_tensor[:, :, :, :min_sparse_index] = 0.0
-
-                        # Keep last sliding_window tokens if requested
-                        if self.sliding_window is not None:
-                            mask_tensor[:, :, :, -self.sliding_window:] = 0.0
                     else:
-                        # We don't expect q_len>1 here, but keep this for safety
-                        mask_tensor = sorted_index_to_variable_mask(
-                            sorted_indices,
+                        # fixed_xpc / fixed_ytok semantics: prune on *candidate* tokens.
+                        mask_tensor = self._build_decode_mask_fixed(
+                            importance_probs,
                             attention_mask,
                             min_sparse_index,
-                            bsz_,
-                            q_len,
-                            key_len,
-                            self.head_keep.to(sorted_indices.device),
-                            sliding_window=self.sliding_window,
                         )
-
-                # # Optional strict sliding window enforcement after sparsity selection
-                # if self.sliding_window is not None:
-                #     if not hasattr(self, "window_cache"):
-                #         self.window_cache = SlidingWindowCache(
-                #             max_seq_len=1024,
-                #             sliding_window=self.sliding_window,
-                #             device=mask_tensor.device,
-                #         )
-                #     window = self.window_cache.get_window(q_len, key_len)
-                #     mask_tensor = enforce_sliding_window(mask_tensor, window)
 
                 final_mask = mask_tensor
 
