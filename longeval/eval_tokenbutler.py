@@ -185,20 +185,62 @@ def replace_attention_modules(model, config, args):
         raise NotImplementedError(f"Architecture {args.architecture} not supported.")
 
     return model
-
+    
 def configure_experimental_modules(model, args):
     """
-    Set per-module attributes for *AttentionExperimental modules.
+    Set per-module attributes for *AttentionExperimental modules and
+    compute a rough expected token sparsity for logging.
     """
     token_sparsity_list = []
+
+    # Nominal sequence length to estimate sparsity for fixed_ytok
+    nominal_seq_len = getattr(args, "datalen", None)
+    if nominal_seq_len is None and hasattr(model, "config") and hasattr(model.config, "max_position_embeddings"):
+        nominal_seq_len = model.config.max_position_embeddings
+    if nominal_seq_len is None:
+        nominal_seq_len = 2048  # safe fallback
 
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
             module.eval_llm_mode = args.eval_llm_mode
             module.token_sparse_method = args.token_sparse_method
-            module.set_token_sparsity()
-            token_sparsity_list.append(1.0 - module.sparse_aggression)
 
+            # Let the module parse token_sparse_method and set:
+            #   target_sparsity / target_keep_tokens / sparse_aggression / head_keep
+            module.set_token_sparsity()
+
+            # ---- estimate sparsity for logging ----
+            method = module.token_sparse_method or ""
+            expected_sparsity = 0.0
+
+            if "pc" in method:
+                # fixed_xpc: target_sparsity is "fraction of candidates pruned"
+                if getattr(module, "target_sparsity", None) is not None:
+                    expected_sparsity = module.target_sparsity
+                elif getattr(module, "sparse_aggression", None) is not None:
+                    expected_sparsity = 1.0 - float(module.sparse_aggression)
+                else:
+                    expected_sparsity = 0.0
+
+            elif "tok" in method:
+                # fixed_ytok: approximate sparsity at a nominal sequence length
+                keep_tokens = getattr(module, "target_keep_tokens", None)
+                if keep_tokens is not None and keep_tokens > 0:
+                    head = getattr(args, "min_sparse_index", 0) or 0
+                    tail = getattr(args, "sliding_window", 0) or 0
+                    eff_context = max(1, nominal_seq_len - head - tail)
+                    keep = min(keep_tokens, eff_context)
+                    expected_sparsity = 1.0 - (keep / float(eff_context))
+                else:
+                    # e.g. layer 0 (we keep it dense)
+                    expected_sparsity = 0.0
+            else:
+                # No sparsity / unsupported scheme
+                expected_sparsity = 0.0
+
+            token_sparsity_list.append(expected_sparsity)
+
+            # ---- copy the rest of the config into the module ----
             module.stream_llm_start_size = args.stream_llm_start_size
             module.num_tok_per_page = args.num_tok_per_page
             module.producer_frequency = args.producer_frequency
@@ -212,16 +254,17 @@ def configure_experimental_modules(model, args):
             module.lookahead = args.lookahead
             module.num_layers_pred = args.producer_frequency
             module.sliding_window = args.sliding_window
-
             module.tokenbutler_variant = args.tokenbutler_variant
+
             if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
                 if module.layer_idx % args.producer_frequency == 0:
                     module.update_predictor()
 
     if token_sparsity_list:
         avg_token_sparsity = sum(token_sparsity_list) / len(token_sparsity_list)
-        print(f"Average expected token sparsity (1 - sparse_aggression): {avg_token_sparsity:.4f}")
+        print(f"Average expected token sparsity: {avg_token_sparsity:.4f}")
         return avg_token_sparsity
+
     return None
 
 def load_producer_weights_if_needed(model, predictor_ckpt: str):

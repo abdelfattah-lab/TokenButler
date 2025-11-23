@@ -227,14 +227,36 @@ class LlamaAttentionExperimental(nn.Module):
 
             # fixed_ytok: keep exactly y *candidate* tokens per head/query.
             elif spec.endswith("tok"):
+                y = int(spec[:-3])
+
                 if self.layer_idx == 0:
-                    self.target_keep_tokens = None  # dense
+                    # Never prune layer 0.
+                    self.target_keep_tokens = None
                     self.sparse_aggression = 1.0
                 else:
-                    y = int(spec[:-3])
                     self.target_keep_tokens = max(1, y)
-                    # No per‑head re‑weighting here; keep uniform behaviour.
-                    self.sparse_aggression = None
+
+                    # --- Approximate keep fraction for logging / metrics only ----
+                    # We'll approximate the effective number of candidate tokens
+                    # using either a user‑provided nominal_seq_len or the model's
+                    # max_position_embeddings, minus sink + sliding window.
+                    nominal_L = getattr(self, "nominal_seq_len", None)
+                    if nominal_L is None:
+                        nominal_L = getattr(
+                            self.config,
+                            "max_position_embeddings",
+                            self.max_position_embeddings,
+                        )
+
+                    head = getattr(self, "min_sparse_index", 0) or 0
+                    tail = getattr(self, "sliding_window", 0) or 0
+                    eff_L = max(1, nominal_L - head - tail)
+
+                    keep_frac = min(1.0, float(self.target_keep_tokens) / eff_L)
+
+                    # This is only used by configure_experimental_modules() to
+                    # compute an "average sparsity" summary.
+                    self.sparse_aggression = keep_frac
                     self.head_keep = None
             else:
                 raise ValueError(f"Unknown fixed sparsity spec '{spec}' in token_sparse_method='{method}'")
