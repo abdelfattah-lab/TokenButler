@@ -277,7 +277,9 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.hidden_size = pred_hid_size
         self.num_heads = num_heads
         # In the original TokenButler code this is "num layers we predict for".
-        # For slice/project we will override it to n_layer_factor.
+        # For slice/project we reinterpret the ctor arg as the *group size*
+        # (a.k.a. n_layer_factor). For the original TokenButler variant it
+        # keeps the old semantics.
         self.num_hidden_layers = num_hidden_layers
         self.dropout = dropout
         self.head_dim = pred_hid_size // (num_heads * 4)
@@ -380,18 +382,21 @@ class TokenImportancePredictorAttentive(nn.Module):
             # -------------------------------
             # tokenbutler_slice / tokenbutler_project
             # -------------------------------
-            # Hard‑code number of query‑MLPs ("slots") for now.
-            # These are *not* model layers; they are predictors that each
-            # cover a chunk of layers.
-            self.num_query_mlps = 4   # or 8, etc. — your n_layer_factor
-
+            # Here `num_hidden_layers` is interpreted as the *group size* G
+            # (n_layer_factor): how many real transformer layers a single
+            # predictor MLP is responsible for.
+            #
+            # Given total_layers, we derive the number of groups:
+            #   num_query_mlps = ceil(total_layers / G)
+            # Each group has its own MLP and covers exactly G local layers
+            # (the last group may be partially used, but we still allocate G).
+            self.group_size: int = num_hidden_layers
             total_layers = self.config.num_hidden_layers
-            # How many layers each slot is responsible for (ceil division).
-            self.layers_per_slot = (total_layers + self.num_query_mlps - 1) // self.num_query_mlps
+            self.num_query_mlps: int = (total_layers + self.group_size - 1) // self.group_size
 
-            # Each slot MLP outputs queries for *its chunk* of layers:
-            # [B, L, hidden] → [B, L, (layers_per_slot * H * dDash)]
-            out_dim_per_slot = self.layers_per_slot * self.num_heads * self.dDash
+            # Each slot MLP outputs queries for *its own group*:
+            # [B, L, hidden] → [B, L, (group_size * H * dDash)]
+            out_dim_per_slot = self.group_size * self.num_heads * self.dDash
 
             self.q_mlps = nn.ModuleList(
                 [
@@ -501,8 +506,8 @@ class TokenImportancePredictorAttentive(nn.Module):
             q_importance: [B*H, N_slots, Lq, dDash]
             k_importance: [B*H, N_slots, Lk, dDash] or None
         """
-        layer_idx = 0  # single predictor block
-
+        if layer_idx is None:
+            layer_idx = 0
         if self.device != hidden_states.device:
             self.device = hidden_states.device
             self.to(self.device)
@@ -603,46 +608,44 @@ class TokenImportancePredictorAttentive(nn.Module):
         # ------------------------------------------------------------------
         else:
             # tokenbutler_slice / tokenbutler_project:
-            # multiple Q-MLPs; each slot MLP predicts queries for a *chunk* of layers.
-            # Each mlp output is interpreted as [layers_per_slot, H, dDash] per token,
-            # then scattered into per-layer bins.
-            base_linear = self.q_mlps[0][0]
+            #
+            # We only ever need queries for the *group* that contains
+            # `layer_idx`. Each call therefore runs exactly one slot MLP
+            # and returns [B*H, G, L, dDash], where G = group_size is the
+            # number of layers in that group. The 2nd dim indexes the
+            # *local* layer index within the group.
+            if layer_idx is None:
+                raise ValueError(
+                    "TokenImportancePredictorAttentive.forward() "
+                    "requires `layer_idx` for tokenbutler_slice/project."
+                )
+
+            G = self.group_size
+            group_idx = layer_idx // G
+            if group_idx >= self.num_query_mlps:
+                raise ValueError(
+                    f"layer_idx={layer_idx} out of range for "
+                    f"{self.num_query_mlps} groups of size {G} "
+                    f"(num_layers={self.config.num_hidden_layers})."
+                )
+
+            base_linear = self.q_mlps[group_idx][0]
             hidden_states = hidden_states.to(base_linear.weight.dtype)
 
             hidden_for_importance = self.norm_importance(hidden_states)
             B, L, _ = hidden_for_importance.size()
             H = self.num_heads
 
-            total_layers = self.config.num_hidden_layers
-            layers_per_slot = self.layers_per_slot
+            # MLP for this group only: [B, L, G * H * dDash]
+            q_flat = self.q_mlps[group_idx](hidden_for_importance)
+            q_group = q_flat.view(B, L, G, H, self.dDash)
+            # [B, H, G, L, dDash]
+            q_group = q_group.permute(0, 3, 2, 1, 4).contiguous()
 
-            # q_layers: [B, H, total_layers, L, dDash]
-            q_layers = hidden_for_importance.new_empty(
-                B, H, total_layers, L, self.dDash
-            )
-
-            for slot_idx, mlp in enumerate(self.q_mlps):
-                start_layer = slot_idx * layers_per_slot
-                end_layer = min(start_layer + layers_per_slot, total_layers)
-                if start_layer >= end_layer:
-                    break
-                group_len = end_layer - start_layer
-
-                # mlp output: [B, L, layers_per_slot * H * dDash]
-                q_flat = mlp(hidden_for_importance)
-                q_slot = q_flat.view(B, L, layers_per_slot, H, self.dDash)
-                # Last slot may represent fewer real layers: drop extras.
-                q_slot = q_slot[:, :, :group_len, :, :]  # [B, L, group_len, H, dDash]
-                # [B, H, group_len, L, dDash]
-                q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
-
-                q_layers[:, :, start_layer:end_layer, :, :] = q_slot
-
-            # Final shape expected by the attention code: [B*H, total_layers, L, dDash]
-            q_importance = q_layers.view(B * H, total_layers, L, self.dDash)
+            # [B*H, G, L, dDash]
+            q_importance = q_group.view(B * H, G, L, self.dDash)
             k_importance = None  # K comes from real key cache (slice/project)
             return q_importance, k_importance
-
 
 class HeadImportancePredictor(nn.Module):
     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \

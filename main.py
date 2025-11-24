@@ -1341,7 +1341,7 @@ if __name__ == '__main__':
             device_map[f'model.layers.{0}'] = 0
         dtype = torch.float16 if args.model_mode == "eval" else torch.float32
         model = AutoModelForCausalLM.from_pretrained(
-            model_path,
+            model_path, 
             device_map=device_map,
             offload_folder=None,
             trust_remote_code=True,
@@ -1353,10 +1353,11 @@ if __name__ == '__main__':
     if args.randomize_init:
         model = AutoModelForCausalLM.from_config(config).cuda()
 
-    if not hasattr(config, "num_hidden_layers"):
-        args.producer_frequency = config.num_layers
-    else:
-        args.producer_frequency = config.num_hidden_layers
+    # if not hasattr(config, "num_hidden_layers"):
+    #     args.producer_frequency = config.num_layers
+    # else:
+    #     args.producer_frequency = config.num_hidden_layers
+    args.producer_frequency = 4
     print("Using device_map:", device_map)
 
 

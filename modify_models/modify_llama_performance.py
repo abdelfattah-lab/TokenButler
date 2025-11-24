@@ -722,7 +722,11 @@ def convert_kvcache_experimental(model, config, producer_frequency):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
                 if layer_counter['idx'] % producer_frequency == 0:
-                    new_module = LlamaAttentionExperimental(config).to(dtype).to(device)
+                    new_module = LlamaAttentionExperimental(
+                        config,
+                        producer=None,
+                        layer_idx=layer_counter['idx'],
+                    ).to(dtype).to(device)
                     producer_layer = new_module
                     producer_layer_device = device
                 else:

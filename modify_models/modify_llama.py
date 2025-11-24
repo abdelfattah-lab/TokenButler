@@ -513,54 +513,73 @@ class LlamaAttentionExperimental(nn.Module):
                         #   tokenbutler_slice   → q from predictor, k = first dDash dims of real key cache
                         #   tokenbutler_project → q from predictor, k = Linear(real key cache)
                         # ------------------------------------------------------------------
-                        # In slice/project, q_importance is stored per *real* layer.
-                        # The predictor internally handles num_query_mlps / grouping.
-                        q_importance_tensor = self.producer.q_importance[
-                            :, self.layer_idx, :, :
-                        ].float().to(query_states.device)  # [BH, Lq, dDash]
- 
-
                         if self.tokenbutler_variant == "tokenbutler":
-                            k_importance_tensor = self.producer.k_importance[
+                            # Original TokenButler: q_importance is [BH, num_layers, Lq, dDash]
+                            owner = self if self.producer is None else self.producer
+                            q_importance_tensor = owner.q_importance[
+                                :, self.layer_idx, :, :
+                            ].float().to(query_states.device)  # [BH, Lq, dDash]
+
+                            k_importance_tensor = owner.k_importance[
                                 :, self.layer_idx % self.producer_frequency, :, :
                             ].float().to(key_states.device)  # [BH, Lk, dDash]
-                        elif self.tokenbutler_variant == "tokenbutler_slice":
-                            Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
-
-                            # Use the projection corresponding to the *actual* layer index,
-                            # NOT the predictor slot.
-                            proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                                self.layer_idx
-                            ]  # [H, Dh, dDash]
-
-                            key_for_proj = key_states.to(proj_weight.device)  # [B,H,Lk,Dh]
-                            k_proj = torch.einsum(
-                                "bhlk,hkd->bhld", key_for_proj, proj_weight
-                            )  # [B,H,Lk,dDash]
-                            if k_proj.device != key_states.device:
-                                k_proj = k_proj.to(key_states.device)
-
-                            k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
-                        elif self.tokenbutler_variant == "tokenbutler_project":
-                            Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
-                            # One projector per *real* layer & head.
-                            proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                                self.layer_idx
-                            ]  # [H, Dh, dDash]
-
-                            # Move keys to predictor weight device, do projection there, then move back.
-                            key_for_proj = key_states.to(proj_weight.device)            # [B,H,Lk,Dh]
-                            k_proj = torch.einsum(
-                                "bhlk,hkd->bhld", key_for_proj, proj_weight
-                            )  # [B,H,Lk,dDash]
-                            if k_proj.device != key_states.device:
-                                k_proj = k_proj.to(key_states.device)
-
-                            k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
                         else:
-                            raise ValueError(
-                                f"Unknown tokenbutler_variant: {self.tokenbutler_variant}"
+                            # tokenbutler_slice / tokenbutler_project:
+                            # q_importance is [BH, G, Lq, dDash] for this
+                            # group's G layers. Select the local index.
+                            owner = self if self.producer is None else self.producer
+                            group_size = getattr(
+                                owner.sparse_token_predictor, "group_size", None
                             )
+                            if group_size is None:
+                                group_size = getattr(self, "producer_frequency", None)
+                            if group_size is None:
+                                raise ValueError(
+                                    "group_size for TokenButler slice/project is not set "
+                                    "(expected `sparse_token_predictor.group_size` or "
+                                    "`producer_frequency`)."
+                                )
+                            group_start = (self.layer_idx // group_size) * group_size
+                            local_idx = self.layer_idx - group_start
+
+                            q_group = owner.q_importance  # [BH, G, Lq, dDash]
+                            q_importance_tensor = q_group[:, local_idx, :, :].float().to(
+                                query_states.device
+                            )  # [BH, Lq, dDash]
+
+                            if self.tokenbutler_variant == "tokenbutler_slice":
+                                # K = first dDash dims of real key cache.
+                                Bk, Hk, Lk, Dh = key_states.shape
+                                if self.dDash > Dh:
+                                    raise ValueError(
+                                        f"dDash={self.dDash} > head_dim={Dh} "
+                                        "for tokenbutler_slice"
+                                    )
+                                k_proj = key_states[..., : self.dDash].to(
+                                    q_importance_tensor.dtype
+                                )
+                                k_importance_tensor = k_proj.reshape(
+                                    Bk * Hk, Lk, self.dDash
+                                )
+                            elif self.tokenbutler_variant == "tokenbutler_project":
+                                # K = Linear(real key cache)
+                                Bk, Hk, Lk, Dh = key_states.shape
+                                proj_weight = owner.sparse_token_predictor.key_cache_proj[
+                                    self.layer_idx
+                                ]  # [H, Dh, dDash]
+                                key_for_proj = key_states.to(proj_weight.device)
+                                k_proj = torch.einsum(
+                                    "bhlk,hkd->bhld", key_for_proj, proj_weight
+                                )  # [B,H,Lk,dDash]
+                                if k_proj.device != key_states.device:
+                                    k_proj = k_proj.to(key_states.device)
+                                k_importance_tensor = k_proj.reshape(
+                                    Bk * Hk, Lk, self.dDash
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Unknown tokenbutler_variant: {self.tokenbutler_variant}"
+                                )
 
                         importance_mask = torch.bmm(
                             q_importance_tensor,
@@ -739,14 +758,40 @@ class LlamaAttentionExperimental(nn.Module):
                     if attention_mask is not None:
                         attn_weights = attn_weights + attention_mask
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
                 # --- Auxiliary predictor loss: row-subsampled teacher vs predictor logits ---
 
+                # Include producer layers as well (except global layer 0), by
+                # always routing through the "owner" that actually stores
+                # q_importance / k_importance.
                 if self.layer_idx > 0:
+                    owner = self if self.producer is None else self.producer
                     # Predictor Q for this *real* layer: [BH, Lq, dDash]
-                    # q_importance is stored as [BH, num_model_layers, Lq, dDash].
-                    q_importance_tensor = self.producer.q_importance[
-                        :, self.layer_idx, :, :
-                    ].float().to(query_states.device)
+                    # tokenbutler: q_importance is stored as [BH, num_model_layers, Lq, dDash].
+                    if self.tokenbutler_variant == "tokenbutler":
+                        q_importance_tensor = owner.q_importance[
+                            :, self.layer_idx, :, :
+                        ].float().to(query_states.device)
+                    else:
+                        # tokenbutler_slice / tokenbutler_project:
+                        # producer.q_importance is [BH, G, Lq, dDash] for this group.
+                        group_size = getattr(
+                            self.producer.sparse_token_predictor, "group_size", None
+                        )
+                        if group_size is None:
+                            group_size = getattr(self, "producer_frequency", None)
+                        if group_size is None:
+                            raise ValueError(
+                                "group_size for TokenButler slice/project is not set "
+                                "(expected `sparse_token_predictor.group_size` or "
+                                "`producer_frequency`)."
+                            )
+                        group_start = (self.layer_idx // group_size) * group_size
+                        local_idx = self.layer_idx - group_start
+                        q_group = self.producer.q_importance  # [BH, G, Lq, dDash]
+                        q_importance_tensor = q_group[:, local_idx, :, :].float().to(
+                            query_states.device
+                        )
                     BH, Lq_imp, _ = q_importance_tensor.shape
                     assert Lq_imp == q_len
                     assert BH == bsz * self.num_heads
@@ -756,13 +801,12 @@ class LlamaAttentionExperimental(nn.Module):
                         bsz, self.num_heads, q_len, self.dDash
                     )
 
-                    # Predictor K depends on TokenButler variant
                     if self.tokenbutler_variant == "tokenbutler":
                         Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
 
                         # Use the projection corresponding to the *actual* layer index,
                         # NOT the predictor slot.
-                        proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
+                        proj_weight = owner.sparse_token_predictor.key_cache_proj[
                             self.layer_idx
                         ]  # [H, Dh, dDash]
 
@@ -790,7 +834,7 @@ class LlamaAttentionExperimental(nn.Module):
                         Bk, Hk, Lk, Dh = key_states.shape  # [B,H,Lk,Dh]
 
                         # Again: per *real* layer projection, no slots here.
-                        proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
+                        proj_weight = owner.sparse_token_predictor.key_cache_proj[
                             self.layer_idx
                         ]  # [H, Dh, dDash]
 
@@ -1002,7 +1046,10 @@ class LlamaAttentionExperimental(nn.Module):
                             top_k_ratio=0.05,
                         )
         if self.layer_idx > 0 and self.train_headpredictor:
-            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
+            owner = self if self.producer is None else self.producer
+            head_importance_tensor = owner.head_importances[
+                :, :, :, self.layer_idx % self.producer_frequency
+            ].float().to(attn_output.device)
             attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
             self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
 
@@ -1114,7 +1161,13 @@ def convert_kvcache_experimental(model, config, producer_frequency):
                 device = next(module.parameters()).device
                 dtype = next(module.parameters()).dtype
                 if layer_counter['idx'] % producer_frequency == 0:
-                    new_module = LlamaAttentionExperimental(config).to(dtype).to(device)
+                    # Producer layer: owns the predictor for its group.
+                    # Pass the true transformer layer index so the predictor
+                    # can map depth → (group, local_idx).
+                    new_module = LlamaAttentionExperimental(
+                        config,
+                        layer_idx=layer_counter['idx'],
+                    ).to(dtype).to(device)
                     producer_layer = new_module
                     producer_layer_device = device
                 else:
