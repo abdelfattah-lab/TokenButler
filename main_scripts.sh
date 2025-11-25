@@ -93,9 +93,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node 2 \
   --sliding_window 512 \
   --tokenbutler_project \
   --producer_frequency 4 \
+  --override_dense \
   --predictor_ckpt /home/ya255/projects/TokenButler/checkpoints/TokenButler_24Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_p4x.csv_L3_8BiLong_p4x_False_False_2000_4_False_custom_mix_long_1024_1_1_10_0.001_16_1024_16_False_4/e_tokenbutler_project_0.3875000000000002.pt
-
-
 
 #   --dataset_name "ruler/fwe,ruler/qa_1,ruler/qa_2,ruler/vt" \
                 # "ruler/niah_single_1,ruler/niah_single_2,ruler/niah_single_3,\

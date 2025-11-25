@@ -50,14 +50,7 @@ class LlamaAttentionExperimental(nn.Module):
         self.rope_theta = config.rope_theta
         self.inference_mode = False
 
-        # Layer / grouping metadata
         self.layer_idx = layer_idx
-
-        # How many *consumer* layers each predictor invocation serves.
-        # Example (24‑layer model, producer_frequency=4):
-        #   layer 0 → queries for layers 1–4
-        #   layer 4 → queries for layers 5–8
-        #   layer 8 → queries for layers 9–12
         self.producer_frequency = max(1, int(producer_frequency))
 
         # Module that owns the predictor outputs for this layer.
@@ -563,19 +556,7 @@ class LlamaAttentionExperimental(nn.Module):
             min_sparse_index = self.min_sparse_index
             with torch.no_grad():
                 if evalmode == "ExpPred":
-                    # Only run predictor-based sparsity on *single-token decode* steps.
-                    # Prefill (q_len > 1) stays dense to avoid [B,H,Lq,Lk] importance mats.
                     if self.layer_idx > 0 and q_len == 1:
-                        # ------------------------------------------------------------------
-                        # TokenButler variants:
-                        #   tokenbutler         → q,k from predictor (original)
-                        #   tokenbutler_slice   → q from predictor, k = first dDash dims of real key cache
-                        #   tokenbutler_project → q from predictor, k = Linear(real key cache)
-                        # ------------------------------------------------------------------
-                        # q_importance is stored on the group root as
-                        # [BH, producer_frequency, Lq, dDash]. Each layer ℓ>0 uses
-                        # the slot corresponding to
-                        #   slot_idx = (ℓ - 1) % producer_frequency.
                         slot_idx = self._get_group_slot_index()
                         q_importance_tensor = self.producer.q_importance[
                             :, slot_idx, :, :
@@ -738,19 +719,7 @@ class LlamaAttentionExperimental(nn.Module):
                                         attention_mask,
                                         min_sparse_index,
                                     )
-
-                        # Apply per‑row sliding‑window after sparsity selection
-                        if self.sliding_window is not None:
-                            if not hasattr(self, "window_cache"):
-                                self.window_cache = SlidingWindowCache(
-                                    max_seq_len=1024,
-                                    sliding_window=self.sliding_window,
-                                    device=mask_tensor.device,
-                                )
-                            window = self.window_cache.get_window(q_len, key_len)
-                            mask_tensor = enforce_sliding_window(mask_tensor, window)
                         final_mask = mask_tensor
-
                         self.final_mask_investigate = final_mask
                     else:
                         # Layer 0: dense attention only – no predictor-based sparsity mask.
@@ -1132,10 +1101,6 @@ class LlamaAttentionExperimental(nn.Module):
             if self.effective_sparsity is None or checkeverytime:
                 true_mask = final_mask + attention_mask  # {0, -inf}
 
-                # Candidate tokens for *TokenButler* sparsity:
-                #   - would have been active without TokenButler
-                #   - are not sink tokens
-                #   - are not in the sliding‑window tail.
                 candidate_mask = (~attention_mask.bool())
                 if self.min_sparse_index is not None and self.min_sparse_index > 0:
                     clamp_idx = min(self.min_sparse_index, true_mask.size(-1))
@@ -1207,13 +1172,6 @@ class LlamaAttentionExperimental(nn.Module):
         return attn_output, attn_weights
         
 def convert_kvcache_experimental(model, config, producer_frequency: int):
-    """
-    Replace all LlamaAttention blocks with LlamaAttentionExperimental.
-
-    New modules are placed EXACTLY on the same device/dtype as the original
-    LlamaAttention they replace. This keeps us consistent with the
-    `device_map` that was used when loading the model.
-    """
     layer_idx_counter = 0
     group_roots: dict[int, LlamaAttentionExperimental] = {}
 

@@ -522,7 +522,7 @@ if __name__ == "__main__":
     # One copy per rank (same pattern as RULER’s eval)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     ).to(dist_config.device)
 
@@ -561,7 +561,7 @@ if __name__ == "__main__":
         # One copy per rank (same pattern as RULER’s eval)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to(dist_config.device)
 
