@@ -416,6 +416,7 @@ def parse_args() -> Namespace:
     p.add_argument("--lookahead", type=int, default=0)
     p.add_argument("--sliding_window", type=int, default=None)
     p.add_argument("--train_headpredictor", action="store_true")
+    p.add_argument("--override_dense", action="store_true")
     p.add_argument("--flash_attn", action="store_true")
     
     p.add_argument('--producer_frequency', type=int, default=None, help='Frequency of predictor')
@@ -555,6 +556,16 @@ if __name__ == "__main__":
 
     if dist_config.master_process:
         print(colored("TokenButler model ready, starting RULER evaluation...", "green"))
+
+    if args.override_dense:
+        # One copy per rank (same pattern as RULER’s eval)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            trust_remote_code=True,
+        ).to(dist_config.device)
+
+        model.eval()
 
     # ------------------- RULER evaluation loop -------------------
     for dataset_name in dataset_names:
