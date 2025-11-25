@@ -266,14 +266,13 @@ class TokenImportancePredictorAttentive(nn.Module):
         intdim,
         attn_reduce_factor,
         dropout: float = 0.1,
-        predictor_variant: str = "tokenbutler",
+        predictor_variant: str = "tokenbutler_project",
     ):
         super().__init__()
         self.config = config
         self.hidden_size = pred_hid_size
         self.num_heads = num_heads
-        # In the original TokenButler code this is "num layers we predict for".
-        # For slice/project we will override it to n_layer_factor.
+        # Interpreted as the number of slots per producer group.
         self.num_hidden_layers = num_hidden_layers
         self.dropout = dropout
         self.head_dim = pred_hid_size // (num_heads * 4)
@@ -285,6 +284,11 @@ class TokenImportancePredictorAttentive(nn.Module):
         self.flash_attn = False
         self.predictor_variant = predictor_variant
 
+        if self.predictor_variant != "tokenbutler_project":
+            raise ValueError(
+                f"Unsupported predictor_variant: {self.predictor_variant}. Only tokenbutler_project is supported."
+            )
+
         # Real model head dim (for projecting true K cache)
         num_attn_heads = getattr(config, "num_attention_heads", num_heads)
         self.model_head_dim = config.hidden_size // num_attn_heads
@@ -293,13 +297,12 @@ class TokenImportancePredictorAttentive(nn.Module):
             pred_hid_size % (num_heads * 4) == 0
         ), "pred_hid_size must be divisible by num_heads * 4."
 
-        # For slice/project we enforce dDash ≤ head_dim (because we slice/project Ks)
-        if self.predictor_variant in ("tokenbutler_slice", "tokenbutler_project"):
-            if self.dDash > self.model_head_dim:
-                raise ValueError(
-                    f"dDash={self.dDash} must be <= model head dim={self.model_head_dim} "
-                    "for tokenbutler_slice / tokenbutler_project."
-                )
+        # Enforce dDash ≤ head_dim (because we project the real key cache)
+        if self.dDash > self.model_head_dim:
+            raise ValueError(
+                f"dDash={self.dDash} must be <= model head dim={self.model_head_dim} "
+                "for tokenbutler_project."
+            )
 
         # Reduced hidden size for the (optional) mini self-attention
         self.hidden_size_reduced = self.hidden_size // self.attn_reduce_factor
@@ -311,130 +314,49 @@ class TokenImportancePredictorAttentive(nn.Module):
         # Shared LayerNorm for the importance branch
         self.norm_importance = nn.LayerNorm(self.hidden_size)
 
-        # ------------------------------------------------------------------
-        # Variant 1: original TokenButler (learned Q + learned K per layer)
-        # ------------------------------------------------------------------
-        if self.predictor_variant == "tokenbutler":
-            # Q and K projections for ALL layers/heads in one big MLP each:
-            # output: [B, L, num_hidden_layers * num_heads * dDash]
-            self.q_proj_importance = nn.Sequential(
-                nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(
-                    self.intermediate_dim,
-                    num_hidden_layers * num_heads * self.dDash,
-                    bias=False,
-                ),
-            )
-            self.k_proj_importance = nn.Sequential(
-                nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-                nn.SiLU(),
-                nn.Linear(
-                    self.intermediate_dim,
-                    num_hidden_layers * num_heads * self.dDash,
-                    bias=False,
-                ),
-            )
-
-            # Mini-transformer used ONLY in this variant
-            self.input_proj = nn.Linear(
-                self.hidden_size, self.hidden_size_reduced, bias=False
-            )
-
-            self.q_proj_attn = nn.Linear(
-                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
-            )
-            self.k_proj_attn = nn.Linear(
-                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
-            )
-            self.v_proj_attn = nn.Linear(
-                self.hidden_size_reduced, self.hidden_size_reduced, bias=False
-            )
-            self.attn_dropout = nn.Dropout(self.dropout)
-
-            self.norm1 = nn.LayerNorm(self.hidden_size_reduced)
-            self.norm2 = nn.LayerNorm(self.hidden_size)
-
-            self.ffn_hidden_size = 2 * self.hidden_size_reduced
-            self.ffn = nn.Sequential(
-                nn.Linear(self.hidden_size_reduced, self.ffn_hidden_size),
-                nn.GELU(),
-                nn.Linear(self.ffn_hidden_size, self.hidden_size),
-                nn.Dropout(self.dropout),
-            )
-
-            # RoPE for internal self-attn + importance K
-            self._init_rope()
-        # ------------------------------------------------------------------
-        # Variant 2: tokenbutler_slice / tokenbutler_project
+        # TokenButler Project:
         #   - no internal self-attn
-        #   - no learned K in predictor
+        #   - K comes from the real key cache via a learned projection
         #   - Q-MLP predicts queries for a *group* of layers
         #     (slots within a producer group).
         #   Here, `num_hidden_layers` is interpreted as:
         #       N_slots = producer_frequency = number of consumer layers
         #       served by each producer.
-        # ------------------------------------------------------------------
-        else:
-            # -------------------------------
-            # tokenbutler_slice / tokenbutler_project
-            # -------------------------------
-            # num_hidden_layers here is the number of *slots per group*,
-            # i.e. how many consumer layers a single producer serves.
-            # Each forward() call produces queries for exactly
-            # `self.num_hidden_layers` slots.
-            self.num_query_mlps = 1
-            self.layers_per_slot = self.num_hidden_layers  # == N_slots
+        self.num_query_mlps = 1
+        self.layers_per_slot = self.num_hidden_layers  # == N_slots
 
-            # Single MLP:
-            #   [B, L, hidden] → [B, L, (N_slots * H * dDash)]
-            out_dim_per_slot = self.layers_per_slot * self.num_heads * self.dDash
+        # Single MLP:
+        #   [B, L, hidden] → [B, L, (N_slots * H * dDash)]
+        out_dim_per_slot = self.layers_per_slot * self.num_heads * self.dDash
 
-            self.q_mlps = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-                        nn.SiLU(),
-                        nn.Linear(
-                            self.intermediate_dim,
-                            out_dim_per_slot,
-                            bias=False,
-                        ),
-                    )
-                ]
-            )
-            # These are unused in slice/project
-            self.q_proj_importance = None
-            self.k_proj_importance = None
-            self.input_proj = None
-            self.q_proj_attn = None
-            self.k_proj_attn = None
-            self.v_proj_attn = None
-            self.attn_dropout = None
-            self.norm1 = None
-            self.norm2 = None
-            self.ffn_hidden_size = None
-            self.ffn = None
-            self.rotary_emb_attn = None
-            self.rotary_emb_importance = None
+        self.q_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
+                    nn.SiLU(),
+                    nn.Linear(
+                        self.intermediate_dim,
+                        out_dim_per_slot,
+                        bias=False,
+                    ),
+                )
+            ]
+        )
         # Initialize all modules that actually exist
         self._initialize_weights()
         self.device = None
 
-        # For tokenbutler_project: per-(slot, head) projection of *real* KV cache.
+        # Per-(slot, head) projection of *real* KV cache.
         # Shape: [num_slots, num_heads, head_dim, dDash]
-        if self.predictor_variant == "tokenbutler_project":
-            self.key_cache_proj = nn.Parameter(
-                torch.empty(
-                    self.config.num_hidden_layers,
-                    self.num_heads,
-                    self.model_head_dim,
-                    self.dDash,
-                )
+        self.key_cache_proj = nn.Parameter(
+            torch.empty(
+                self.config.num_hidden_layers,
+                self.num_heads,
+                self.model_head_dim,
+                self.dDash,
             )
-            nn.init.xavier_uniform_(self.key_cache_proj)
-        else:
-            self.key_cache_proj = None
+        )
+        nn.init.xavier_uniform_(self.key_cache_proj)
 
 
     def _initialize_weights(self):
@@ -457,29 +379,6 @@ class TokenImportancePredictorAttentive(nn.Module):
                 if module.out_proj.bias is not None:
                     nn.init.constant_(module.out_proj.bias, 0)
 
-    def _init_rope(self):
-
-        # send self.config but after modifying head_dim to be self.head_dim just in the function call
-        config_copy = copy.deepcopy(self.config)
-        config_copy.rope_scaling = {
-            "factor": 32.0,
-            "high_freq_factor": 4.0,
-            "low_freq_factor": 1.0,
-            "original_max_position_embeddings": 8192,
-            "rope_type": "llama3"
-        }
-        config_copy.head_dim = self.attn_head_dim
-        
-        # Rotary embedding for attention layer
-        self.rotary_emb_attn = LlamaRotaryEmbedding(
-            config_copy
-        )
-
-        config_copy.head_dim = self.dDash
-        # Rotary embedding for importance projection
-        self.rotary_emb_importance = LlamaRotaryEmbedding(
-            config_copy
-        )
     def forward(
         self,
         hidden_states,
@@ -503,125 +402,30 @@ class TokenImportancePredictorAttentive(nn.Module):
             self.to(self.device)
 
         B, L, _ = hidden_states.size()
+        # tokenbutler_project:
+        # a single Q-MLP predicts queries for a *group* of layers.
+        # Each forward() call returns queries for N_slots positions
+        # within that group.
+        base_linear = self.q_mlps[0][0]
+        hidden_states = hidden_states.to(base_linear.weight.dtype)
+
+        hidden_for_importance = self.norm_importance(hidden_states)
+        B, L, _ = hidden_for_importance.size()
         H = self.num_heads
-        N = self.num_hidden_layers  # for tokenbutler: num layers; for slice/project: num slots
 
-        # ------------------------------------------------------------------
-        # Variant 1: original TokenButler (learned Q + learned K)
-        # ------------------------------------------------------------------
-        if self.predictor_variant == "tokenbutler":
-            hidden_states = hidden_states.to(self.input_proj.weight.dtype)
-            hidden_states_reduced = self.input_proj(hidden_states)
+        N_slots = self.num_hidden_layers  # == layers_per_slot
 
-            # mini self-attention over reduced hidden
-            q = self.q_proj_attn(hidden_states_reduced)
-            k = self.k_proj_attn(hidden_states_reduced)
-            v = self.v_proj_attn(hidden_states_reduced)
-            q = q.view(B, L, H, self.attn_head_dim).transpose(1, 2)
-            k = k.view(B, L, H, self.attn_head_dim).transpose(1, 2)
-            v = v.view(B, L, H, self.attn_head_dim).transpose(1, 2)
+        mlp = self.q_mlps[0]
+        # mlp output: [B, L, N_slots * H * dDash]
+        q_flat = mlp(hidden_for_importance)
+        q_slot = q_flat.view(B, L, N_slots, H, self.dDash)  # [B, L, N_slots, H, dDash]
+        # [B, H, N_slots, L, dDash]
+        q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
 
-            if (
-                past_key_value is not None
-                and layer_idx < len(past_key_value.predictor_primary_key)
-                and past_key_value.predictor_primary_key[layer_idx] is not None
-            ):
-                offset = past_key_value.predictor_primary_key[layer_idx].shape[2]
-            else:
-                offset = 0
-
-            if position_ids is None:
-                position_ids = torch.arange(
-                    offset, offset + L, dtype=torch.long, device=self.device
-                )
-                position_ids = position_ids.unsqueeze(0).expand(B, L)
-
-            cos, sin = self.rotary_emb_attn(v, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
-
-            if use_cache and past_key_value is not None:
-                k, v = past_key_value.update_predictor_primary(
-                    k.detach(), v.detach(), layer_idx
-                )
-
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True
-            )
-            attn_output = attn_output.to(q.dtype)
-            attn_output = (
-                attn_output.transpose(1, 2)
-                .contiguous()
-                .view(B, L, self.hidden_size_reduced)
-            )
-            attn_output = self.norm1(attn_output)
-            ffn_output = self.ffn(attn_output)
-
-            hidden_for_importance = self.norm2(hidden_states + ffn_output)
-
-            # --- project to Q/K importance space for ALL layers/heads ---
-            hidden_for_importance = self.norm_importance(hidden_for_importance)
-
-            q_importance = self.q_proj_importance(
-                hidden_for_importance
-            )  # [B,L,N*H*dDash]
-            k_importance = self.k_proj_importance(
-                hidden_for_importance
-            )  # [B,L,N*H*dDash]
-
-            q_importance = q_importance.view(B, L, N, H, self.dDash).permute(
-                0, 2, 3, 1, 4
-            ).contiguous()
-            k_importance = k_importance.view(B, L, N, H, self.dDash).permute(
-                0, 2, 3, 1, 4
-            ).contiguous()
-
-            q_importance = q_importance.view(B * H, N, L, self.dDash)
-            k_importance = k_importance.view(B * H, N, L, self.dDash)
-
-            cos, sin = self.rotary_emb_importance(k_importance, position_ids)
-            q_importance, k_importance = apply_rotary_pos_emb(
-                q_importance, k_importance, cos, sin, position_ids
-            )
-
-            if use_cache and past_key_value is not None:
-                k_importance = past_key_value.update_predictor_importance(
-                    k_importance.detach(), layer_idx
-                )
-
-            k_importance = k_importance.view(B * H, N, -1, self.dDash)
-            return q_importance, k_importance
-
-        # ------------------------------------------------------------------
-        # Variant 2: tokenbutler_slice / tokenbutler_project
-        #   Only Q is learned here; K comes from the real key cache.
-        #   We have N_slots = num_hidden_layers = producer_frequency slots
-        #   per producer call.
-        # ------------------------------------------------------------------
-        else:
-            # tokenbutler_slice / tokenbutler_project:
-            # a single Q-MLP predicts queries for a *group* of layers.
-            # Each forward() call returns queries for N_slots positions
-            # within that group.
-            base_linear = self.q_mlps[0][0]
-            hidden_states = hidden_states.to(base_linear.weight.dtype)
-
-            hidden_for_importance = self.norm_importance(hidden_states)
-            B, L, _ = hidden_for_importance.size()
-            H = self.num_heads
-
-            N_slots = self.num_hidden_layers  # == layers_per_slot
-
-            mlp = self.q_mlps[0]
-            # mlp output: [B, L, N_slots * H * dDash]
-            q_flat = mlp(hidden_for_importance)
-            q_slot = q_flat.view(B, L, N_slots, H, self.dDash)  # [B, L, N_slots, H, dDash]
-            # [B, H, N_slots, L, dDash]
-            q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
-
-            # Final shape expected by the attention code: [B*H, N_slots, L, dDash]
-            q_importance = q_slot.view(B * H, N_slots, L, self.dDash)
-            k_importance = None  # K comes from real key cache (slice/project)
-            return q_importance, k_importance
+        # Final shape expected by the attention code: [B*H, N_slots, L, dDash]
+        q_importance = q_slot.view(B * H, N_slots, L, self.dDash)
+        k_importance = None  # K comes from real key cache (projected externally)
+        return q_importance, k_importance
 
 
 class HeadImportancePredictor(nn.Module):
