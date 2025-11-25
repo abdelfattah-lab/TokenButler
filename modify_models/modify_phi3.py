@@ -79,7 +79,14 @@ class Phi3LongRoPEScaledRotaryEmbedding(Phi3RotaryEmbedding):
 
 
 class Phi3AttentionExperimental(nn.Module):
-    def __init__(self, config: Phi3Config, producer=None, layer_idx=0):
+    def __init__(
+        self,
+        config: Phi3Config,
+        producer: Optional["Phi3AttentionExperimental"] = None,
+        layer_idx: int = 0,
+        producer_frequency: int = 1,
+        is_predictor_owner: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -91,8 +98,12 @@ class Phi3AttentionExperimental(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.inference_mode = False
-        self.producer = producer
         self.layer_idx = layer_idx
+        self.producer_frequency = max(1, int(producer_frequency))
+
+        # Module that owns the predictor outputs for this layer group.
+        self.producer: Optional["Phi3AttentionExperimental"] = producer
+
         self.token_sparse_method = None
         self.sparse_aggression = None
         self.stream_llm_start_size = None
@@ -103,6 +114,8 @@ class Phi3AttentionExperimental(nn.Module):
         self.effective_sparsity = None
         self.min_sparse_index = None
         self.pred_hid_size = self.hidden_size
+        # Each predictor call produces one query tensor per consumer layer in the group.
+        self.num_layers_pred = self.producer_frequency
         self.num_tok_per_page = None
         self.calc_hitrates = False
         self.flash_attn = False
@@ -117,6 +130,17 @@ class Phi3AttentionExperimental(nn.Module):
         self.pairwise_loss = False
         self.pairwise_topk_ratio = 0.1  # fraction of keys used as pos/neg in pairwise loss
         self.old_predictor = None
+        self.mode = "balanced"
+        self.tokenbutler_variant = "tokenbutler_project"
+        self.lookahead = 0
+
+        # Whether this layer runs the predictor (i.e. group root).
+        self.is_predictor_owner = is_predictor_owner
+        # Decode-time gating knobs.
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+        self._dense_kv_cutoff = 0
+        self.always_dense_decode_tokens = 1
 
         self.low_recall_first = {}
 
@@ -130,8 +154,8 @@ class Phi3AttentionExperimental(nn.Module):
             self.msemagn_loss = None
             self.headmseloss = MSELoss(reduction='none')
             self.headmsemagn_loss = None
-        
-        if self.producer is None:  # This is the producer layer
+
+        if self.is_predictor_owner:
             self.q_importance = None  # Shared mask across layers during inference
             self.k_importance = None
             self.head_importances = None
@@ -200,53 +224,171 @@ class Phi3AttentionExperimental(nn.Module):
         return self._global_head_keep[self.layer_idx].to(next(self.parameters()).device)
 
     def update_predictor(self):
+        attn_device = next(self.parameters()).device
         self.sparse_token_predictor = TokenImportancePredictorAttentive(
-            self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-            intdim = self.intdim, attn_reduce_factor=self.attn_reduce_factor
-        ).to('cuda:0')
+            self.config,
+            self.pred_hid_size,
+            self.num_heads,
+            self.num_layers_pred,
+            dropout=0.1,
+            dDash=self.dDash,
+            intdim=self.intdim,
+            attn_reduce_factor=self.attn_reduce_factor,
+            predictor_variant=getattr(self, "tokenbutler_variant", "tokenbutler_project"),
+        ).to(attn_device)
         self.sparse_token_predictor.flash_attn = self.flash_attn
         if self.train_headpredictor:
             self.sparse_head_predictor = HeadImportancePredictor(
-                self.config, self.pred_hid_size, self.num_heads, self.num_layers_pred, dropout=0.1, dDash = self.dDash, \
-                intdim = self.intdim, attn_reduce_factor=self.head_attn_reduce_factor
-            ).to('cuda:0')
+                self.config,
+                self.pred_hid_size,
+                self.num_heads,
+                self.num_layers_pred,
+                dropout=0.1,
+                dDash=self.dDash,
+                intdim=self.intdim,
+                attn_reduce_factor=self.head_attn_reduce_factor,
+            ).to(attn_device)
             self.sparse_head_predictor.flash_attn = self.flash_attn
 
     def set_token_sparsity(self):
         assert self.token_sparse_method is not None, "Set token sparse method first!"
-        if self.token_sparse_method is not None:
+        method = self.token_sparse_method
+
+        if method is not None:
             try:
                 mname = self.config._name_or_path.split("/")[-1]
-                read_path = f"threshold_calibs/{mname}/{self.token_sparse_method}.pkl"
+                read_path = f"threshold_calibs/{mname}/{method}.pkl"
                 threshold_model_dictionary = torch.load(read_path)
                 self.tok_calibration_set = threshold_model_dictionary
-            except:
+            except Exception:
                 pass
-        if self.token_sparse_method == "LazyLLM":
-            if self.layer_idx <= 9:
-                self.sparse_aggression = 1
-            elif self.layer_idx <= 19:
-                self.sparse_aggression = 0.7
-            elif self.layer_idx <= 28:
-                self.sparse_aggression = 0.4
-            else:
-                self.sparse_aggression = 0.1
-        elif "fixed" in self.token_sparse_method:
-            if self.layer_idx == 0:
-                self.sparse_aggression = 1
-            else:
-                self.sparse_aggression = 1 - float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-        elif "progressive" in self.token_sparse_method:
-            pc_drop = float(self.token_sparse_method.split("_")[1].split("pc")[0])/100.
-            self.sparse_aggression = (1 - pc_drop) ** (self.layer_idx)  # (x% per layer, progressive_xpc style)
-        else:
-            raise ValueError(f"Unknown token sparsity method {self.token_sparse_method}")
 
-        self.head_keep = self.build_head_keep_ratios()
+        self.target_sparsity = None
+        self.target_keep_tokens = None
+        self.sparse_aggression = None
+        self.head_keep = None
+
+        if method.startswith("fixed_"):
+            spec = method.split("_", 1)[1]
+
+            if spec.endswith("pc"):
+                if self.layer_idx == 0:
+                    self.target_sparsity = 0.0
+                    self.sparse_aggression = 1.0
+                else:
+                    x = float(spec[:-2])
+                    self.target_sparsity = x / 100.0
+                    self.sparse_aggression = 1.0 - self.target_sparsity
+                self.head_keep = self.build_head_keep_ratios()
+            elif spec.endswith("tok"):
+                y = int(spec[:-3])
+                if self.layer_idx == 0:
+                    self.target_keep_tokens = None
+                    self.sparse_aggression = 1.0
+                else:
+                    self.target_keep_tokens = max(1, y)
+                    nominal_L = getattr(self, "nominal_seq_len", None)
+                    if nominal_L is None:
+                        nominal_L = getattr(self.config, "max_position_embeddings", self.max_position_embeddings)
+                    head = getattr(self, "min_sparse_index", 0) or 0
+                    tail = getattr(self, "sliding_window", 0) or 0
+                    eff_L = max(1, nominal_L - head - tail)
+                    keep_frac = min(1.0, float(self.target_keep_tokens) / eff_L)
+                    self.sparse_aggression = keep_frac
+                    self.head_keep = None
+            else:
+                raise ValueError(f"Unknown fixed sparsity spec '{spec}' in token_sparse_method='{method}'")
+        else:
+            raise ValueError(
+                f"Unsupported token sparsity method '{method}'. "
+                "Use 'fixed_xpc' (e.g. fixed_65pc) or 'fixed_ytok' (e.g. fixed_128tok)."
+            )
             
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def _should_apply_sparse_decode(self, q_len: int, kv_seq_len: int) -> bool:
+        if q_len != 1:
+            return False
+        if self._dense_kv_cutoff == 0:
+            self._dense_kv_cutoff = kv_seq_len
+            return False
+        return kv_seq_len > self._dense_kv_cutoff
+
+    def _build_decode_mask_fixed(
+        self,
+        importance_scores: torch.Tensor,
+        attention_mask: torch.Tensor,
+        min_sparse_index: Optional[int],
+    ) -> torch.Tensor:
+        bsz, num_heads, q_len, key_len = importance_scores.shape
+        assert q_len == 1, "Decode-time mask only valid for q_len == 1"
+        device = importance_scores.device
+        dtype = importance_scores.dtype
+
+        attn_valid = attention_mask[:, :, -1:, :] == 0
+        candidate_mask = attn_valid.expand(bsz, num_heads, 1, key_len)
+
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            candidate_mask[..., :clamp_idx] = False
+
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            candidate_mask[..., -win:] = False
+
+        if not candidate_mask.any():
+            return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+
+        method = self.token_sparse_method or ""
+        candidate_counts = candidate_mask.sum(dim=-1, keepdim=True)
+
+        if "pc" in method:
+            if self.sparse_aggression is None:
+                raise ValueError("sparse_aggression must be set for fixed_xpc")
+            if getattr(self, "head_keep", None) is not None:
+                head_keep = self.head_keep.to(device)
+            else:
+                head_keep = torch.full((self.num_heads,), float(self.sparse_aggression), device=device)
+            head_keep = head_keep.clamp(min=0.0, max=1.0).view(1, self.num_heads, 1, 1)
+            keep_counts = (head_keep * candidate_counts.float()).floor()
+            keep_counts = keep_counts.clamp(min=1)
+            keep_counts = torch.minimum(keep_counts, candidate_counts).long()
+        elif "tok" in method:
+            if self.target_keep_tokens is None or self.target_keep_tokens <= 0:
+                return torch.zeros_like(importance_scores, dtype=dtype, device=device)
+            keep_counts = torch.minimum(
+                candidate_counts,
+                torch.full_like(candidate_counts, self.target_keep_tokens, dtype=torch.long),
+            ).clamp(min=1)
+        else:
+            raise ValueError(f"token_sparse_method '{method}' is not a fixed_* scheme")
+
+        scores = importance_scores.clone().masked_fill(~candidate_mask, float("-inf"))
+        _, sorted_idx = scores.sort(dim=-1, descending=True)
+        B, H, _, K = sorted_idx.shape
+        rank = torch.empty_like(sorted_idx, dtype=torch.long)
+        arange_K = torch.arange(K, device=sorted_idx.device, dtype=torch.long).view(1, 1, 1, K).expand_as(sorted_idx)
+        rank.scatter_(-1, sorted_idx, arange_K)
+        keep_mask = (~candidate_mask) | (rank < keep_counts)
+
+        mask_tensor = torch.zeros_like(importance_scores, dtype=dtype, device=device)
+        mask_tensor = mask_tensor.masked_fill(~keep_mask, float("-inf"))
+
+        if min_sparse_index is not None and min_sparse_index > 0:
+            clamp_idx = min(min_sparse_index, key_len)
+            mask_tensor[..., :clamp_idx] = 0.0
+        if self.sliding_window is not None and self.sliding_window > 0:
+            win = min(self.sliding_window, key_len)
+            mask_tensor[..., -win:] = 0.0
+
+        return mask_tensor
+
+    def _get_group_slot_index(self) -> Optional[int]:
+        if self.layer_idx == 0 or self.producer is None:
+            return None
+        return (self.layer_idx - 1) % self.producer_frequency
 
     def forward(
         self,
@@ -300,6 +442,9 @@ class Phi3AttentionExperimental(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
+        if self.inference_mode and use_cache and q_len > 1 and kv_seq_len == q_len:
+            self._dense_kv_cutoff = kv_seq_len + self.always_dense_decode_tokens
+
         final_mask = None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -329,8 +474,9 @@ class Phi3AttentionExperimental(nn.Module):
             with torch.no_grad():
                 if evalmode == "ExpPred":
                     if self.layer_idx > 0:
-                        q_importance_tensor = self.producer.q_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(query_states.device) # [BH, Lq, D']
-                        k_importance_tensor = self.producer.k_importance[:, self.layer_idx % self.producer_frequency, :, :].float().to(key_states.device) # [BH, Lk, D']
+                        slot_idx = self._get_group_slot_index()
+                        q_importance_tensor = self.producer.q_importance[:, slot_idx, :, :].float().to(query_states.device) # [BH, Lq, D']
+                        k_importance_tensor = self.producer.k_importance[:, slot_idx, :, :].float().to(key_states.device) # [BH, Lk, D']
                         importance_mask = torch.bmm(q_importance_tensor, k_importance_tensor.transpose(-2, -1)) / math.sqrt(self.dDash) # [BH, Lq, Lk]
                         importance_mask = importance_mask.view(bsz, self.num_heads, q_len, key_len) # [B, H, Lq, Lk]
                         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -357,30 +503,39 @@ class Phi3AttentionExperimental(nn.Module):
                             perhead_thresholds = self.tok_calibration_set[self.layer_idx - 1].to(unadj_importance_mask.device) # 0 does not have calibration data.
                             mask_tensor = threshold_to_mask(unadj_importance_mask, perhead_thresholds, min_sparse_index, bsz, q_len, key_len)
                         else:
-                            importance_mask = torch.softmax(importance_mask + attention_mask, dim=-1)
-                            _, sorted_indices = importance_mask.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
-                            sorted_indices = sorted_indices[:, :, -q_len:, :]
-                            if q_len == 1:
-                                # initialize tensor of zeros with shape like sorted_indices
-                                mask_tensor = torch.zeros_like(importance_mask)
-                                sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
-                                # scatter value float('-inf') at indexes in sorted_indices to mask_tensor
-                                mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
-                                mask_tensor[:, :, :, :min_sparse_index] = 0.0
-                                if self.sliding_window is not None:
-                                    mask_tensor[:, :, :, -self.sliding_window:] = 0.0
-                                # import pdb; pdb.set_trace()
-                            else:
-                                mask_tensor = sorted_index_to_variable_mask(
-                                    sorted_indices,
+                            importance_probs = torch.softmax(importance_mask + attention_mask, dim=-1)
+                            apply_sparse_decode = self._should_apply_sparse_decode(q_len, key_len)
+                            if (
+                                apply_sparse_decode
+                                and self.token_sparse_method is not None
+                                and self.token_sparse_method.startswith("fixed_")
+                            ):
+                                mask_tensor = self._build_decode_mask_fixed(
+                                    importance_probs,
                                     attention_mask,
                                     min_sparse_index,
-                                    bsz,
-                                    q_len,
-                                    key_len,
-                                    self.head_keep.to(sorted_indices.device),
-                                    sliding_window=self.sliding_window
                                 )
+                            else:
+                                _, sorted_indices = importance_probs.sort(dim=-1, descending=True)  # [B, H, q_len, key_len]
+                                sorted_indices = sorted_indices[:, :, -q_len:, :]
+                                if q_len == 1:
+                                    mask_tensor = torch.zeros_like(importance_probs)
+                                    sorted_indices = sorted_indices[:, :, :, int(self.sparse_aggression * key_len):]
+                                    mask_tensor.scatter_(-1, sorted_indices, float('-inf'))
+                                    mask_tensor[:, :, :, :min_sparse_index] = 0.0
+                                    if self.sliding_window is not None:
+                                        mask_tensor[:, :, :, -self.sliding_window:] = 0.0
+                                else:
+                                    mask_tensor = sorted_index_to_variable_mask(
+                                        sorted_indices,
+                                        attention_mask,
+                                        min_sparse_index,
+                                        bsz,
+                                        q_len,
+                                        key_len,
+                                        self.head_keep.to(sorted_indices.device),
+                                        sliding_window=self.sliding_window
+                                    )
                         if self.sliding_window is not None:
                             if not hasattr(self, "window_cache"):
                                 self.window_cache = SlidingWindowCache(
@@ -627,7 +782,8 @@ class Phi3AttentionExperimental(nn.Module):
                 attn_output = torch.matmul(attn_weights, value_states)
 
         if self.layer_idx > 0 and self.train_headpredictor:
-            head_importance_tensor = self.producer.head_importances[:, :, :, self.layer_idx % self.producer_frequency].float().to(attn_output.device)
+            slot_idx = self._get_group_slot_index()
+            head_importance_tensor = self.producer.head_importances[:, :, :, slot_idx].float().to(attn_output.device)
             attn_head_weights = attn_output.mean(dim=-1).permute(0, 2, 1)
             self.headmsemagn_loss = self.headmseloss(attn_head_weights, head_importance_tensor).mean()
 
@@ -646,14 +802,27 @@ class Phi3AttentionExperimental(nn.Module):
         checkeverytime = hasattr(self, 'test_with_thresholds')
         if checkeverytime:
             checkeverytime = self.test_with_thresholds
-        if final_mask is not None:
+        if final_mask is not None and q_len == 1:
             if self.effective_sparsity is None or checkeverytime:
-                true_mask = final_mask + attention_mask
-                num_deact = true_mask.bool().sum(dim=-1)                   # Number of tokens disabled.
-                causally_deact = (attention_mask.bool()).sum(dim=-1).expand_as(num_deact)        # Number of tokens disabled causally anyway
-                additional_deact = (num_deact - causally_deact)
-                num_active = (~attention_mask.bool()).sum(dim=-1).expand_as(num_deact)    # Number of tokens active at this position if zero-sparsity
-                effective_sparsity = 100 * (additional_deact.float() / num_active.float()).mean().item()
+                true_mask = final_mask + attention_mask  # {0, -inf}
+
+                candidate_mask = (~attention_mask.bool())
+                min_sparse_index = getattr(self, "min_sparse_index", None)
+                if min_sparse_index is not None and min_sparse_index > 0:
+                    clamp_idx = min(min_sparse_index, true_mask.size(-1))
+                    candidate_mask[..., :clamp_idx] = False
+                if self.sliding_window is not None and self.sliding_window > 0:
+                    win = min(self.sliding_window, true_mask.size(-1))
+                    candidate_mask[..., -win:] = False
+
+                if candidate_mask.any():
+                    total_deact = (true_mask.bool() & candidate_mask).sum(dim=-1)
+                    causal_deact = (attention_mask.bool() & candidate_mask).sum(dim=-1)
+                    additional_deact = (total_deact - causal_deact)
+                    num_candidates = candidate_mask.sum(dim=-1)
+                    effective_sparsity = 100 * (additional_deact.float() / num_candidates.float()).mean().item()
+                else:
+                    effective_sparsity = 0.0
                 self.effective_sparsity = effective_sparsity
                 print("Effective Sparsity:", effective_sparsity, "%\t Sequence Length:", q_len)
 
@@ -666,7 +835,7 @@ class Phi3AttentionExperimental(nn.Module):
 
         attn_output = self.o_proj(attn_output)
 
-        if self.producer is None:
+        if self.is_predictor_owner:
             try:
                 q_importance, k_importance = self.sparse_token_predictor(
                     hidden_states,
@@ -712,39 +881,59 @@ class Phi3AttentionExperimental(nn.Module):
 
         # return attn_output, attn_weights
 
-def convert_kvcache_experimental(model, config, producer_frequency):
-    producer_layer = None
-    producer_layer_device = None
-    layer_counter = {'idx': 0}
+def convert_kvcache_experimental(model, config, producer_frequency: int):
+    layer_idx_counter = 0
+    group_roots: dict[int, Phi3AttentionExperimental] = {}
 
-    def recurse_convert(parent_module):
-        nonlocal producer_layer
-        nonlocal producer_layer_device
-        for name, module in parent_module._modules.items():
-            if len(list(module.children())) > 0:
-                recurse_convert(module)
-            # Check if module class name ends with Phi3Attention
-            if module.__class__.__name__.endswith('Phi3Attention'):
-                device = next(module.parameters()).device
-                dtype = next(module.parameters()).dtype
-                if layer_counter['idx'] % producer_frequency == 0:
-                    new_module = Phi3AttentionExperimental(config).to(dtype).to(device)
-                    producer_layer = new_module
-                    producer_layer_device = device
+    def recurse(parent_module: nn.Module, prefix: str = ""):
+        nonlocal layer_idx_counter
+
+        for name, child in list(parent_module._modules.items()):
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            if len(list(child.children())) > 0:
+                recurse(child, full_name)
+            if child.__class__.__name__.endswith("Phi3Attention"):
+                try:
+                    ref_param = next(child.parameters())
+                    target_device = ref_param.device
+                    orig_dtype = ref_param.dtype
+                except StopIteration:
+                    target_device = torch.device("cpu")
+                    orig_dtype = torch.float32
+
+                layer_idx = layer_idx_counter
+                is_owner = (layer_idx % producer_frequency == 0)
+
+                if layer_idx == 0:
+                    producer = None
                 else:
-                    new_module = Phi3AttentionExperimental(
-                        config,
-                        producer=producer_layer,
-                        layer_idx=layer_counter['idx']
-                    ).to(dtype).to(device)
-                new_module.load_state_dict(module.state_dict(), strict=False)
-                is_producer = layer_counter['idx'] % producer_frequency == 0
-                if is_producer:
-                    print(f"Converted Producer layer '{name}' to Phi3AttentionExperimental at layer index {layer_counter['idx']}")
-                else:
-                    print(f"Converted layer '{name}' to Phi3AttentionExperimental at layer index {layer_counter['idx']}")
-                parent_module._modules[name] = new_module
-                layer_counter['idx'] += 1
-    recurse_convert(model)
-    producer_layer = producer_layer.to(producer_layer_device)
+                    base_idx = ((layer_idx - 1) // producer_frequency) * producer_frequency
+                    producer = group_roots[base_idx]
+
+                new_attn = Phi3AttentionExperimental(
+                    config=config,
+                    producer=producer,
+                    layer_idx=layer_idx,
+                    producer_frequency=producer_frequency,
+                    is_predictor_owner=is_owner,
+                ).to(device=target_device, dtype=orig_dtype)
+
+                new_attn.load_state_dict(child.state_dict(), strict=False)
+
+                if is_owner:
+                    group_roots[layer_idx] = new_attn
+
+                parent_module._modules[name] = new_attn
+
+                print(
+                    f"Converted {full_name}: "
+                    f"layer_idx={layer_idx}, "
+                    f"target_device={target_device}, "
+                    f"new_device={next(new_attn.parameters()).device}"
+                )
+
+                layer_idx_counter += 1
+
+    recurse(model)
     return model
