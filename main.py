@@ -1196,16 +1196,6 @@ if __name__ == '__main__':
 
     # TokenButler predictor variants (token pruning only)
     parser.add_argument(
-        '--tokenbutler',
-        action='store_true',
-        help='Use original TokenButler predictor (baseline: learned Q+K mini-transformer).',
-    )
-    parser.add_argument(
-        '--tokenbutler_slice',
-        action='store_true',
-        help='Use TokenButler variant with learned Q and K taken as the first dDash dims of the real key cache.',
-    )
-    parser.add_argument(
         '--tokenbutler_project',
         action='store_true',
         help='Use TokenButler variant with learned Q and a learned linear projection of the real key cache.',
@@ -1229,28 +1219,9 @@ if __name__ == '__main__':
 
     # ------------------------------------------------------------------
     # Decide which TokenButler variant to use
-    #   tokenbutler         → original behaviour (learned Q+K)
-    #   tokenbutler_slice   → learned Q, K = first dDash dims of real key cache
-    #   tokenbutler_project → learned Q, K = Linear(real key cache) → dDash
-    # Only one of the three flags should be set.
+    #   Only tokenbutler_project is supported.
     # ------------------------------------------------------------------
-    variant_flags = [
-        args.tokenbutler,
-        args.tokenbutler_slice,
-        args.tokenbutler_project,
-    ]
-    if sum(bool(x) for x in variant_flags) > 1:
-        raise ValueError(
-            "Please specify at most one of "
-            "--tokenbutler, --tokenbutler_slice, or --tokenbutler_project."
-        )
-    if args.tokenbutler_slice:
-        args.tokenbutler_variant = "tokenbutler_slice"
-    elif args.tokenbutler_project:
-        args.tokenbutler_variant = "tokenbutler_project"
-    else:
-        # Default: original predictor (paper behaviour)
-        args.tokenbutler_variant = "tokenbutler"
+    args.tokenbutler_variant = "tokenbutler_project"
 
     print("IF EVALUATING: To compare with SnapKV Fairly, please set --sliding_window to 16 for experiments.")
 

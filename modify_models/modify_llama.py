@@ -89,7 +89,7 @@ class LlamaAttentionExperimental(nn.Module):
         self.pairwise_loss = False
         self.mode = "balanced"  # "extreme_recall" or "balanced"
         self.pairwise_topk_ratio = 0.02  # fraction of keys used as pos/neg in pairwise loss
-        self.tokenbutler_variant = "tokenbutler"
+        self.tokenbutler_variant = "tokenbutler_project"
 
         # Whether this layer runs the predictor (i.e. is the group root that
         # produces queries for producer_frequency future layers).
@@ -190,7 +190,7 @@ class LlamaAttentionExperimental(nn.Module):
             intdim=self.intdim,
             attn_reduce_factor=self.attn_reduce_factor,
             dropout=0.1,
-            predictor_variant=getattr(self, "tokenbutler_variant", "tokenbutler"),
+            predictor_variant=getattr(self, "tokenbutler_variant", "tokenbutler_project"),
         ).to(attn_device)
         self.sparse_token_predictor.flash_attn = self.flash_attn
 
@@ -562,47 +562,21 @@ class LlamaAttentionExperimental(nn.Module):
                             :, slot_idx, :, :
                         ].float().to(query_states.device)  # [BH, Lq, dDash]
  
-                        if self.tokenbutler_variant == "tokenbutler":
-                            k_importance_tensor = self.producer.k_importance[
-                                :, slot_idx, :, :
-                            ].float().to(key_states.device)  # [BH, Lk, dDash]
-                        elif self.tokenbutler_variant == "tokenbutler_slice":
-                            Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
+                        Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
+                        # One projector per *real* layer & head.
+                        proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
+                            self.layer_idx
+                        ]  # [H, Dh, dDash]
 
-                            # Use the projection corresponding to the *actual* layer index,
-                            # NOT the predictor slot.
-                            proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                                self.layer_idx
-                            ]  # [H, Dh, dDash]
+                        # Move keys to predictor weight device, do projection there, then move back.
+                        key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)            # [B,H,Lk,Dh]
+                        k_proj = torch.einsum(
+                            "bhlk,hkd->bhld", key_for_proj, proj_weight
+                        )  # [B,H,Lk,dDash]
+                        if k_proj.device != key_states.device:
+                            k_proj = k_proj.to(key_states.device)
 
-                            key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)  # [B,H,Lk,Dh]
-                            k_proj = torch.einsum(
-                                "bhlk,hkd->bhld", key_for_proj, proj_weight
-                            )  # [B,H,Lk,dDash]
-                            if k_proj.device != key_states.device:
-                                k_proj = k_proj.to(key_states.device)
-
-                            k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
-                        elif self.tokenbutler_variant == "tokenbutler_project":
-                            Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
-                            # One projector per *real* layer & head.
-                            proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                                self.layer_idx
-                            ]  # [H, Dh, dDash]
-
-                            # Move keys to predictor weight device, do projection there, then move back.
-                            key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)            # [B,H,Lk,Dh]
-                            k_proj = torch.einsum(
-                                "bhlk,hkd->bhld", key_for_proj, proj_weight
-                            )  # [B,H,Lk,dDash]
-                            if k_proj.device != key_states.device:
-                                k_proj = k_proj.to(key_states.device)
-
-                            k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
-                        else:
-                            raise ValueError(
-                                f"Unknown tokenbutler_variant: {self.tokenbutler_variant}"
-                            )
+                        k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
 
                         importance_mask = torch.bmm(
                             q_importance_tensor,
@@ -832,56 +806,27 @@ class LlamaAttentionExperimental(nn.Module):
                         bsz, self.num_heads, q_len, self.dDash
                     )
 
-                    # Predictor K depends on TokenButler variant
-                    if self.tokenbutler_variant == "tokenbutler":
-                        Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
+                    Bk, Hk, Lk, Dh = key_states.shape  # [B, H, Lk, head_dim]
 
-                        # Use the projection corresponding to the *actual* layer index,
-                        # NOT the predictor slot.
-                        proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                            self.layer_idx
-                        ]  # [H, Dh, dDash]
+                    # Use the projection corresponding to the *actual* layer index,
+                    # NOT the predictor slot.
+                    proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
+                        self.layer_idx
+                    ]  # [H, Dh, dDash]
 
-                        key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)  # [B,H,Lk,Dh]
-                        k_proj = torch.einsum(
-                            "bhlk,hkd->bhld", key_for_proj, proj_weight
-                        )  # [B,H,Lk,dDash]
-                        if k_proj.device != key_states.device:
-                            k_proj = k_proj.to(key_states.device)
+                    key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)  # [B,H,Lk,Dh]
+                    k_proj = torch.einsum(
+                        "bhlk,hkd->bhld", key_for_proj, proj_weight
+                    )  # [B,H,Lk,dDash]
+                    if k_proj.device != key_states.device:
+                        k_proj = k_proj.to(key_states.device)
 
-                        k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
-                        _, Lk_imp, _ = k_importance_tensor.shape
-                        assert Lk_imp == key_len
-                        k_imp = k_importance_tensor.view(
-                            bsz, self.num_heads, key_len, self.dDash
-                        )
-                    elif self.tokenbutler_variant == "tokenbutler_slice":
-                        if self.dDash > self.head_dim:
-                            raise ValueError(
-                                f"dDash={self.dDash} > head_dim={self.head_dim} for tokenbutler_slice"
-                            )
-                        # Use real key cache: [B,H,Lk,Dh] → [B,H,Lk,dDash]
-                        k_imp = key_states[..., : self.dDash].to(q_imp.dtype)
-                    elif self.tokenbutler_variant == "tokenbutler_project":
-                        Bk, Hk, Lk, Dh = key_states.shape  # [B,H,Lk,Dh]
-
-                        # Again: per *real* layer projection, no slots here.
-                        proj_weight = self.producer.sparse_token_predictor.key_cache_proj[
-                            self.layer_idx
-                        ]  # [H, Dh, dDash]
-
-                        key_for_proj = key_states.to(proj_weight.device, dtype=proj_weight.dtype)  # [B,H,Lk,Dh]
-                        k_proj = torch.einsum(
-                            "bhlk,hkd->bhld", key_for_proj, proj_weight
-                        )  # [B,H,Lk,dDash]
-                        if k_proj.device != key_states.device:
-                            k_proj = k_proj.to(key_states.device)
-
-                        k_imp = k_proj.to(q_imp.dtype)  # [B,H,Lk,dDash]
-                    else:
-                        raise ValueError(
-                            f"Unknown tokenbutler_variant: {self.tokenbutler_variant}"
-                        )
+                    k_importance_tensor = k_proj.reshape(Bk * Hk, Lk, self.dDash)
+                    _, Lk_imp, _ = k_importance_tensor.shape
+                    assert Lk_imp == key_len
+                    k_imp = k_importance_tensor.view(
+                        bsz, self.num_heads, key_len, self.dDash
+                    )
                     # --- derive per-example real lengths from attention_mask if possible ---
                     if attention_mask is not None and attention_mask.size(-2) == q_len:
                         # attention_mask: [B, 1, Lq, Lk], values 0 (keep) or -inf (mask)
