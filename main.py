@@ -962,7 +962,6 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                             mse_match_loss += module.msemagn_loss
                         except:
                             mse_match_loss += 0
-                            import pdb; pdb.set_trace()
                         module.msemagn_loss = 0
                         if args.train_headpredictor:
                             # head_match_loss += module.headmsemagn_loss.to('cuda:0')
@@ -1372,7 +1371,8 @@ if __name__ == '__main__':
 
     print("=== Sanity check: attention devices ===")
     for name, module in model.named_modules():
-        if isinstance(module, LlamaAttentionExperimental):
+        # if isinstance(module, LlamaAttentionExperimental) or 
+        if module.__class__.__name__.endswith("AttentionExperimental"):
             print(f"{name}: layer_idx={module.layer_idx}, q_proj={module.q_proj.weight.device}")
     print("=======================================")
     # exit(0)
