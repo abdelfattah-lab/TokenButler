@@ -23,6 +23,33 @@ torchrun --standalone --nnodes=1 --nproc_per_node 2 \
 # 
 # 
 
+python main.py \
+    --proj_name TokenButler_14Nov \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
+    --token_sparse_method fixed_40pc \
+    --model_mode finetune \
+    --finetune_dataset custom_mix_long \
+    --train_subset_fac 1 \
+    --train_seqlen 4096 \
+    --eval_llm_mode ExpPred \
+    --grad_accum_steps 8 \
+    --result_file "L3_8BiLong_project_4xQMP.csv" \
+    --wname L3_8BiLong_project_4xQMP \
+    --pred_lr 1e-3 \
+    --train_batch_size 1 \
+    --dDash 32 \
+    --intdim 1024 \
+    --eval_subset 1000 \
+    --eval_wk2_seqlen 4096 \
+    --max_loss_rows 256 \
+    --model_parallelism \
+    --train_batch_size 1 \
+    --softmax_causal_loss_ce \
+    --tokenbutler_project \
+    --producer_frequency 4
+
+
+
 
 CUDA_VISIBLE_DEVICES=0,1 \
 torchrun --standalone --nnodes=1 --nproc_per_node 2 \
@@ -30,16 +57,42 @@ torchrun --standalone --nnodes=1 --nproc_per_node 2 \
   --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
   --architecture llama \
   --datalen 16384 \
-  --dataset_name "long_bench/qasper" \
+  --dataset_name "ruler/niah_multikey_2" \
   --dDash 32 \
   --intdim 1024 \
   --result_dir results_tokbutler/shortm \
   --eval_llm_mode ExpPred \
-  --token_sparse_method fixed_4096tok \
+  --token_sparse_method fixed_8192tok \
   --min_sparse_index 128 \
-  --sliding_window 4096 \
+  --sliding_window 512 \
   --tokenbutler_project \
-  --predictor_ckpt /home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_project_4xQMP.csv_L3_8BiLong_project_4xQMP_True_False_2000_False_custom_mix_long_16384_1_1_1_dc2fda83/ExpPred_fixed_40pc_False_False_0_256_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_False_False_True_tokenbutler_project_32_0.3875000000000002_20251121-015221.pt
+  --producer_frequency 4 \
+  --predictor_ckpt /home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_project_4xQMP.csv_L3_8BiLong_project_4xQMP_False_False_2000_4_False_custom_mix_long_1024_1_1_ec783ea2/1000_ExpPred_fixed_40pc_False_False_0_256_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_False_False_True_tokenbutler_project_0.3875000000000002_20251124-153051.pt
+  
+
+
+
+CUDA_VISIBLE_DEVICES=0,1 \
+torchrun --standalone --nnodes=1 --nproc_per_node 2 \
+  longeval/eval_tokenbutler.py \
+  --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --architecture llama \
+  --datalen 16384 \
+  --dataset_name "ruler/niah_multikey_2" \
+  --dDash 32 \
+  --intdim 1024 \
+  --result_dir results_tokbutler/best_yet \
+  --eval_llm_mode ExpPred \
+  --token_sparse_method fixed_2tok \
+  --min_sparse_index 128 \
+  --sliding_window 512 \
+  --tokenbutler_project \
+  --producer_frequency 4 \
+  --predictor_ckpt /home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_project_4xQMP.csv_L3_8BiLong_project_4xQMP_False_False_2000_4_False_custom_mix_long_1024_1_1_ec783ea2/1000_ExpPred_fixed_40pc_False_False_0_256_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_False_False_True_tokenbutler_project_0.3875000000000002_20251124-153051.pt
+  
+
+
+  /home/ya255/projects/TokenButler/expt_model/TokenButler_14Nov_42_finetune_None_None_None_500_llama_meta-llama_Llama-3.1-8B-Instruct_L3_8BiLong_project_4xQMP.csv_L3_8BiLong_project_4xQMP_True_False_2000_False_custom_mix_long_16384_1_1_1_dc2fda83/ExpPred_fixed_40pc_False_False_0_256_False_False_True_False_False_None_False_False_4_8_2_32_1024_False_False_True_False_False_True_tokenbutler_project_32_0.3875000000000002_20251121-015221.pt
 
   # --dataset_name "ruler/niah_multikey_2" \
 

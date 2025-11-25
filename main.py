@@ -98,25 +98,6 @@ def _name_from_args_for_fs(args, timestamp: bool):
 
     return shorten(folder_name), shorten(file_name)
 
-# def save_model(args, model, note=None):
-#     if note is None:
-#         timestamp = True
-#     else:
-#         timestamp = False
-#     passargs = args
-#     passargs.model_resume_path = None
-
-#     folder_name, file_name = args_to_name(passargs, timestamp)
-#     folder_path = "expt_model/" + folder_name
-#     if not os.path.exists("expt_model"):
-#         os.makedirs("expt_model")
-#     os.makedirs(folder_path, exist_ok=True)
-#     model_savepath_name = os.path.join(folder_path, file_name)
-#     if note is not None:
-#         model_savepath_name += "_" + note
-#     print(f"Model will be saved at: {model_savepath_name}")
-#     model_producer_layer = get_producer_layers(model)
-#     torch.save([layer_p.state_dict() for layer_p in model_producer_layer], model_savepath_name + ".pt")
 
 def save_model(args, model, note=None):
     if note is None:
@@ -141,47 +122,6 @@ def save_model(args, model, note=None):
     torch.save([layer_p.state_dict() for layer_p in model_producer_layer],
                model_savepath_name + ".pt")
 
-
-# def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
-#     """
-#     Saves a model checkpoint with detailed experimental information in the name.
-    
-#     Args:
-#         args: Experimental arguments for generating the checkpoint name.
-#         model: The model to save.
-#         optimizer: The optimizer state to save.
-#         scheduler: The scheduler state to save.
-#         step: Current training step.
-#         epoch: Current epoch.
-#         note: Additional note to append to the checkpoint file name.
-#     """
-#     # Generate folder and file name based on args
-#     timestamp = note is None
-    
-#     passargs = args
-#     passargs.model_resume_path = None
-#     folder_name, file_name = args_to_name(passargs, timestamp)
-
-#     # Create folder path for checkpoints
-#     folder_path = os.path.join("checkpoints", folder_name)
-#     os.makedirs(folder_path, exist_ok=True)
-
-#     # Append step and epoch to the file name for clarity
-#     checkpoint_file_name = f"{file_name[-40:]}"
-#     model_producer_layer = get_producer_layers(model)
-#     checkpoint_path = os.path.join(folder_path, f"{checkpoint_file_name}.pt")
-
-#     # Save the checkpoint
-#     torch.save({
-#         'wandb_step': wandb.run.step,
-#         'step': step,
-#         'epoch': epoch,
-#         'model_state_dict': [layer_p.state_dict() for layer_p in model_producer_layer],
-#         'optimizer_state_dict': optimizer.state_dict(),
-#         'scheduler_state_dict': scheduler.state_dict()
-#     }, checkpoint_path)
-
-#     print(f"Checkpoint saved at: {checkpoint_path}")
 
 def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
     timestamp = note is None
@@ -211,14 +151,25 @@ def save_checkpoint(args, model, optimizer, scheduler, step, epoch, note=None):
 
 def get_producer_layers(model):
     """
-    Traverses the model to find the producer layer (layer_idx=0).cc
+    Return all attention layers that own a TokenButler predictor.
     """
     producer_modules = []
     for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental") and module.layer_idx == 0:
+        if not module.__class__.__name__.endswith("AttentionExperimental"):
+            continue
+
+        # New path: grouped producers mark themselves explicitly.
+        if getattr(module, "is_predictor_owner", False):
             producer_modules.append(module)
+
+        # Backwards‑compatible fallback for older checkpoints
+        elif (
+            not hasattr(module, "is_predictor_owner")
+            and getattr(module, "layer_idx", None) == 0
+        ):
+            producer_modules.append(module)
+
     return producer_modules
-    
 
 def set_inference_mode(model, mode: bool):
     """
@@ -444,7 +395,8 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     tokenized_output = tokenizer(concatenated_text, truncation=False)
 
     # Split tokenized input into chunks of max_seq_len
-    input_ids = torch.tensor(tokenized_output["input_ids"]).to(model.device)
+    model_device = next(model.parameters()).device
+    input_ids = torch.tensor(tokenized_output["input_ids"]).to(model_device)
     max_seq_len = args.eval_wk2_seqlen
     num_chunks = (len(input_ids) + max_seq_len - 1) // max_seq_len  # Ceiling division
     input_chunks = input_ids.split(max_seq_len)
@@ -467,7 +419,7 @@ def evaluate_wikitext2(model, tokenizer, args, testenc=None, traintime_subset=Fa
     effective_sparsity_list = [] 
 
     for chunk in progress_bar:
-        batch = input_chunks[chunk].unsqueeze(0).to(model.device)
+        batch = input_chunks[chunk].unsqueeze(0).to(model_device)
         if batch.size(1) < 2:
             continue
         with autocast():
@@ -611,10 +563,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
         The fine-tuned model.
     """
     if args.model_parallelism:
-        model_producer_layers = get_producer_layers(model)
-        for producer_layer in model_producer_layers:
-            for param in producer_layer.sparse_token_predictor.parameters():
-                param = param.to('cuda:0')
+        # Optional debug: inspect where HF's device_map placed things.
         for name, param in model.named_parameters():
             print(f"Layer: {name}, Device: {param.device}")
     max_seq_len = args.train_seqlen
@@ -755,7 +704,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             c4 = load_dataset(
                 "allenai/c4",
                 "realnewslike",
-                split="train[:30000]"
+                split="train[:90000]"
             )
             c4 = c4.select_columns(["text"])
             print("C4 loaded with length: ", len(c4))
@@ -764,7 +713,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
             owt = load_dataset(
                 "HuggingFaceFW/fineweb-edu",
                 "sample-10BT",
-                split="train[:30000]",
+                split="train[:90000]",
             )
             owt = owt.select_columns(["text"])
             print("OpenWebText loaded with length: ", len(owt))
@@ -779,7 +728,7 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                 stream = stream["train"]
 
             buffer = []
-            for ex in islice(stream, 30000):
+            for ex in islice(stream, 90000):
                 buffer.append({"text": ex["content"]})
             wiki = Dataset.from_list(buffer)
             print("CodeParrot loaded with length:", len(wiki))
@@ -989,10 +938,11 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                         calc_hitrates = False
                         module.calc_hitrates = False
 
-            input_ids = batch.to(model.device)
+            model_device = next(model.parameters()).device
+            input_ids = batch.to(model_device)
             input_ids = input_ids[:, :max_seq_len]
             total_tok_seen += input_ids.size(1) * input_ids.size(0)  # L * B
-            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model_device)
             labels = input_ids.clone()
             outputs = model(input_ids, attention_mask=attention_mask, labels=labels, use_cache=False)
             task_loss = outputs.loss
@@ -1008,13 +958,15 @@ def finetune_actmse(model, tokenizer, testenc_wk2, args=None):
                     if hasattr(module, 'msemagn_loss'):
                         nlayers += 1
                         try:
-                            mse_match_loss += module.msemagn_loss.to('cuda:0')
+                            # mse_match_loss += module.msemagn_loss.to('cuda:0')
+                            mse_match_loss += module.msemagn_loss
                         except:
                             mse_match_loss += 0
                             import pdb; pdb.set_trace()
                         module.msemagn_loss = 0
                         if args.train_headpredictor:
-                            head_match_loss += module.headmsemagn_loss.to('cuda:0')
+                            # head_match_loss += module.headmsemagn_loss.to('cuda:0')
+                            head_match_loss += module.headmsemagn_loss
                             module.headmsemagn_loss = 0
                         if calc_hitrates:
                             headhit_accs.append(module.head_hit_acc)
@@ -1194,6 +1146,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_parallelism', action='store_true', help='Enable model parallelism')
     parser.add_argument('--no_wandb', action='store_true', help='Enable or disable wandb logging')
     parser.add_argument('--evalgap', type=int, default=2000, help='eval gap during training')
+    parser.add_argument('--producer_frequency', type=int, default=None, help='Frequency of predictor')
     parser.add_argument('--flash_attn', action='store_true', help='Use Flash Attention')
     
     # Train related arguments
@@ -1352,11 +1305,12 @@ if __name__ == '__main__':
         model = AutoModelForCausalLM.from_pretrained(model_path, offload_folder=None, trust_remote_code=True, use_auth_token=True, **kwargs).cuda()
     if args.randomize_init:
         model = AutoModelForCausalLM.from_config(config).cuda()
-
-    if not hasattr(config, "num_hidden_layers"):
-        args.producer_frequency = config.num_layers
-    else:
-        args.producer_frequency = config.num_hidden_layers
+    if args.producer_frequency is None:
+        if not hasattr(config, "num_hidden_layers"):
+            args.producer_frequency = config.num_layers
+        else:
+            args.producer_frequency = config.num_hidden_layers
+    
     print("Using device_map:", device_map)
 
 
@@ -1413,7 +1367,6 @@ if __name__ == '__main__':
         model = convert_kvcache_experimental(model, config, args.producer_frequency)
     else:
         raise NotImplementedError(f"Architecture {args.architecture} not supported")
-
     token_sparsity_list = []
     for module in model.modules():
         if module.__class__.__name__.endswith("AttentionExperimental"):
@@ -1446,6 +1399,12 @@ if __name__ == '__main__':
                 if module.layer_idx % args.producer_frequency == 0:
                     module.update_predictor()
 
+    print("=== Sanity check: attention devices ===")
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaAttentionExperimental):
+            print(f"{name}: layer_idx={module.layer_idx}, q_proj={module.q_proj.weight.device}")
+    print("=======================================")
+    # exit(0)
     if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
         model._prepare_cache_for_generation = patched_prepare_cache_for_generation.__get__(
             model, model.__class__
@@ -1468,11 +1427,21 @@ if __name__ == '__main__':
     if not args.model_parallelism:
         model = model.cuda()
     try:
-        producer_layer = get_producer_layers(model)[0]
+        producer_layers = get_producer_layers(model)
 
-        tokpred_params = sum(p.numel() for p in producer_layer.sparse_token_predictor.parameters())
+        # Total token‑predictor params across *all* producers
+        tokpred_params = sum(
+            p.numel()
+            for layer in producer_layers
+            for p in layer.sparse_token_predictor.parameters()
+        )
+
         if args.train_headpredictor:
-            head_pred_params = sum(p.numel() for p in producer_layer.sparse_head_predictor.parameters())
+            head_pred_params = sum(
+                p.numel()
+                for layer in producer_layers
+                for p in layer.sparse_head_predictor.parameters()
+            )
         else:
             head_pred_params = 0
         total_params = tokpred_params + head_pred_params
@@ -1525,8 +1494,8 @@ if __name__ == '__main__':
             for idx, producer_layer_weight in enumerate(producer_layer_weights):
                 try:
                     model_producer_layers[idx].load_state_dict(producer_layer_weight, strict=False)
-                    if args.model_parallelism:
-                        model_producer_layers[idx].to("cuda:0")
+                    # if args.model_parallelism:
+                    #     model_producer_layers[idx].to("cuda:0")
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

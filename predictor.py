@@ -255,10 +255,6 @@ class PredictorDynamicCache(DynamicCache):
                 out.append(t.index_select(0, indices))
         return out
 
-
-# class TokenImportancePredictorAttentive(nn.Module):
-#     def __init__(self, config, pred_hid_size, num_heads, num_hidden_layers, dDash, intdim, \
-#                  attn_reduce_factor, dropout=0.1):
 class TokenImportancePredictorAttentive(nn.Module):
     def __init__(
         self,
@@ -369,28 +365,29 @@ class TokenImportancePredictorAttentive(nn.Module):
 
             # RoPE for internal self-attn + importance K
             self._init_rope()
-
         # ------------------------------------------------------------------
         # Variant 2: tokenbutler_slice / tokenbutler_project
         #   - no internal self-attn
         #   - no learned K in predictor
-        #   - multiple Q-MLPs (one per "slot"), accessed by layer grouping
+        #   - Q-MLP predicts queries for a *group* of layers
+        #     (slots within a producer group).
+        #   Here, `num_hidden_layers` is interpreted as:
+        #       N_slots = producer_frequency = number of consumer layers
+        #       served by each producer.
         # ------------------------------------------------------------------
         else:
             # -------------------------------
             # tokenbutler_slice / tokenbutler_project
             # -------------------------------
-            # Hard‑code number of query‑MLPs ("slots") for now.
-            # These are *not* model layers; they are predictors that each
-            # cover a chunk of layers.
-            self.num_query_mlps = 4   # or 8, etc. — your n_layer_factor
+            # num_hidden_layers here is the number of *slots per group*,
+            # i.e. how many consumer layers a single producer serves.
+            # Each forward() call produces queries for exactly
+            # `self.num_hidden_layers` slots.
+            self.num_query_mlps = 1
+            self.layers_per_slot = self.num_hidden_layers  # == N_slots
 
-            total_layers = self.config.num_hidden_layers
-            # How many layers each slot is responsible for (ceil division).
-            self.layers_per_slot = (total_layers + self.num_query_mlps - 1) // self.num_query_mlps
-
-            # Each slot MLP outputs queries for *its chunk* of layers:
-            # [B, L, hidden] → [B, L, (layers_per_slot * H * dDash)]
+            # Single MLP:
+            #   [B, L, hidden] → [B, L, (N_slots * H * dDash)]
             out_dim_per_slot = self.layers_per_slot * self.num_heads * self.dDash
 
             self.q_mlps = nn.ModuleList(
@@ -404,10 +401,8 @@ class TokenImportancePredictorAttentive(nn.Module):
                             bias=False,
                         ),
                     )
-                    for _ in range(self.num_query_mlps)
                 ]
             )
-
             # These are unused in slice/project
             self.q_proj_importance = None
             self.k_proj_importance = None
@@ -599,13 +594,14 @@ class TokenImportancePredictorAttentive(nn.Module):
         # ------------------------------------------------------------------
         # Variant 2: tokenbutler_slice / tokenbutler_project
         #   Only Q is learned here; K comes from the real key cache.
-        #   We have N = num_hidden_layers = n_layer_factor Q-MLPs.
+        #   We have N_slots = num_hidden_layers = producer_frequency slots
+        #   per producer call.
         # ------------------------------------------------------------------
         else:
             # tokenbutler_slice / tokenbutler_project:
-            # multiple Q-MLPs; each slot MLP predicts queries for a *chunk* of layers.
-            # Each mlp output is interpreted as [layers_per_slot, H, dDash] per token,
-            # then scattered into per-layer bins.
+            # a single Q-MLP predicts queries for a *group* of layers.
+            # Each forward() call returns queries for N_slots positions
+            # within that group.
             base_linear = self.q_mlps[0][0]
             hidden_states = hidden_states.to(base_linear.weight.dtype)
 
@@ -613,33 +609,17 @@ class TokenImportancePredictorAttentive(nn.Module):
             B, L, _ = hidden_for_importance.size()
             H = self.num_heads
 
-            total_layers = self.config.num_hidden_layers
-            layers_per_slot = self.layers_per_slot
+            N_slots = self.num_hidden_layers  # == layers_per_slot
 
-            # q_layers: [B, H, total_layers, L, dDash]
-            q_layers = hidden_for_importance.new_empty(
-                B, H, total_layers, L, self.dDash
-            )
+            mlp = self.q_mlps[0]
+            # mlp output: [B, L, N_slots * H * dDash]
+            q_flat = mlp(hidden_for_importance)
+            q_slot = q_flat.view(B, L, N_slots, H, self.dDash)  # [B, L, N_slots, H, dDash]
+            # [B, H, N_slots, L, dDash]
+            q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
 
-            for slot_idx, mlp in enumerate(self.q_mlps):
-                start_layer = slot_idx * layers_per_slot
-                end_layer = min(start_layer + layers_per_slot, total_layers)
-                if start_layer >= end_layer:
-                    break
-                group_len = end_layer - start_layer
-
-                # mlp output: [B, L, layers_per_slot * H * dDash]
-                q_flat = mlp(hidden_for_importance)
-                q_slot = q_flat.view(B, L, layers_per_slot, H, self.dDash)
-                # Last slot may represent fewer real layers: drop extras.
-                q_slot = q_slot[:, :, :group_len, :, :]  # [B, L, group_len, H, dDash]
-                # [B, H, group_len, L, dDash]
-                q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
-
-                q_layers[:, :, start_layer:end_layer, :, :] = q_slot
-
-            # Final shape expected by the attention code: [B*H, total_layers, L, dDash]
-            q_importance = q_layers.view(B * H, total_layers, L, self.dDash)
+            # Final shape expected by the attention code: [B*H, N_slots, L, dDash]
+            q_importance = q_slot.view(B * H, N_slots, L, self.dDash)
             k_importance = None  # K comes from real key cache (slice/project)
             return q_importance, k_importance
 

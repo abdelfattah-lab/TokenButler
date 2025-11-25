@@ -112,14 +112,20 @@ def infer_producer_frequency(config):
 
 def get_producer_layers(model):
     """
-    Collect producer attention modules: *AttentionExperimental with layer_idx == 0.
+    Return all attention blocks that *own* a predictor, i.e. the group roots.
+    We identify them via `is_predictor_owner`, and sort by `layer_idx` so the
+    order matches how the checkpoint list was saved.
     """
-    producer_modules = []
-    for module in model.modules():
-        if module.__class__.__name__.endswith("AttentionExperimental") and getattr(module, "layer_idx", None) == 0:
-            producer_modules.append(module)
-    return producer_modules
+    from modify_models.modify_llama import LlamaAttentionExperimental  # adjust import if needed
 
+    producers = []
+    for m in model.modules():
+        if isinstance(m, LlamaAttentionExperimental) and getattr(m, "is_predictor_owner", False):
+            producers.append(m)
+
+    # Make sure ordering is stable / matches training time
+    producers.sort(key=lambda m: m.layer_idx)
+    return producers
 def replace_attention_modules(model, config, args):
     """
     Replace standard attention with *AttentionExperimental via convert_kvcache_experimental
@@ -130,7 +136,7 @@ def replace_attention_modules(model, config, args):
     if args.architecture == "llama" and "Yarn-Llama" not in model_path:
         print("Running LLaMA module replacement")
         if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
-            from modify_models.modify_llama_performance import (
+            from modify_models.modify_llama import (
                 convert_kvcache_experimental,
                 LlamaAttentionExperimental,  # noqa: F401
             )
@@ -412,6 +418,7 @@ def parse_args() -> Namespace:
     p.add_argument("--train_headpredictor", action="store_true")
     p.add_argument("--flash_attn", action="store_true")
     
+    p.add_argument('--producer_frequency', type=int, default=None, help='Frequency of predictor')
     p.add_argument(
         '--tokenbutler',
         action='store_true',
@@ -505,8 +512,8 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Producer frequency = number of layers
-    args.producer_frequency = infer_producer_frequency(config)
+    if args.producer_frequency is None:
+        args.producer_frequency = infer_producer_frequency(config)
 
     if dist_config.master_process:
         print(colored(f"Loading base model from {model_name}", "cyan"))

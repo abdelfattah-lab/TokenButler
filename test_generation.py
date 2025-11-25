@@ -647,8 +647,8 @@ if __name__ == '__main__':
         if args.eval_llm_mode in ["ExpPred", "ReplAttn"]:
             # from modify_models.modify_llama import convert_kvcache_experimental
             # from modify_models.modify_llama import LlamaAttentionExperimental
-            from modify_models.modify_llama_performance import convert_kvcache_experimental
-            from modify_models.modify_llama_performance import LlamaAttentionExperimental
+            from modify_models.modify_llama import convert_kvcache_experimental
+            from modify_models.modify_llama import LlamaAttentionExperimental
         else:
             from modify_models.modify_llama_baselines import convert_kvcache_experimental
             from modify_models.modify_llama_baselines import LlamaAttentionExperimental
