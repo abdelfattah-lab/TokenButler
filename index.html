@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <!-- Meta tags for social media banners, these should be filled in appropriatly as they are your "business card" -->
+  <!-- Replace the content tag with appropriate information -->
+  <meta name="description" content="ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM inference">
+  <meta property="og:title" content="ShadowKV"/>
+  <meta property="og:description" content="ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM inference"/>
+  <meta property="og:url" content="https://bytedance.github.io/ShadowKV/"/>
+  <!-- Path to banner image, should be in the path listed below. Optimal dimenssions are 1200X630-->
+  <meta property="og:image" content="static/images/proj_fig.png" />
+  <meta property="og:image:width" content="1200"/>
+  <meta property="og:image:height" content="630"/>
+
+
+  <meta name="twitter:title" content="ShadowKV">
+  <meta name="twitter:description" content="ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM inference">
+  <!-- Path to banner image, should be in the path listed below. Optimal dimenssions are 1200X600-->
+  <meta name="twitter:image" content="static/images/proj_fig.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <!-- Keywords for your paper to be indexed by-->
+  <meta name="keywords" content="KV Cache">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+
+  <title>ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM inference</title>
+  <link rel="icon" type="image/x-icon" href="static/images/ShadowKV.png">
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro"
+  rel="stylesheet">
+
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="static/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="static/css/bulma-slider.min.css">
+  <link rel="stylesheet" href="static/css/fontawesome.all.min.css">
+  <link rel="stylesheet"
+  href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script src="https://documentcloud.adobe.com/view-sdk/main.js"></script>
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+  <script src="static/js/bulma-carousel.min.js"></script>
+  <script src="static/js/bulma-slider.min.js"></script>
+  <script src="static/js/index.js"></script>
+  <script type="text/x-mathjax-config">
+    MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ['\\(','\\)']]}});
+  </script>
+  <script type="text/javascript"
+    src="http://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-AMS-MML_HTMLorMML">
+  </script>
+  <style>
+    @font-face {
+      font-family: 'ShadowKVFont';
+      src: url('static/Persona5MenuFont.ttf') format('truetype');
+    }
+  
+    .custom-font {
+      font-family: 'ShadowKVFont', sans-serif !important;
+        font-size: 3.0rem;
+    }
+  </style>
+</head>
+<body>
+
+  <section class="hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered">
+          <div class="column has-text-centered">
+            <img src="static/images/ShadowKV.png" alt="ShadowKV" width="60" height="60" />
+            <h1 class="title is-2 publication-title" style="display: inline;"> ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM inference</h1>
+            <br><br>
+            <div class="is-size-5 publication-authors">
+              <!-- Paper authors -->
+              <span class="author-block">
+                <a href="https://preminstrel.com/" target="_blank">Hanshi Sun</a><sup>1,2*</sup>,</span>
+                <span class="author-block">
+                <a href="https://lchang20.github.io/" target="_blank">Li-Wen Chang</a><sup>2</sup>,</span>
+                <span class="author-block">
+                    <a href="https://sites.google.com/view/wenleibao/" target="_blank">Wenlei Bao</a><sup>2</sup>, 
+                </span>
+                <span class="author-block">
+                    <a href="https://sizezheng.github.io/" target="_blank">Size Zheng</a><sup>2</sup>,
+                </span>
+                <span class="author-block">
+                    <a href="https://zheng-ningxin.github.io/" target="_blank">Ningxin Zheng</a><sup>2</sup>,
+                </span><br>
+                <span class="author-block">
+                    <a href="https://scholar.google.com/citations?user=ZMfk2F8AAAAJ&hl=zh-CN">Xin Liu</a><sup>2</sup>,
+                </span>
+                <span class="author-block">
+                    <a href="https://www.andrew.cmu.edu/user/harryd/" target="_blank">Harry Dong</a><sup>1</sup>,
+                </span>
+                <span class="author-block">
+                    <a href="https://users.ece.cmu.edu/~yuejiec/" target="_blank">Yuejie Chi</a><sup>1</sup>,
+                </span>
+              <span class="author-block">
+                <a href="https://www.andrew.cmu.edu/user/beidic/" target="_blank">Beidi Chen</a><sup>1</sup>
+                </span>
+                </div>
+                <div class="is-size-5 publication-authors">
+                <span class="affliation"><small><sup>1</sup>Carnegie Mellon University <sup>2</sup>ByteDance</span>
+                <span class="eql-cntrb"><small><br><sup>*</sup>Work done during the internship at ByteDance</small></span>
+                </div>
+
+                <div class="column has-text-centered">
+                
+                <!-- ArXiv abstract Link -->
+                <span class="link-block">
+                    <a href="https://arxiv.org/abs/2410.21465" target="_blank"
+                    class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">
+                        <i class="ai ai-arxiv"></i>
+                    </span>
+                    <span>arXiv</span>
+                    </a>
+                </span>
+
+                <!-- Github link -->
+                <span class="link-block">
+                    <a href="https://github.com/bytedance/ShadowKV/tree/main" target="_blank"
+                    class="external-link button is-normal is-rounded is-dark">
+                    <span class="icon">
+                        <i class="fab fa-github"></i>
+                    </span>
+                    <span>Code</span>
+                    </a>
+                </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- Paper abstract -->
+<section class="section hero is-light">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3" style="text-align: center;"><img src="static/images/Llama-Shadow.png" style="height: 53px; display: inline; vertical-align:middle;"/>&nbsp; Introduction</h2>
+        <div class="content has-text-justified">
+          <p>
+            With the widespread deployment of long-context LLMs, KV cache has emerged as a critical bottleneck by expanding linearly in size with the sequence length. We present <b>ShadowKV</b>, a high-throughput long-context LLM inference system that <b>stores the low-rank key cache</b> and <b>offloads the value cache</b> to <b>reduce the memory footprint for larger batch sizes and longer sequences</b>. By evaluating ShadowKV on a broad range of benchmarks, including <a style="color: #209CEE" href="https://github.com/hsiehjackson/RULER">RULER</a>, <a style="color: #209CEE" href="https://github.com/THUDM/LongBench">LongBench</a>, and <a style="color: #209CEE" href="https://github.com/gkamradt/LLMTest_NeedleInAHaystack">Needle In A Haystack</a>, and models like <a style="color: #209CEE" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct">Llama-3.1-8B-Instruct</a>, <a style="color: #209CEE" href="https://huggingface.co/gradientai/Llama-3-8B-Instruct-Gradient-1048k">Llama-3-8B-Instruct-1M</a>, <a style="color: #209CEE" href="https://huggingface.co/THUDM/glm-4-9b-chat-1m">GLM-4-9B-Chat-1M</a>, <a style="color: #209CEE" href="https://huggingface.co/01-ai/Yi-9B-200K">Yi-9B-200K</a>, <a style="color: #209CEE" href="https://huggingface.co/microsoft/Phi-3-mini-128k-instruct">Phi-3-Mini-128K-Instruct</a>, and <a style="color: #209CEE" href="https://huggingface.co/Qwen/Qwen2-7B-Instruct">Qwen2-7B-128K-Instruct</a>, we show that it supports up to <b>6x larger</b> batch sizes and boosts throughput by <b>up to 3.04x</b> on an A100 GPU without sacrificing accuracy, even surpassing the performance achievable with infinite batch size under the assumption of infinite GPU memory.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section hero is-light">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <div class="column is-four-fifths">
+                <h2 class="title is-3" style="text-align: center;"><img src="static/images/GPU.png" style="height: 50px; display: inline; vertical-align: middle;"/>&nbsp; Generation Throughput with ShadowKV</h2>
+                <div class="content has-text-justified">
+                    <p>
+                        To demonstrate the efﬁciency of ShadowKV, we deploy it into real-world large batch serving scenarios. By measuring the throughput during decoding across different models, we show that ShadowKV can support up to <b>6x larger batch sizes</b> and <b>boost throughput by up to 3.04x</b>. Our efficiency evaluation includes LLMs such as 
+                        <a style="color: #209CEE" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct">Llama-3.1-8B-Instruct</a>, <a style="color: #209CEE" href="https://huggingface.co/gradientai/Llama-3-8B-Instruct-Gradient-1048k">Llama-3-8B-Instruct-1M</a>, <a style="color: #209CEE" href="https://huggingface.co/THUDM/glm-4-9b-chat-1m">GLM-4-9B-Chat-1M</a>, and <a style="color: #209CEE" href="https://huggingface.co/01-ai/Yi-9B-200K">Yi-9B-200K</a> on an A100. The baseline selects the largest batch size that can fit entirely on the GPU with full attention. We also include results for the same batch size of ShadowKV and the infinite batch size, assuming infinite GPU memory capabilities.
+                    </p>
+
+                    <table>
+                    <caption><i>Generation throughput (tokens/s) on an A100. The <span style="color:#1269cc">blue text in brackets</span> denotes batch size.</i></caption>
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        <th>Context</th>
+                        <th>Full Attention</th>
+                        <th>ShadowKV</th>
+                        <th>Gain</th>
+                        <th>Full Attention (Inf)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td rowspan="3"><b>Llama-3-8B-1M</b><br> (8 KV heads)</td>
+                        <td>60K</td>
+                        <td>160.62 <span style="color:#1269cc">(8)</span></td>
+                        <td class="bold-text">455.14 <span style="color:#1269cc">(48)</span></td>
+                        <td><b>2.83x</b></td>
+                        <td>168.72 <span style="color:#1269cc">(48)</span> / 273.07 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>122K</td>
+                        <td>80.77 <span style="color:#1269cc">(4)</span></td>
+                        <td class="bold-text">239.51 <span style="color:#1269cc">(24)</span></td>
+                        <td><b>2.97x</b></td>
+                        <td>83.05 <span style="color:#1269cc">(24)</span> / 134.30 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>244K</td>
+                        <td>40.37 <span style="color:#1269cc">(2)</span></td>
+                        <td class="bold-text">119.01 <span style="color:#1269cc">(12)</span></td>
+                        <td><b>2.95x</b></td>
+                        <td>52.00 <span style="color:#1269cc">(12)</span> / 67.15 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td rowspan="2"><b>Llama-3.1-8B</b><br>(8 KV heads)</td>
+                        <td>60K</td>
+                        <td>160.93 <span style="color:#1269cc">(8)</span></td>
+                        <td class="bold-text">472.77 <span style="color:#1269cc">(48)</span></td>
+                        <td><b>2.94x</b></td>
+                        <td>168.72 <span style="color:#1269cc">(48)</span> / 273.07 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>122K</td>
+                        <td>80.78 <span style="color:#1269cc">(4)</span></td>
+                        <td class="bold-text">245.90 <span style="color:#1269cc">(24)</span></td>
+                        <td><b>3.04x</b></td>
+                        <td>83.05 <span style="color:#1269cc">(24)</span> / 134.30 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td rowspan="3"><b>GLM-4-9B-1M</b><br>(4 KV heads)</td>
+                        <td>60K</td>
+                        <td>241.05 <span style="color:#1269cc">(12)</span></td>
+                        <td class="bold-text">615.89 <span style="color:#1269cc">(50)</span></td>
+                        <td><b>2.56x</b></td>
+                        <td>266.24 <span style="color:#1269cc">(50)</span> / 436.91 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>122K</td>
+                        <td>122.67 <span style="color:#1269cc">(6)</span></td>
+                        <td class="bold-text">293.40 <span style="color:#1269cc">(25)</span></td>
+                        <td><b>2.39x</b></td>
+                        <td>158.83 <span style="color:#1269cc">(25)</span> / 214.87 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>244K</td>
+                        <td>61.13 <span style="color:#1269cc">(3)</span></td>
+                        <td class="bold-text">136.51 <span style="color:#1269cc">(12)</span></td>
+                        <td><b>2.23x</b></td>
+                        <td>78.84 <span style="color:#1269cc">(12)</span> / 107.44 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td rowspan="3"><b>Yi-9B-200K</b><br>(4 KV heads)</td>
+                        <td>60K</td>
+                        <td>204.81 <span style="color:#1269cc">(10)</span></td>
+                        <td class="bold-text">544.36 <span style="color:#1269cc">(42)</span></td>
+                        <td><b>2.66x</b></td>
+                        <td>271.21 <span style="color:#1269cc">(42)</span> / 364.09 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>122K</td>
+                        <td>101.44 <span style="color:#1269cc">(5)</span></td>
+                        <td class="bold-text">260.03 <span style="color:#1269cc">(21)</span></td>
+                        <td><b>2.56x</b></td>
+                        <td>133.53 <span style="color:#1269cc">(21)</span> / 179.06 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr>
+                        <td>244K</td>
+                        <td>46.74 <span style="color:#1269cc">(2)</span></td>
+                        <td class="bold-text">118.55 <span style="color:#1269cc">(10)</span></td>
+                        <td><b>2.54x</b></td>
+                        <td>65.79 <span style="color:#1269cc">(10)</span> / 89.53 <span style="color:#1269cc">(Inf)</span></td>
+                      </tr>
+                      <tr></tr>
+                    </tbody>
+                  </table>
+                <br>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+<!-- End Solutions -->
+
+<!-- ShadowKV -->
+<section class="section hero is-light">
+<div class="container is-max-desktop">
+    <div class="columns is-centered">
+        <div class="column is-four-fifths">
+            <h2 class="title is-3" style="text-align: center"><img src="static/images/ShadowKV.png" style="height: 40px; display: inline;"/>&nbsp;ShadowKV</h2>
+            <div class="content has-text-justified">
+                <p>
+                    The algorithm of ShadowKV is divided into two main phases: pre-filling and decoding. The pre-filling phase involves <b>low-rank decomposition of the post-RoPE key cache</b>, <b>offloading the value cache</b>, and <b>constructing landmarks to facilitate subsequent high-throughput decoding</b>. The decoding phase includes <b>accurate KV selection</b> and <b>efficient sparse KV cache reconstruction</b>.
+                </p>
+
+                <p>
+                In our <a style="color: #209CEE" href="https://arxiv.org/abs/2410.21465 target="_blank">paper</a>, we show that ShadowKV can <b>reduce the GPU memory footprint of the KV cache by over 6x without accuracy degradation on a wide range of models and evaluation benchmarks with minimal sparse KV cache budget</b>.
+                </p>
+            </div>
+            <div class="figure">
+                <img src="static/images/framework.png" alt="ShadowKV System" height="400" />
+            </div>
+            <br>
+            <p>As illustrated in the figure, ShadowKV enhances long-context LLM inference throughput by offloading the value cache to the CPU while maintaining <b>a low-rank key cache, landmarks, and outliers</b> on the GPU. During decoding, it employs landmarks for efficient <b>sparse attention</b>, reducing computation and data movement. ShadowKV effectively utilizes a limited KV budget to achieve high accuracy, theoretically reaching <b>over 7 TB/s equivalent bandwidth on an A100</b>, and empirically <b>boosts generation throughput by 3.04x for Llama-3.1-8B with on a batch of 122K contexts</b>.
+            </p>
+        </div>
+    </div>
+</div>
+</section>
+<section class="section hero is-light">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered">
+            <div class="column is-four-fifths">
+                <h2 class="title is-3" style="text-align: center;"><img src="static/images/Idea.png" style="height: 50px; display: inline; vertical-align: middle;"/>&nbsp; Motivation of ShadowKV</h2>
+                <div class="content has-text-justified">
+                <p>Our design of ShadowKV is inspired by two critical empirical observations regarding LLMs when dealing with long contexts, detailed as follows.</p>
+                <h4 class="title is-5" ><img src="static/images/Observation.png" style="height: 36px; display: inline; vertical-align: middle;"/>&nbsp; Low-rank Keys and Offloaded Values for Storage</h4>
+                <p>
+                    As shown in the figure below, we observed that <b>pre-RoPE keys are exceptionally low-rank</b> compared to the layer inputs, post-RoPE keys, values, key weight matrix, and value weight matrix. Moreover, the pre-RoPE keys lack significant similarities in low-rank subspaces across different sequences, while <b>a sequence and its continuation tend to strongly share low-rank subspaces, enabling high compression rates within each sequence</b>.
+                </p>
+                <div class="figure">
+                    <img src="static/images/svd.png" alt="SVD" height="400" />
+                </div>
+                <p>
+                    Meanwhile, in long-context LLM inference, the <b>quadratic scaling of attention computation</b> with sequence length makes the <b>linear cost of low-rank decomposition</b> during pre-filling negligible. This observation motivates us to <b>store the low-rank keys and offload the values to reduce the memory footprint for larger batch sizes and longer sequences</b>.
+                </p>
+                <h4 class="title is-5" ><img src="static/images/Fast.png" style="height: 36px; display: inline; vertical-align: middle;"/>&nbsp; Accurate KV Selection for Fast Decoding</h4>
+                <div style="display: flex; align-items: top; gap: 10px;">
+                    <div style="flex: 1;">
+                        <p>
+                            To further reduce the latency overhead in sparse attention, including <b>fetching the selected value cache from the CPU and reconstructing the corresponding key cache</b>, an <b>accurate KV selection method</b> is needed to minimize the sparse KV cache budget while maintaining the accuracy. We found <b>most post-RoPE key cache exhibits spatial locality</b>, with high cosine similarity to adjacent tokens, <b>except for a few outliers</b>.
+                        </p>
+                    </div>
+                    <div style="flex: 0 0 55%; max-width: 55%;">
+                        <img src="static/images/kv_sel.png" alt="kv_sel" width=500 />
+                    </div>
+                </div>
+                <br>
+                <p>
+                    This finding suggests that for the majority of chunks, we can maintain the mean value as compressed landmarks to select <b>minimal important KV pairs (1.56%)</b> accurately during decoding. Outlier chunks, which may contain dense or critical information and are difficult to approximate, are retained to ensure accuracy. Given their <b>relatively small number (0.2-0.3%)</b>, storing them on the GPU is feasible without affecting memory capacity. Furthermore, as shown in Figure, considering the <b>temporal locality of the KV cache, a cache policy can be leveraged</b> to further reduce the latency overhead by 60% during decoding with optimized kernels.
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+</section>
+
+
+<section class="section hero is-light">
+<div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+        <h2 class="title is-3"><img src="static/images/Telescope.png" style="height: 50px; display: inline; vertical-align: middle;"/>&nbsp; Conclusion and Future Work</h2>
+        <div class="content has-text-justified">
+        <p>
+            Leveraging the ShadowKV framework, we enable efficient long-context LLM inference for <b>larger batch size and longer sequences</b>, making long-context LLM serving more viable. ShadowKV can be further <b>integrated with various works on KV quantization</b>, enhancing its performance by reducing the KV cache bit-width. Our empirical experiments demonstrate ShadowKV can <b>support up to 6x larger batch sizes and enhance throughput by up to 3.04x on an A100 across various long-context models</b>. ShadowKV holds great promise for improving long-context LLM inference. We look forward to staying engaged with the community to further advance this field.
+          </p>
+        </div>
+       <div class="figure">
+  <img
+    src="static/images/ShadowKV.png"
+    alt="<i>ShadowKV</i>"
+    width="200"
+    height="200" />
+</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+  
+<!--BibTex citation -->
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <h2 class="title">BibTeX</h2>
+      <pre><code>@article{sun2024shadowkv,
+    title={ShadowKV: KV Cache in Shadows for High-Throughput Long-Context LLM Inference},
+    author={Sun, Hanshi and Chang, Li-Wen and Bao, Wenlei and Zheng, Size and Zheng, Ningxin and Liu, Xin and Dong, Harry and Chi, Yuejie and Chen, Beidi},
+    journal={arXiv preprint arXiv:2410.21465},
+    year={2024}
+}</code></pre>
+    </div>
+</section>
+<!--End BibTex citation -->
+
+
+  <footer class="footer">
+  <div class="container">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content">
+
+          <p>
+            This page was built using the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a> which was adopted from the <a href="https://nerfies.github.io" target="_blank">Nerfies</a> project page. The icons are created by GPT4. 
+            You are free to borrow the of this website, we just ask that you link back to this page in the footer. <br> This website is licensed under a <a rel="license"  href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">Creative
+            Commons Attribution-ShareAlike 4.0 International License</a>.
+          </p>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

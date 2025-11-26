@@ -1,0 +1,8 @@
+*.DS_Store
+build/
+3rdparty/
+*.pyc
+*.so
+*.jsonl
+*.log
+*.csv

@@ -1,0 +1,48 @@
+{
+  "timestamp": "20251125_203340",
+  "args": {
+    "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+    "prompt_len": 65536,
+    "bsz": 1,
+    "budget": 2048,
+    "gen_len": 100,
+    "profile_layers": null,
+    "num_rounds": 1,
+    "output_dir": "./logs/results",
+    "enable_profiler": false,
+    "profiler_output_dir": "./profiler_logs",
+    "profiler_wait_steps": 2,
+    "profiler_warmup_steps": 2,
+    "profiler_active_steps": 6,
+    "baseline": true,
+    "shadowkv": false,
+    "xkey": false,
+    "xkv": false,
+    "rank_k": 64,
+    "rank_v": 96,
+    "group_size": 1,
+    "minference": false
+  },
+  "results": {
+    "method": "Baseline (prompt_len=65536, bsz=1)",
+    "num_rounds": 1,
+    "throughput": {
+      "values": [
+        27.311463953759585
+      ],
+      "mean": 27.311463953759585,
+      "std": 0.0,
+      "min": 27.311463953759585,
+      "max": 27.311463953759585
+    },
+    "peak_memory_gb": {
+      "values": [
+        23.2645320892334
+      ],
+      "mean": 23.2645320892334,
+      "std": 0.0,
+      "min": 23.2645320892334,
+      "max": 23.2645320892334
+    }
+  }
+}
