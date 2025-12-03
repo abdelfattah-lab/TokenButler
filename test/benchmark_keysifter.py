@@ -23,7 +23,7 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
     model_kwargs = {
         'model_name': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
         'batch_size': 1,
-        'max_length': 132072,
+        'max_length': 136072,
         'device': 'cuda:0',
         'dtype': torch.bfloat16,
         'attn_mode': attn_mode,
@@ -36,7 +36,7 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
             'rank': 160,
             'dDash': 16,
             'producer_frequency': 4,
-            # TODO: Are we missing intdim here?
+            'keysifter_intermediate_dim': 1024,
             'predictor_path': '',  # Random weights
         })
     elif attn_mode == 'shadowkv':
@@ -197,8 +197,8 @@ def main():
         # (prompt_length, gen_length)
         # (512, 32),      # Short context
         # (2048, 32),     # Medium context
-        (65536, 32),     # Long context
-        (131072, 32),     # Very long context
+        (65536, 2048),     # Long context
+        (131072, 2048),     # Very long context
     ]
 
     all_results = []

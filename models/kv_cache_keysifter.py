@@ -20,14 +20,14 @@ class KeySifterCache:
     KV Cache with KeySifter-based sparse attention for decode.
     
     During prefill:
-        - Store full K/V cache
-        - Project keys to reduced dimension (k_proj_cache) for efficient importance computation
+        - Store full RoPEd K/V cache for retrieval during decode
+        - Project RoPEd keys to reduced dimension (k_proj_cache) for efficient importance scoring
     
     During decode:
         - Use predictor to compute importance queries
         - Score against projected key cache (avoids recomputation)
         - Select top-k positions based on importance scores
-        - Retrieve and RoPE the selected keys for attention
+        - Retrieve RoPEd keys directly (no RoPE computation needed)
     
     This approach trades memory for compute efficiency during long decode sequences.
     """
@@ -88,7 +88,7 @@ class KeySifterCache:
             dtype=dtype,
         )
         
-        # Full key cache (un-RoPEd for SVD or direct access)
+        # Full key cache (RoPEd - stored during prefill for efficient decode retrieval)
         self.k_cache = torch.zeros(
             self.num_hidden_layers,
             batch_size,
@@ -113,8 +113,9 @@ class KeySifterCache:
             dtype=dtype,
         )
         
-        # Buffer for selected K/V during decode
-        buffer_size = sparse_budget + 4096  # Extra space for local window + new tokens
+        # Buffer for assembling KV during decode: [local_window (circular) | sparse_selected]
+        # Only stores recent local_window tokens + space for gathering sparse tokens
+        buffer_size = self.local_window + sparse_budget
         self.k_cache_buffer = torch.zeros(
             self.num_hidden_layers,
             batch_size,
@@ -133,11 +134,13 @@ class KeySifterCache:
             device=device,
             dtype=dtype,
         )
-        
+
         # State tracking
         self.kv_offset = 0
         self.prefill_len = 0
         self.gen_offset = 0
+        self.last_projected_pos = 0  # Track up to which position we've projected decode tokens
+        self.local_window_head = 0  # Circular queue head pointer for local window
         
         # Store importance queries from producer layers
         # Shape: [batch*heads, N_slots, 1, dDash] (for decode, Lq=1)
@@ -161,47 +164,27 @@ class KeySifterCache:
         self.kv_offset = 0
         self.prefill_len = 0
         self.gen_offset = 0
+        self.last_projected_pos = 0
+        self.local_window_head = 0
         self.q_importance_cache = None
-    
+
     def H2D(self):
         """Host to device transfer (no-op if already on GPU)."""
         pass
     
     def get_svd(self, key_states: torch.Tensor, layer_idx: int, fake_svd: bool = False):
         """
-        Bad name. Likely the old code needed to compute SVD. We're using it to store un-RoPEd keys and compute projections of keys for importance scoring.
-        Called during prefill to prepare for sparse decode.
-        For KeySifter, we also project those keys to be used during decode.
+        No-op for KeySifterCache. Kept for API compatibility with other cache implementations.
+        
+        Key projection for importance scoring is performed in prefill_kv_cache() on RoPEd keys,
+        not here on un-RoPEd keys.
         
         Args:
-            key_states: Either [bsz, seq_len, kv_dim] (flat) or [bsz, num_kv_heads, seq_len, head_dim]
-            layer_idx: Layer index
-            fake_svd: Compatibility flag (unused)
+            key_states: Unused
+            layer_idx: Unused
+            fake_svd: Unused
         """
-        # Handle different input shapes (same logic as ShadowKVCache)
-        if key_states.dim() == 3:
-            # [bsz, seq_len, kv_dim] -> [bsz, num_kv_heads, seq_len, head_dim]
-            bsz, seq_len, _ = key_states.shape
-            key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        elif key_states.shape[1] > 32:
-            # TODO: I think we can merge this with the first case?
-            # [bsz, seq_len, kv_dim] format (seq_len > 32)
-            bsz, seq_len, _ = key_states.shape
-            key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # else: already [bsz, num_kv_heads, seq_len, head_dim]
-        
-        seq_len = key_states.shape[2]
-        
-        # Store un-RoPEd keys
-        # TODO: Don't store here and store it in prefill_kv_cache instead so that it's RoPEd and we don't have to RoPE again during decode?
-        self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states)
-        
-        # Project keys for importance scoring (per KV head)
-        # key_states: [B, num_kv_heads, L, head_dim]
-        # proj_weight: [num_kv_heads, head_dim, dDash] (aggregated during predictor loading)
-        proj_weight = self.predictor.key_cache_proj[layer_idx]  # [8, 128, dDash]
-        k_proj = torch.einsum("bhlk,hkd->bhld", key_states, proj_weight)
-        self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
+        pass
     
     def prefill_kv_cache(
         self,
@@ -212,7 +195,6 @@ class KeySifterCache:
     ):
         """
         Store prefill K/V cache and prepare for sparse decode.
-        Note: The stored K is only the local window. 
         
         Args:
             new_v_cache: [bsz, num_kv_heads, seq_len, head_dim] - value states
@@ -222,10 +204,21 @@ class KeySifterCache:
         """
         seq_len = new_v_cache.shape[2]
         
+        # Store full RoPEd key cache (for sparse retrieval during decode)
+        self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states_roped)
+        
         # Store value cache
         self.v_cache[layer_idx, :, :, :seq_len].copy_(new_v_cache)
         
-        # Store local window in buffer (always accessible during decode)
+        # Project RoPEd keys for importance scoring (per KV head)
+        # key_states_roped: [B, num_kv_heads, L, head_dim]
+        # proj_weight: [num_kv_heads, head_dim, dDash] (aggregated during predictor loading)
+        proj_weight = self.predictor.key_cache_proj[layer_idx]  # [num_kv_heads, head_dim, dDash]
+        k_proj = torch.einsum("bhlk,hkd->bhld", key_states_roped, proj_weight)
+        self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
+        
+        # Initialize circular buffer with last local_window tokens from prefill
+        # These will be the most recent tokens at the start of decode
         local_start = max(0, seq_len - self.local_window)
         local_len = seq_len - local_start
         self.k_cache_buffer[layer_idx, :, :, :local_len].copy_(
@@ -234,6 +227,8 @@ class KeySifterCache:
         self.v_cache_buffer[layer_idx, :, :, :local_len].copy_(
             new_v_cache[:, :, local_start:]
         )
+        # Circular buffer starts with head at 0, and local_len items filled
+        # If seq_len < local_window, only first local_len positions are valid
         
         # Only update prefill_len after the last layer to ensure all layers see prefill_len=0
         # during the prefill pass (otherwise subsequent layers think prefill is complete)
@@ -241,6 +236,7 @@ class KeySifterCache:
             self.prefill_len = seq_len
             self.kv_offset = seq_len
             self.gen_offset = 0
+            self.last_projected_pos = seq_len  # Prefill tokens are already projected
     
     def update_kv_cache(
         self,
@@ -250,28 +246,72 @@ class KeySifterCache:
     ):
         """
         Update cache with new decode tokens.
-        
+
         Args:
             new_k_cache: [bsz, num_kv_heads, 1, head_dim] - new RoPEd key
             new_v_cache: [bsz, num_kv_heads, 1, head_dim] - new value
             layer_idx: Layer index
         """
         incoming = new_k_cache.shape[2]
-        
-        # Compute buffer position (after local window + sparse budget)
-        buffer_offset = self.local_window + self.sparse_budget + self.gen_offset
-        
-        # Add to buffer
-        self.k_cache_buffer[layer_idx, :, :, buffer_offset:buffer_offset + incoming].copy_(new_k_cache)
-        self.v_cache_buffer[layer_idx, :, :, buffer_offset:buffer_offset + incoming].copy_(new_v_cache)
-        
-        # TODO: Should implement the logic that would project and store un-RoPEd keys somewhere for importance scoring during long decode.
-        # Note: We store the RoPEd key here; for proper importance scoring, we might
-        # need to track position IDs separately. For now, decode tokens are in local window.
-        
+
+        # Validate cache bounds
+        if self.kv_offset + incoming > self.max_length:
+            raise RuntimeError(
+                f"Sequence length {self.kv_offset + incoming} exceeds max_length {self.max_length}"
+            )
+
+        # Add new token to circular buffer (buffer[0:local_window] is the circular queue)
+        buffer_pos = self.local_window_head
+        self.k_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_k_cache)
+        self.v_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_v_cache)
+
         if layer_idx == self.num_hidden_layers - 1:
+            # Update circular buffer head (wraps around within local_window)
+            old_head = self.local_window_head
+            self.local_window_head = (self.local_window_head + incoming) % self.local_window
+
+            # Update position tracking
             self.kv_offset += incoming
             self.gen_offset += incoming
+
+            # Archive when circular buffer is full (pointer just wrapped to 0)
+            # At this point, the buffer contains exactly local_window tokens that need archiving.
+            # The buffer holds tokens at positions [kv_offset - local_window : kv_offset].
+            # Future writes will overwrite these, so we archive the entire buffer now.
+            if self.local_window_head < old_head:  # Wrapped around (buffer is full)
+                # Archive all local_window tokens currently in the buffer
+                # Buffer positions [0 : local_window] map to sequence positions [kv_offset - local_window : kv_offset]
+                archive_start = self.kv_offset - self.local_window  # First sequence position in buffer
+                archive_end = self.kv_offset  # One past last sequence position in buffer
+
+                # Only archive positions we haven't archived yet
+                start_pos = max(self.last_projected_pos, archive_start)
+                end_pos = archive_end
+
+                if start_pos < end_pos:
+                    num_to_archive = end_pos - start_pos
+                    # Offset within the buffer: buffer is linear [0:local_window] mapping to [archive_start:archive_end]
+                    offset_in_buffer = start_pos - archive_start
+
+                    # Archive for all layers
+                    for archive_layer_idx in range(self.num_hidden_layers):
+                        # Extract the slice to archive from circular buffer
+                        keys_to_archive = self.k_cache_buffer[archive_layer_idx, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
+                        values_to_archive = self.v_cache_buffer[archive_layer_idx, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
+
+                        # Store to main cache
+                        self.k_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(keys_to_archive)
+                        self.v_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(values_to_archive)
+
+                        # Project RoPEd keys for importance scoring
+                        proj_weight = self.predictor.key_cache_proj[archive_layer_idx]
+                        k_proj = torch.einsum("bhlk,hkd->bhld", keys_to_archive, proj_weight)
+
+                        # Store projections
+                        self.k_proj_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(k_proj)
+
+                    # Update tracking - all buffer contents are now archived
+                    self.last_projected_pos = end_pos
     
     def compute_predictor_importance(
         self,
@@ -325,9 +365,9 @@ class KeySifterCache:
         # Select slot: [B*num_attention_heads, Lq, dDash]
         q_slot = self.q_importance_cache[:, slot_idx, :, :]  # [B*32, Lq, dDash]
         
-        # Get projected keys up to prefill length (stored per KV head)
-        # k_proj: [B, num_key_value_heads, prefill_len, dDash]
-        k_proj = self.k_proj_cache[layer_idx, :, :, :self.prefill_len]
+        # Get projected keys up to last projected position (includes prefill + archived decode tokens)
+        # k_proj: [B, num_key_value_heads, last_projected_pos, dDash]
+        k_proj = self.k_proj_cache[layer_idx, :, :, :self.last_projected_pos]
         
         # Reshape q_slot: [B*num_attention_heads, Lq, dDash] -> [B, num_attention_heads, Lq, dDash]
         Lq = q_slot.shape[1]
@@ -338,25 +378,29 @@ class KeySifterCache:
         
         # Efficient scoring with broadcasting:
         # q_slot: [B, num_attention_heads, 1, dDash] -> reshape to [B, num_kv_heads, num_kv_groups, 1, dDash]
-        # k_proj: [B, num_key_value_heads, prefill_len, dDash] -> [B, num_kv_heads, 1, prefill_len, dDash]
+        # k_proj: [B, num_key_value_heads, last_projected_pos, dDash] -> [B, num_kv_heads, 1, last_projected_pos, dDash]
         # This broadcasts k_proj across the num_kv_groups dimension efficiently
         q_slot = q_slot.view(bsz, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
-        k_proj = k_proj.unsqueeze(2)  # [B, num_kv_heads, 1, prefill_len, dDash]
-        
-        # Compute scores: [B, num_kv_heads, num_kv_groups, 1, prefill_len]
+        k_proj = k_proj.unsqueeze(2)  # [B, num_kv_heads, 1, last_projected_pos, dDash]
+
+        # Compute scores: [B, num_kv_heads, num_kv_groups, 1, last_projected_pos]
         scores = torch.einsum("bhgqd,bhgkd->bhgqk", q_slot, k_proj)
-        scores = scores.squeeze(3) / math.sqrt(self.dDash)  # [B, num_kv_heads, num_kv_groups, prefill_len]
-        
+        scores = scores.squeeze(3) / math.sqrt(self.dDash)  # [B, num_kv_heads, num_kv_groups, last_projected_pos]
+
         # Aggregate scores from attention heads to KV heads
         # Use max across the group (if any attention head thinks a token is important, keep it)
-        scores = scores.max(dim=2).values  # [B, num_kv_heads, prefill_len]
-        
+        scores = scores.max(dim=2).values  # [B, num_kv_heads, last_projected_pos]
+
         # Don't include local window positions (they're always included)
-        local_start = max(0, self.prefill_len - self.local_window)
-        scores[:, :, local_start:] = float("-inf")
+        # Local window is the most recent tokens: [kv_offset - local_window : kv_offset]
+        # We mask out any projected tokens that fall in this range
+        local_start = max(0, self.kv_offset - self.local_window)
+        if local_start < self.last_projected_pos:
+            scores[:, :, local_start:] = float("-inf")
         
-        # Select top-k positions
-        num_to_select = min(self.sparse_budget, local_start)
+        # Select top-k positions from available tokens (projected tokens outside local window)
+        num_available = min(local_start, self.last_projected_pos)
+        num_to_select = min(self.sparse_budget, num_available)
         if num_to_select > 0:
             _, position_ids = torch.topk(scores, k=num_to_select, dim=-1)  # [B, num_kv_heads, sparse_budget]
             # Sort positions for better memory access
@@ -373,39 +417,34 @@ class KeySifterCache:
         self,
         layer_idx: int,
         position_ids: torch.Tensor,
-        rope_func: Callable,
+        rope_func: Callable = None,
         cos_sin_cache: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Gather selected keys from cache and apply RoPE.
-        
+        Gather selected keys from cache (already RoPEd).
+
         Args:
             layer_idx: Layer index
             position_ids: [bsz, num_kv_heads, sparse_budget] - positions to retrieve
-            rope_func: Function to apply rotary position embeddings
-            cos_sin_cache: Optional precomputed cos/sin cache
-            
+            rope_func: Unused (kept for interface compatibility). Keys are already RoPEd.
+            cos_sin_cache: Unused (kept for interface compatibility)
+
         Returns:
-            key_states: [bsz, num_kv_heads, total_len, head_dim] - selected + local + decode keys
+            key_states: [bsz, num_kv_heads, total_len, head_dim] - local + sparse selected keys
         """
-        bsz = position_ids.shape[0]
         num_selected = position_ids.shape[-1]
-        
-        # Gather selected keys (un-RoPEd)
-        # k_cache: [num_layers, bsz, num_kv_heads, max_len, head_dim]
+
+        # Gather selected keys from main cache (already RoPEd - stored during prefill or archived)
         index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
         selected_keys = self.k_cache[layer_idx].gather(dim=2, index=index)
-        
-        # Apply RoPE to selected keys
-        selected_keys = rope_func(selected_keys, position_ids)
-        
-        # Copy to buffer at sparse position
+
+        # Copy sparse selected keys to buffer after local window
         sparse_start = self.local_window
-        sparse_end = sparse_start + num_selected
-        self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_end].copy_(selected_keys)
-        
-        # Return full buffer (local + sparse + decode)
-        total_len = self.local_window + num_selected + self.gen_offset
+        self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected].copy_(selected_keys)
+
+        # Return buffer: [local_window (circular) | sparse_selected]
+        # Order doesn't matter for flash attention as long as K and V are aligned
+        total_len = self.local_window + num_selected
         return self.k_cache_buffer[layer_idx, :, :, :total_len]
     
     def get_value_cache(
@@ -415,25 +454,24 @@ class KeySifterCache:
     ) -> torch.Tensor:
         """
         Gather selected values from cache.
-        
+
         Args:
             layer_idx: Layer index
             position_ids: [bsz, num_kv_heads, sparse_budget] - positions to retrieve
-            
+
         Returns:
-            value_states: [bsz, num_kv_heads, total_len, head_dim] - selected + local + decode values
+            value_states: [bsz, num_kv_heads, total_len, head_dim] - local + sparse selected values
         """
         num_selected = position_ids.shape[-1]
-        
-        # Gather selected values
+
+        # Gather selected values from main cache
         index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
         selected_values = self.v_cache[layer_idx].gather(dim=2, index=index)
-        
-        # Copy to buffer at sparse position
+
+        # Copy sparse selected values to buffer after local window
         sparse_start = self.local_window
-        sparse_end = sparse_start + num_selected
-        self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_end].copy_(selected_values)
-        
-        # Return full buffer
-        total_len = self.local_window + num_selected + self.gen_offset
+        self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected].copy_(selected_values)
+
+        # Return buffer: [local_window (circular) | sparse_selected]
+        total_len = self.local_window + num_selected
         return self.v_cache_buffer[layer_idx, :, :, :total_len]
