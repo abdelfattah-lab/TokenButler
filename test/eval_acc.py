@@ -96,6 +96,11 @@ def parse_args() -> Namespace:
     p.add_argument("--rank_k", type=int, default=96)
     p.add_argument("--rank_v", type=int, default=144)
     p.add_argument("--fake_svd", action='store_true', help="Use fake SVD.")
+    # KeySifter args
+    p.add_argument("--predictor_path", type=str, default="", help="Path to KeySifter predictor weights (.pt file)")
+    p.add_argument("--dDash", type=int, default=32, help="Reduced dimension for KeySifter importance computation")
+    p.add_argument("--producer_frequency", type=int, default=4, help="Number of layers served by one KeySifter predictor")
+    p.add_argument("--keysifter_intermediate_dim", type=int, default=512, help="KeySifter MLP intermediate dimension")
 
     return p.parse_args()
 
@@ -116,6 +121,10 @@ if __name__ == '__main__':
     rank_k = args.rank_k
     rank_v = args.rank_v
     fake_svd = args.fake_svd
+    predictor_path = args.predictor_path
+    dDash = args.dDash
+    producer_frequency = args.producer_frequency
+    keysifter_intermediate_dim = args.keysifter_intermediate_dim
 
     seed_everything(42)
     dist_config = init_dist()
@@ -132,7 +141,8 @@ if __name__ == '__main__':
     LLM = choose_model_class(model_name)
 
     llm = LLM(model_name=model_name, batch_size=batch_size, device=dist_config.device, max_length=datalen+2048, attn_mode=args.method, dtype=dtype,
-              sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd)
+              sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd,
+              predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim)
 
     if dist_config.master_process:
         llm.print_kv_stats()

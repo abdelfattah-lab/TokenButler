@@ -33,6 +33,7 @@ from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_si
 from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
 from .merge_configs import generate_consecutive_palu_config
+from .keysifter_predictor import load_keysifter_predictor
 
 class LlamaLayer:
     def __init__(self, layer_idx) -> None:
@@ -98,6 +99,11 @@ class Llama(LLM):
         rank_v: int = 576,
         fake_svd: bool = False,
         profile_layers: int = 0,
+        # KeySifter
+        predictor_path: str = "",
+        dDash: int = 16,
+        producer_frequency: int = 4,
+        keysifter_intermediate_dim: int = 1024,
     ) -> None:
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -145,7 +151,31 @@ class Llama(LLM):
             raise ValueError(f"Invalid model name {model_name}")
 
         self.fake_svd = fake_svd
-        self.init_kv_cache(sparse_budget, chunk_size, self.config, rank=rank, merge_config=self.merge_config)
+        
+        # Initialize KeySifter predictor if needed
+        self.keysifter_predictor = None
+        self.producer_frequency = producer_frequency
+        if attn_mode.lower() == 'keysifter':
+            self.keysifter_predictor = load_keysifter_predictor(
+                config=self.config,
+                predictor_path=predictor_path,
+                num_heads=self.num_heads,  # Use attention heads (not KV heads) to match training
+                producer_frequency=producer_frequency,
+                dDash=dDash,
+                intermediate_dim=keysifter_intermediate_dim,
+                device=device,
+                dtype=dtype,
+            )
+        
+        self.init_kv_cache(
+            sparse_budget, 
+            chunk_size, 
+            self.config, 
+            rank=rank, 
+            merge_config=self.merge_config,
+            keysifter_predictor=self.keysifter_predictor,
+            producer_frequency=producer_frequency,
+        )
 
         if self.minference:
             import json
@@ -170,7 +200,8 @@ class Llama(LLM):
 
     @torch.inference_mode()
     def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        vllm._custom_ops.rotary_embedding(position_ids, q, k, 128, self.cos_sin_cache, True)
+        # Use self.head_dim instead of hardcoded 128 for better compatibility
+        vllm._custom_ops.rotary_embedding(position_ids, q, k, self.head_dim, self.cos_sin_cache, True)
         bsz = q.shape[0]
         q = q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)

@@ -19,6 +19,8 @@ from .glm import GLM
 from .llama import Llama
 from .qwen import Qwen2
 from .phi3 import Phi3
+from .keysifter_predictor import KeySifterPredictor, load_keysifter_predictor
+from .kv_cache_keysifter import KeySifterCache
 
 def choose_model_class(model_name):
     if 'llama' in model_name.lower():

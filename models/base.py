@@ -32,6 +32,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 from .kv_cache_xkv import ShadowKVCache_xKey, ShadowKVCache_xKV, ShadowKVCache_xKey_CPU, ShadowKVCache_xKV_CPU
+from .kv_cache_keysifter import KeySifterCache
 from .merge_configs import xKVConfig
 
 class LLM:
@@ -44,7 +45,7 @@ class LLM:
         """Return record_function context if profiling is enabled, otherwise nullcontext"""
         return record_function(name) if getattr(self, '_profiling_enabled', False) else nullcontext()
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -59,6 +60,20 @@ class LLM:
             self.kv_cache = ShadowKVCache_xKey_CPU(config, merge_config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, chunk_size=chunk_size)
         elif self.attn_mode.lower() == 'shadowkv_xkv_cpu':
             self.kv_cache = ShadowKVCache_xKV_CPU(config, merge_config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, chunk_size=chunk_size)
+        elif self.attn_mode.lower() == 'keysifter':
+            if keysifter_predictor is None:
+                raise ValueError("KeySifter mode requires a predictor. Pass keysifter_predictor to init_kv_cache.")
+            self.kv_cache = KeySifterCache(
+                config, 
+                predictor=keysifter_predictor,
+                max_length=self.max_length, 
+                device=self.device, 
+                dtype=self.dtype, 
+                batch_size=self.batch_size, 
+                sparse_budget=sparse_budget, 
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+            )
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
 
@@ -66,6 +81,12 @@ class LLM:
         self.kv_cache.print_stats()
     
     def get_ctx(self, input_ids: torch.LongTensor):
+        """
+        Returns position ids for the current input based on the kv cache length.
+        
+        Args:
+            input_ids (torch.LongTensor): The input token IDs.
+        """
         input_len = input_ids.size(1)
         past_len = self.kv_cache.get_kv_len()
         position_ids = torch.arange(past_len, past_len + input_len, device=self.device, dtype=torch.long).unsqueeze(0).repeat(input_ids.size(0), 1)
@@ -143,9 +164,12 @@ class LLM:
 
         elif isinstance(self.kv_cache, ShadowKVCache) or isinstance(self.kv_cache, ShadowKVCache_CPU) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey) or isinstance(self.kv_cache, ShadowKVCache_xKV) or \
-             isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
+             isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) or \
+             isinstance(self.kv_cache, KeySifterCache):
 
-            if q_len > 1024: # prefill
+            # Prefill: use for long sequences OR first pass of short sequences with KeySifter
+            is_keysifter_first_pass = isinstance(self.kv_cache, KeySifterCache) and self.kv_cache.prefill_len == 0
+            if q_len > 1024 or is_keysifter_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):
                     # svd unrope key and save
                     if isinstance(self.kv_cache, ShadowKVCache_xKey):
@@ -154,6 +178,9 @@ class LLM:
                         self.kv_cache.get_svd(key_states, value_states, layer_idx, fake_svd=self.fake_svd)
                     elif isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                         self.kv_cache.get_svd(key_states, value_states, layer_idx)
+                    elif isinstance(self.kv_cache, KeySifterCache):
+                        # Store un-RoPEd keys and compute projections of keys for importance scoring
+                        self.kv_cache.get_svd(key_states, layer_idx)
                     else:
                         self.kv_cache.get_svd(key_states, layer_idx)
                     query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
@@ -173,18 +200,29 @@ class LLM:
                 with self._maybe_record_function("update_kv_cache"):
                     self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
 
+                # KeySifter: compute importance queries at producer layers
+                if isinstance(self.kv_cache, KeySifterCache):
+                    producer_frequency = self.kv_cache.producer_frequency
+                    if layer_idx % producer_frequency == 0:
+                        with self._maybe_record_function("keysifter_predictor"):
+                            # hidden_states here is the residual (pre-attention), we need to pass it
+                            self.kv_cache.compute_predictor_importance(residual, layer_idx)
+
                 # get retrieval idx
                 with self._maybe_record_function("get_retrieval_position_ids"):
                     position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
 
                 # multi-stream
-                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
+                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache):
                     curr_stream = torch.cuda.current_stream()
                     get_value_stream = self.kv_cache.copy_stream
 
                 if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_value_cache_xKV_cpu"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
+                elif isinstance(self.kv_cache, KeySifterCache):
+                    with self._maybe_record_function("get_value_cache_keysifter"):
+                        value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
                 else:
                     with self._maybe_record_function("get_value_cache_offload_stream"):
                         with torch.cuda.stream(get_value_stream):
@@ -195,6 +233,9 @@ class LLM:
                 if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
+                elif isinstance(self.kv_cache, KeySifterCache):
+                    with self._maybe_record_function("get_key_cache_keysifter"):
+                        key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
                 else:
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
