@@ -147,12 +147,15 @@ class KeySifterPredictor(nn.Module):
         
         # Reshape: [B, L, N_slots, H, dDash]
         q_slot = q_flat.view(B, L, N_slots, H, self.dDash)
-        
+
         # Permute to [B, H, N_slots, L, dDash]
-        q_slot = q_slot.permute(0, 3, 2, 1, 4).contiguous()
-        
+        # OPTIMIZATION: Remove .contiguous() to avoid expensive memory copy
+        # PyTorch can handle non-contiguous tensors for indexing operations
+        q_slot = q_slot.permute(0, 3, 2, 1, 4)
+
         # Final shape: [B*H, N_slots, L, dDash]
-        q_importance = q_slot.view(B * H, N_slots, L, self.dDash)
+        # Use reshape instead of view - it handles non-contiguous tensors automatically
+        q_importance = q_slot.reshape(B * H, N_slots, L, self.dDash)
         
         return q_importance
     

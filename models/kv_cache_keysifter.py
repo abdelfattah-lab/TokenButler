@@ -293,7 +293,7 @@ class KeySifterCache:
                     # Offset within the buffer: buffer is linear [0:local_window] mapping to [archive_start:archive_end]
                     offset_in_buffer = start_pos - archive_start
 
-                    # Archive for all layers
+                    # Archive keys and values for all layers
                     for archive_layer_idx in range(self.num_hidden_layers):
                         # Extract the slice to archive from circular buffer
                         keys_to_archive = self.k_cache_buffer[archive_layer_idx, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
@@ -303,12 +303,17 @@ class KeySifterCache:
                         self.k_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(keys_to_archive)
                         self.v_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(values_to_archive)
 
-                        # Project RoPEd keys for importance scoring
-                        proj_weight = self.predictor.key_cache_proj[archive_layer_idx]
-                        k_proj = torch.einsum("bhlk,hkd->bhld", keys_to_archive, proj_weight)
+                    # OPTIMIZATION: Batch project RoPEd keys for ALL layers at once
+                    # Instead of 32 separate einsum ops, do 1 batched einsum
+                    # Extract keys for all layers: [num_layers, B, num_kv_heads, num_to_archive, head_dim]
+                    all_keys_to_archive = self.k_cache_buffer[:, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
 
-                        # Store projections
-                        self.k_proj_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(k_proj)
+                    # Batched einsum across all layers
+                    # all_keys: [L, B, H, T, K] x proj_weights: [L, H, K, D] -> [L, B, H, T, D]
+                    all_k_proj = torch.einsum("lbhtk,lhkd->lbhtd", all_keys_to_archive, self.predictor.key_cache_proj)
+
+                    # Store all projections in one batched copy
+                    self.k_proj_cache[:, :, :, start_pos:end_pos].copy_(all_k_proj)
 
                     # Update tracking - all buffer contents are now archived
                     self.last_projected_pos = end_pos
@@ -383,14 +388,18 @@ class KeySifterCache:
         q_slot = q_slot.view(bsz, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
         k_proj = k_proj.unsqueeze(2)  # [B, num_kv_heads, 1, last_projected_pos, dDash]
 
+        # MODIFIED: Skip scoring and topk, use random positions instead
+        # This is for benchmarking to measure topk overhead
+
+        # # Original code (commented out):
         # Compute scores: [B, num_kv_heads, num_kv_groups, 1, last_projected_pos]
         scores = torch.einsum("bhgqd,bhgkd->bhgqk", q_slot, k_proj)
         scores = scores.squeeze(3) / math.sqrt(self.dDash)  # [B, num_kv_heads, num_kv_groups, last_projected_pos]
-
+        
         # Aggregate scores from attention heads to KV heads
         # Use max across the group (if any attention head thinks a token is important, keep it)
         scores = scores.max(dim=2).values  # [B, num_kv_heads, last_projected_pos]
-
+        
         # Don't include local window positions (they're always included)
         # Local window is the most recent tokens: [kv_offset - local_window : kv_offset]
         # We mask out any projected tokens that fall in this range
@@ -410,7 +419,26 @@ class KeySifterCache:
                 bsz, self.num_key_value_heads, 0,
                 device=self.device, dtype=torch.long
             )
-        
+
+        # # New code: Random selection
+        # local_start = max(0, self.kv_offset - self.local_window)
+        # num_available = min(local_start, self.last_projected_pos)
+        # num_to_select = min(self.sparse_budget, num_available)
+
+        # if num_to_select > 0:
+        #     # Generate random positions from [0, num_available) and sort them
+        #     # Use same positions for all batches and KV heads for simplicity
+        #     random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
+        #     random_positions, _ = random_positions.sort()
+
+        #     # Expand to [bsz, num_kv_heads, num_to_select]
+        #     position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+        # else:
+        #     position_ids = torch.zeros(
+        #         bsz, self.num_key_value_heads, 0,
+        #         device=self.device, dtype=torch.long
+        #     )
+
         return position_ids
     
     def get_key_cache(
@@ -435,12 +463,15 @@ class KeySifterCache:
         num_selected = position_ids.shape[-1]
 
         # Gather selected keys from main cache (already RoPEd - stored during prefill or archived)
+        # OPTIMIZATION: Use out= parameter to write directly to buffer, eliminating intermediate tensor
         index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        selected_keys = self.k_cache[layer_idx].gather(dim=2, index=index)
-
-        # Copy sparse selected keys to buffer after local window
         sparse_start = self.local_window
-        self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected].copy_(selected_keys)
+        torch.gather(
+            self.k_cache[layer_idx],
+            dim=2,
+            index=index,
+            out=self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
+        )
 
         # Return buffer: [local_window (circular) | sparse_selected]
         # Order doesn't matter for flash attention as long as K and V are aligned
@@ -465,12 +496,15 @@ class KeySifterCache:
         num_selected = position_ids.shape[-1]
 
         # Gather selected values from main cache
+        # OPTIMIZATION: Use out= parameter to write directly to buffer, eliminating intermediate tensor
         index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        selected_values = self.v_cache[layer_idx].gather(dim=2, index=index)
-
-        # Copy sparse selected values to buffer after local window
         sparse_start = self.local_window
-        self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected].copy_(selected_values)
+        torch.gather(
+            self.v_cache[layer_idx],
+            dim=2,
+            index=index,
+            out=self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
+        )
 
         # Return buffer: [local_window (circular) | sparse_selected]
         total_len = self.local_window + num_selected
