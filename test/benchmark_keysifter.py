@@ -8,12 +8,14 @@ import torch
 import time
 import sys
 import gc
+import matplotlib.pyplot as plt
+import numpy as np
 sys.path.insert(0, '/home/afa55/Projects/xKV/xKV')
 
 from models import Llama
 from termcolor import colored
 
-def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
+def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, predictor_path=''):
     """Benchmark a single configuration."""
     print(f"\n{'='*60}")
     print(f"Benchmarking: {attn_mode.upper()} | Prompt: {prompt_length} tokens | Gen: {gen_length} tokens")
@@ -37,7 +39,7 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
             'dDash': 16,
             'producer_frequency': 4,
             'keysifter_intermediate_dim': 1024,
-            'predictor_path': '',  # Random weights
+            'predictor_path': predictor_path,
         })
     elif attn_mode == 'shadowkv':
         model_kwargs.update({
@@ -81,30 +83,97 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
     print(f"  Time: {prefill_time:.4f}s")
     print(f"  Throughput: {prefill_tokens_per_sec:.2f} tokens/s")
 
-    # Benchmark decode
+    # Benchmark decode (sampled timings)
     print("\n[DECODE]")
-    llm.kv_cache.H2D()
+    # Time the Host->Device transfer for KV cache
+    try:
+        h2d_start = torch.cuda.Event(enable_timing=True)
+        h2d_end = torch.cuda.Event(enable_timing=True)
+        h2d_start.record()
+        llm.kv_cache.H2D()
+        h2d_end.record()
+        torch.cuda.synchronize()
+        kv_h2d_time = h2d_start.elapsed_time(h2d_end) / 1000.0
+        print(f"  kv_cache.H2D time: {kv_h2d_time:.4f}s")
+    except Exception:
+        # Fallback if CUDA events not available
+        t0 = time.perf_counter()
+        llm.kv_cache.H2D()
+        torch.cuda.synchronize()
+        kv_h2d_time = time.perf_counter() - t0
+        print(f"  kv_cache.H2D time (fallback): {kv_h2d_time:.4f}s")
 
-    decode_times = []
+    # We'll keep a low-overhead wall-clock measurement per-step, and
+    # also take sampled CUDA event timings every `sample_rate` steps
+    decode_times = []             # wall-clock per-step (all steps)
+    sampled_total = []            # sampled total time (CUDA events) seconds
+    sampled_getctx = []           # sampled get_ctx time
+    sampled_inference = []        # sampled inference time
+
+    sample_rate = max(1, int(gen_length // 50))  # ~50 samples across generation
 
     for i in range(gen_length):
+        # wall-clock start
         torch.cuda.synchronize()
         start = time.perf_counter()
 
         next_token = logits.argmax(dim=-1)
-        position_ids = llm.get_ctx(next_token)
-        logits = llm.inference(input_ids=next_token, position_ids=position_ids)
+
+        # Sample detailed timings periodically to avoid high overhead
+        if (i % sample_rate) == 0:
+            evt_total_s = torch.cuda.Event(enable_timing=True)
+            evt_total_e = torch.cuda.Event(enable_timing=True)
+            evt_get_s = torch.cuda.Event(enable_timing=True)
+            evt_get_e = torch.cuda.Event(enable_timing=True)
+            evt_inf_s = torch.cuda.Event(enable_timing=True)
+            evt_inf_e = torch.cuda.Event(enable_timing=True)
+
+            evt_total_s.record()
+
+            evt_get_s.record()
+            position_ids = llm.get_ctx(next_token)
+            evt_get_e.record()
+
+            evt_inf_s.record()
+            logits = llm.inference(input_ids=next_token, position_ids=position_ids)
+            evt_inf_e.record()
+
+            evt_total_e.record()
+            torch.cuda.synchronize()
+
+            total_ms = evt_total_s.elapsed_time(evt_total_e)
+            get_ms = evt_get_s.elapsed_time(evt_get_e)
+            inf_ms = evt_inf_s.elapsed_time(evt_inf_e)
+
+            sampled_total.append(total_ms / 1000.0)
+            sampled_getctx.append(get_ms / 1000.0)
+            sampled_inference.append(inf_ms / 1000.0)
+        else:
+            position_ids = llm.get_ctx(next_token)
+            logits = llm.inference(input_ids=next_token, position_ids=position_ids)
 
         torch.cuda.synchronize()
         step_time = time.perf_counter() - start
         decode_times.append(step_time)
 
+    # Compute averages
     avg_decode_time = sum(decode_times) / len(decode_times)
     decode_tokens_per_sec = 1.0 / avg_decode_time
+
+    sample_info = {}
+    if sampled_total:
+        sample_info = {
+            'sample_count': len(sampled_total),
+            'avg_sample_total_sec': sum(sampled_total) / len(sampled_total),
+            'avg_sample_getctx_sec': sum(sampled_getctx) / len(sampled_getctx),
+            'avg_sample_inference_sec': sum(sampled_inference) / len(sampled_inference),
+        }
 
     print(f"  Avg time per token: {avg_decode_time*1000:.2f}ms")
     print(f"  Throughput: {decode_tokens_per_sec:.2f} tokens/s")
     print(f"  Min/Max: {min(decode_times)*1000:.2f}ms / {max(decode_times)*1000:.2f}ms")
+    if sample_info:
+        print(f"  Sampled ({sample_info['sample_count']}): total {sample_info['avg_sample_total_sec']*1000:.2f}ms | get_ctx {sample_info['avg_sample_getctx_sec']*1000:.2f}ms | inference {sample_info['avg_sample_inference_sec']*1000:.2f}ms")
 
     # Total time
     total_time = prefill_time + sum(decode_times)
@@ -134,7 +203,79 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512):
         'decode_tokens_per_sec': decode_tokens_per_sec,
         'total_time': total_time,
         'memory_allocated_gb': memory_allocated,
+        'kv_h2d_time': kv_h2d_time,
+        'sample_info': sample_info,
     }
+
+
+def plot_decode_breakdown(results_list, output_file='decode_breakdown.png'):
+    """Plot decode stage time breakdown for KeySifter."""
+    # Filter for KeySifter results with sample info
+    keysifter_results = [r for r in results_list 
+                         if r['attn_mode'] == 'keysifter' and r.get('sample_info')]
+    
+    if not keysifter_results:
+        print("No KeySifter results with timing breakdown found.")
+        return
+    
+    # Create figure with subplots
+    n_configs = len(keysifter_results)
+    fig, axes = plt.subplots(1, n_configs, figsize=(6*n_configs, 5))
+    if n_configs == 1:
+        axes = [axes]
+    
+    for idx, result in enumerate(keysifter_results):
+        ax = axes[idx]
+        sample_info = result['sample_info']
+        
+        # Extract timing components (in milliseconds)
+        get_ctx_ms = sample_info['avg_sample_getctx_sec'] * 1000
+        inference_ms = sample_info['avg_sample_inference_sec'] * 1000
+        total_ms = sample_info['avg_sample_total_sec'] * 1000
+        
+        # Calculate overhead (total - get_ctx - inference)
+        overhead_ms = max(0, total_ms - get_ctx_ms - inference_ms)
+        
+        # Also include KV H2D transfer time
+        h2d_ms = result.get('kv_h2d_time', 0) * 1000
+        
+        # Create bar chart
+        components = ['get_ctx\n(KeySifter)', 'inference\n(Model)', 'overhead']
+        times = [get_ctx_ms, inference_ms, overhead_ms]
+        colors = ['#FF6B6B', '#4ECDC4', '#95E1D3']
+        
+        bars = ax.bar(components, times, color=colors, edgecolor='black', linewidth=1.5)
+        
+        # Add value labels on bars
+        for bar, time_val in zip(bars, times):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{time_val:.2f}ms\n({time_val/total_ms*100:.1f}%)',
+                   ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        # Add total time annotation
+        ax.axhline(y=total_ms, color='red', linestyle='--', linewidth=2, alpha=0.7, label=f'Total: {total_ms:.2f}ms')
+        
+        # Formatting
+        prompt_len = result['prompt_length']
+        gen_len = result['gen_length']
+        ax.set_title(f'Decode Stage Breakdown\nPrompt: {prompt_len:,} tokens | Gen: {gen_len} tokens',
+                    fontsize=12, fontweight='bold')
+        ax.set_ylabel('Time per Token (ms)', fontsize=11)
+        ax.set_ylim(0, total_ms * 1.2)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        ax.legend(loc='upper right', fontsize=9)
+        
+        # Add note about H2D transfer
+        if h2d_ms > 0:
+            ax.text(0.5, 0.95, f'Note: KV H2D transfer = {h2d_ms:.2f}ms (one-time)',
+                   transform=ax.transAxes, ha='center', va='top',
+                   fontsize=8, style='italic', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"\n{colored(f'Decode breakdown plot saved to {output_file}', 'green')}")
+    plt.close()
 
 
 def print_comparison(results_list):
@@ -192,6 +333,9 @@ def main():
     print(colored("KeySifter vs Full Attention - Runtime Efficiency Benchmark", 'cyan', attrs=['bold']))
     print(colored("="*80, 'cyan'))
 
+    # Path to trained KeySifter weights
+    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_p4x.pt'
+
     # Test configurations
     configs = [
         # (prompt_length, gen_length)
@@ -216,9 +360,9 @@ def main():
         # Wait a bit between tests
         time.sleep(2)
 
-        # Test KeySifter
+        # Test KeySifter with trained weights
         try:
-            result = benchmark_model('keysifter', prompt_len, gen_len, sparse_budget=1024)
+            result = benchmark_model('keysifter', prompt_len, gen_len, sparse_budget=1024, predictor_path=weights_path)
             all_results.append(result)
         except Exception as e:
             print(f"KeySifter failed: {e}")
@@ -228,6 +372,9 @@ def main():
 
     # Print comparison
     print_comparison(all_results)
+
+    # Plot decode breakdown
+    plot_decode_breakdown(all_results)
 
     # Save results
     import json
