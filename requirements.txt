@@ -15,47 +15,68 @@
 #
 ################################################################################
 
-accelerate==0.32.1
-click==8.1.3
-Cython
-datasets==3.6.0
-einops==0.8.0
-evaluate
-fastchat==0.1.0
-fuzzywuzzy==0.18.0
-gcsfs
-huggingface-hub
-hydra-core==1.3.2
-jieba==0.42.1
-loguru==0.7.2
-matplotlib
-nemo_toolkit[all]==2.3.0
-ninja
-nltk==3.9.1
-numpy==1.26.4
-omegaconf==2.3.0
-openai
-packaging
-pandas
-protobuf==4.24.4
-pytorch-lightning==2.0.7
-rouge==1.0.1
-rouge_score
-safetensors
-scikit_learn
-scipy
-seaborn
-sentencepiece
-sympy
-tabulate
-tenacity
-termcolor
-tiktoken
+# Core ML/DL frameworks
 torch==2.6.0
-tqdm==4.66.3
 transformers==4.51.1
 vllm==0.8.3
-wandb
-wheel
+flash_attn==2.7.4.post1
+flashinfer-python==0.3.1
+minference==0.1.6.0
+
+# Training and acceleration
+pytorch-lightning==2.0.7
+accelerate==0.32.1
+nemo_toolkit[all]==2.3.0
+
+# Data processing
+datasets==3.6.0
+numpy==1.26.4
+pandas
+scipy
+
+# NLP utilities
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+rouge==1.0.1
+rouge_score
+nltk==3.9.1
+sentencepiece
 wonderwords
+
+# Visualization
+matplotlib
+seaborn
+termcolor
+
+# Configuration management
+hydra-core==1.3.2
+omegaconf==2.3.0
+loguru==0.7.2
+
+# General utilities
+tqdm==4.66.3
+click==8.1.3
+tenacity
+tabulate
+packaging
+protobuf==4.24.4
+PyYAML
+
+# Storage and serialization
+gcsfs
+safetensors
+
+# Build dependencies
+Cython
+ninja
+
+# Experiment tracking
+wandb
+
+# Optional utilities
+evaluate
+openai
+tiktoken
+beautifulsoup4
+sympy
 yacs==0.1.8
