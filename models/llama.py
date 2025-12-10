@@ -104,6 +104,7 @@ class Llama(LLM):
         dDash: int = 16,
         producer_frequency: int = 4,
         keysifter_intermediate_dim: int = 1024,
+        oracle_random_indices: bool = True,
     ) -> None:
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -175,6 +176,8 @@ class Llama(LLM):
             merge_config=self.merge_config,
             keysifter_predictor=self.keysifter_predictor,
             producer_frequency=producer_frequency,
+            dDash=dDash,
+            oracle_random_indices=oracle_random_indices,
         )
 
         if self.minference:

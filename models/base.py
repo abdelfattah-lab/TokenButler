@@ -33,6 +33,7 @@ from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 from .kv_cache_xkv import ShadowKVCache_xKey, ShadowKVCache_xKV, ShadowKVCache_xKey_CPU, ShadowKVCache_xKV_CPU
 from .kv_cache_keysifter import KeySifterCache
+from .kv_cache_oracle import OracleCache
 from .merge_configs import xKVConfig
 
 class LLM:
@@ -45,7 +46,7 @@ class LLM:
         """Return record_function context if profiling is enabled, otherwise nullcontext"""
         return record_function(name) if getattr(self, '_profiling_enabled', False) else nullcontext()
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -73,6 +74,17 @@ class LLM:
                 sparse_budget=sparse_budget, 
                 chunk_size=chunk_size,
                 producer_frequency=producer_frequency,
+            )
+        elif self.attn_mode.lower() == 'oracle':
+            self.kv_cache = OracleCache(
+                config,
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                random_indices=oracle_random_indices,
             )
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
@@ -165,10 +177,10 @@ class LLM:
         elif isinstance(self.kv_cache, ShadowKVCache) or isinstance(self.kv_cache, ShadowKVCache_CPU) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey) or isinstance(self.kv_cache, ShadowKVCache_xKV) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) or \
-             isinstance(self.kv_cache, KeySifterCache):
+             isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
 
-            # Prefill: use for long sequences OR first pass of short sequences with KeySifter
-            is_keysifter_first_pass = isinstance(self.kv_cache, KeySifterCache) and self.kv_cache.prefill_len == 0
+            # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle
+            is_keysifter_first_pass = (isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache)) and self.kv_cache.prefill_len == 0
             if q_len > 1024 or is_keysifter_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):
                     # svd unrope key and save
@@ -178,8 +190,8 @@ class LLM:
                         self.kv_cache.get_svd(key_states, value_states, layer_idx, fake_svd=self.fake_svd)
                     elif isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                         self.kv_cache.get_svd(key_states, value_states, layer_idx)
-                    elif isinstance(self.kv_cache, KeySifterCache):
-                        # Store un-RoPEd keys and compute projections of keys for importance scoring
+                    elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                        # Store un-RoPEd keys and compute projections of keys for importance scoring (skipped for Oracle)
                         self.kv_cache.get_svd(key_states, layer_idx)
                     else:
                         self.kv_cache.get_svd(key_states, layer_idx)
@@ -213,15 +225,15 @@ class LLM:
                     position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
 
                 # multi-stream
-                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache):
+                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache) and not isinstance(self.kv_cache, OracleCache):
                     curr_stream = torch.cuda.current_stream()
                     get_value_stream = self.kv_cache.copy_stream
 
                 if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_value_cache_xKV_cpu"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache):
-                    with self._maybe_record_function("get_value_cache_keysifter"):
+                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                    with self._maybe_record_function("get_value_cache_keysifter_or_oracle"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
                 else:
                     with self._maybe_record_function("get_value_cache_offload_stream"):
@@ -233,8 +245,8 @@ class LLM:
                 if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache):
-                    with self._maybe_record_function("get_key_cache_keysifter"):
+                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                    with self._maybe_record_function("get_key_cache_keysifter_or_oracle"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
                 else:
                     with self._maybe_record_function("get_key_cache"):

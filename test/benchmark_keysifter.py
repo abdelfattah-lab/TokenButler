@@ -15,7 +15,7 @@ sys.path.insert(0, '/home/afa55/Projects/xKV/xKV')
 from models import Llama
 from termcolor import colored
 
-def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, predictor_path=''):
+def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, predictor_path='', oracle_random_indices=True):
     """Benchmark a single configuration."""
     print(f"\n{'='*60}")
     print(f"Benchmarking: {attn_mode.upper()} | Prompt: {prompt_length} tokens | Gen: {gen_length} tokens")
@@ -40,6 +40,13 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
             'producer_frequency': 4,
             'keysifter_intermediate_dim': 1024,
             'predictor_path': predictor_path,
+        })
+    elif attn_mode == 'oracle':
+        model_kwargs.update({
+            'sparse_budget': sparse_budget,
+            'chunk_size': 8,
+            'dDash': 16,  # Or whatever default
+            'oracle_random_indices': oracle_random_indices,
         })
     elif attn_mode == 'shadowkv':
         model_kwargs.update({
@@ -210,9 +217,12 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
 
 def plot_decode_breakdown(results_list, output_file='decode_breakdown.png'):
     """Plot decode stage time breakdown for KeySifter."""
-    # Filter for KeySifter results with sample info
+    # Filter for KeySifter or Oracle results
+    # Oracle results might not have detailed sample info if we skipped predictor, 
+    # but let's see if we added sample collection logic for it. The benchmark_model code collects samples regardless of mode.
+    # So both should have sample_info.
     keysifter_results = [r for r in results_list 
-                         if r['attn_mode'] == 'keysifter' and r.get('sample_info')]
+                         if (r['attn_mode'] == 'keysifter' or r['attn_mode'] == 'oracle') and r.get('sample_info')]
     
     if not keysifter_results:
         print("No KeySifter results with timing breakdown found.")
@@ -341,8 +351,9 @@ def main():
         # (prompt_length, gen_length)
         # (512, 32),      # Short context
         # (2048, 32),     # Medium context
-        (65536, 2048),     # Long context
-        (131072, 2048),     # Very long context
+        (32768, 1024),     # Medium context
+        # (65536, 2048),     # Long context
+        # (131072, 2048),     # Very long context
     ]
 
     all_results = []
@@ -366,6 +377,25 @@ def main():
             all_results.append(result)
         except Exception as e:
             print(f"KeySifter failed: {e}")
+
+        # Test Oracle (Random)
+        try:
+            result = benchmark_model('oracle', prompt_len, gen_len, sparse_budget=1024, oracle_random_indices=True)
+            result['attn_mode'] = 'oracle_random' # Rename for clarity in output
+            all_results.append(result)
+        except Exception as e:
+            print(f"Oracle (Random) failed: {e}")
+
+        # Wait
+        time.sleep(2)
+
+        # Test Oracle (Contiguous)
+        try:
+            result = benchmark_model('oracle', prompt_len, gen_len, sparse_budget=1024, oracle_random_indices=False)
+            result['attn_mode'] = 'oracle_contiguous' # Rename for clarity in output
+            all_results.append(result)
+        except Exception as e:
+            print(f"Oracle (Contiguous) failed: {e}")
 
         # Wait between configurations
         time.sleep(2)
