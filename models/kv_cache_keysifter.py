@@ -391,7 +391,6 @@ class KeySifterCache:
         # MODIFIED: Skip scoring and topk, use random positions instead
         # This is for benchmarking to measure topk overhead
 
-        # # Original code (commented out):
         # Compute scores: [B, num_kv_heads, num_kv_groups, 1, last_projected_pos]
         scores = torch.einsum("bhgqd,bhgkd->bhgqk", q_slot, k_proj)
         scores = scores.squeeze(3) / math.sqrt(self.dDash)  # [B, num_kv_heads, num_kv_groups, last_projected_pos]
@@ -407,37 +406,37 @@ class KeySifterCache:
         if local_start < self.last_projected_pos:
             scores[:, :, local_start:] = float("-inf")
         
+        # # Original code (commented out):
         # Select top-k positions from available tokens (projected tokens outside local window)
-        num_available = min(local_start, self.last_projected_pos)
-        num_to_select = min(self.sparse_budget, num_available)
-        if num_to_select > 0:
-            _, position_ids = torch.topk(scores, k=num_to_select, dim=-1)  # [B, num_kv_heads, sparse_budget]
-            # Sort positions for better memory access
-            position_ids, _ = position_ids.sort(dim=-1)
-        else:
-            position_ids = torch.zeros(
-                bsz, self.num_key_value_heads, 0,
-                device=self.device, dtype=torch.long
-            )
-
-        # # New code: Random selection
-        # local_start = max(0, self.kv_offset - self.local_window)
         # num_available = min(local_start, self.last_projected_pos)
         # num_to_select = min(self.sparse_budget, num_available)
-
         # if num_to_select > 0:
-        #     # Generate random positions from [0, num_available) and sort them
-        #     # Use same positions for all batches and KV heads for simplicity
-        #     random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
-        #     random_positions, _ = random_positions.sort()
-
-        #     # Expand to [bsz, num_kv_heads, num_to_select]
-        #     position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+        #     _, position_ids = torch.topk(scores, k=num_to_select, dim=-1)  # [B, num_kv_heads, sparse_budget]
+        #     # Sort positions for better memory access
+        #     position_ids, _ = position_ids.sort(dim=-1)
         # else:
         #     position_ids = torch.zeros(
         #         bsz, self.num_key_value_heads, 0,
         #         device=self.device, dtype=torch.long
         #     )
+
+        # New code: Random selection
+        num_available = min(local_start, self.last_projected_pos)
+        num_to_select = min(self.sparse_budget, num_available)
+
+        if num_to_select > 0:
+            # Generate random positions from [0, num_available) and sort them
+            # Use same positions for all batches and KV heads for simplicity
+            random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
+            random_positions, _ = random_positions.sort()
+
+            # Expand to [bsz, num_kv_heads, num_to_select]
+            position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+        else:
+            position_ids = torch.zeros(
+                bsz, self.num_key_value_heads, 0,
+                device=self.device, dtype=torch.long
+            )
 
         return position_ids
     
