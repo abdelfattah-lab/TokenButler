@@ -215,7 +215,7 @@ def run_single_benchmark(prompt_length, gen_length, sparse_budget, predictor_pat
         'sparse_budget': sparse_budget,
         'chunk_size': 8,
         'rank': 160,
-        'dDash': 16,
+        'dDash': 8,
         'producer_frequency': 4,
         'keysifter_intermediate_dim': 1024,
         'predictor_path': predictor_path,
@@ -756,7 +756,7 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
-    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_p4x.pt'
+    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash8.pt'
     
     # Key operations to track
     operations = [
@@ -778,7 +778,7 @@ def main():
             topk_values = [512, 1024, 2048]
         else:
             context_lengths = [4096, 8192, 16384, 32768, 65536]
-            topk_values = [2048]
+            topk_values = [1024, 2048, 4096]
         
         results = collect_sweep_data(context_lengths, topk_values, 
                                      args.gen_length, weights_path)

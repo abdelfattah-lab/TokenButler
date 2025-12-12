@@ -318,48 +318,84 @@ def load_keysifter_predictor(
         if missing:
             print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
         
-        # Now merge key_cache_proj from all producer layers
-        # Each producer has key_cache_proj: [total_layers, num_heads (32), head_dim, dDash]
-        # We aggregate to per-KV-head by averaging within GQA groups to save 4x memory
-        total_layers = config.num_hidden_layers
-        num_key_value_heads = getattr(config, "num_key_value_heads", num_heads)
-        num_key_value_groups = num_heads // num_key_value_heads
-        
-        # First, collect all per-attention-head projections
-        merged_key_proj_full = torch.zeros(
-            total_layers,
-            num_heads,  # 32 attention heads
-            predictor.model_head_dim,
-            dDash
-        )
-        
-        for prod_idx, state_dict in enumerate(state_dict_list):
-            # Find key_cache_proj in this state_dict
-            key_proj = None
+        # Check shape from first available key_proj to determine if we need aggregation
+        sample_key_proj = None
+        for state_dict in state_dict_list:
             for key, value in state_dict.items():
                 if 'key_cache_proj' in key:
-                    key_proj = value
+                    sample_key_proj = value
                     break
+            if sample_key_proj is not None:
+                break
+        
+        is_already_gqa = False
+        num_key_value_heads = getattr(config, "num_key_value_heads", num_heads)
+        total_layers = config.num_hidden_layers
+        
+        if sample_key_proj is not None and sample_key_proj.shape[1] == num_key_value_heads:
+            is_already_gqa = True
+            print(f"  Checkpoint has GQA shape ({num_key_value_heads} heads). Loading directly.")
+        
+        if is_already_gqa:
+             merged_key_proj = torch.zeros(
+                total_layers,
+                num_key_value_heads, 
+                predictor.model_head_dim,
+                dDash
+            )
+             for prod_idx, state_dict in enumerate(state_dict_list):
+                key_proj = None
+                for key, value in state_dict.items():
+                    if 'key_cache_proj' in key:
+                        key_proj = value
+                        break
+                
+                if key_proj is not None:
+                    start_layer = prod_idx * producer_frequency
+                    end_layer = min(start_layer + producer_frequency, total_layers)
+                    
+                    for layer_idx in range(start_layer, end_layer):
+                        if layer_idx < key_proj.shape[0]:
+                            merged_key_proj[layer_idx] = key_proj[layer_idx]
+                    
+                    print(f"  Producer {prod_idx}: loaded key_cache_proj for layers {start_layer}-{end_layer-1}")
+        else:
+            # Aggregate per-attention-head projections to per-KV-head by averaging within GQA groups
+            # First, collect all per-attention-head projections
+            merged_key_proj_full = torch.zeros(
+                total_layers,
+                num_heads,  # 32 attention heads
+                predictor.model_head_dim,
+                dDash
+            )
             
-            if key_proj is not None:
-                # Determine which layers this producer serves
-                start_layer = prod_idx * producer_frequency
-                end_layer = min(start_layer + producer_frequency, total_layers)
+            for prod_idx, state_dict in enumerate(state_dict_list):
+                # Find key_cache_proj in this state_dict
+                key_proj = None
+                for key, value in state_dict.items():
+                    if 'key_cache_proj' in key:
+                        key_proj = value
+                        break
                 
-                # Copy the projections for these layers
-                for layer_idx in range(start_layer, end_layer):
-                    if layer_idx < key_proj.shape[0]:
-                        merged_key_proj_full[layer_idx] = key_proj[layer_idx]
-                
-                print(f"  Producer {prod_idx}: loaded key_cache_proj for layers {start_layer}-{end_layer-1}")
-        
-        # Aggregate per-attention-head projections to per-KV-head by averaging within GQA groups
-        # [total_layers, 32, head_dim, dDash] -> [total_layers, 8, 4, head_dim, dDash] -> mean -> [total_layers, 8, head_dim, dDash]
-        merged_key_proj = merged_key_proj_full.view(
-            total_layers, num_key_value_heads, num_key_value_groups, predictor.model_head_dim, dDash
-        ).mean(dim=2)
-        
-        print(f"  Aggregated key_cache_proj: {num_heads} attention heads -> {num_key_value_heads} KV heads (averaged within GQA groups)")
+                if key_proj is not None:
+                    # Determine which layers this producer serves
+                    start_layer = prod_idx * producer_frequency
+                    end_layer = min(start_layer + producer_frequency, total_layers)
+                    
+                    # Copy the projections for these layers
+                    for layer_idx in range(start_layer, end_layer):
+                        if layer_idx < key_proj.shape[0]:
+                            merged_key_proj_full[layer_idx] = key_proj[layer_idx]
+                    
+                    print(f"  Producer {prod_idx}: loaded key_cache_proj for layers {start_layer}-{end_layer-1}")
+
+            # [total_layers, 32, head_dim, dDash] -> [total_layers, 8, 4, head_dim, dDash] -> mean -> [total_layers, 8, head_dim, dDash]
+            num_key_value_groups = num_heads // num_key_value_heads
+            merged_key_proj = merged_key_proj_full.view(
+                total_layers, num_key_value_heads, num_key_value_groups, predictor.model_head_dim, dDash
+            ).mean(dim=2)
+            
+            print(f"  Aggregated key_cache_proj: {num_heads} attention heads -> {num_key_value_heads} KV heads (averaged within GQA groups)")
         
         # Assign aggregated key_cache_proj
         predictor.key_cache_proj.data.copy_(merged_key_proj)

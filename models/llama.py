@@ -105,6 +105,7 @@ class Llama(LLM):
         producer_frequency: int = 4,
         keysifter_intermediate_dim: int = 1024,
         oracle_random_indices: bool = True,
+        page_size: int = 1,
     ) -> None:
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -178,6 +179,7 @@ class Llama(LLM):
             producer_frequency=producer_frequency,
             dDash=dDash,
             oracle_random_indices=oracle_random_indices,
+            page_size=page_size,
         )
 
         if self.minference:

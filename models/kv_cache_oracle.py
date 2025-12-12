@@ -36,6 +36,7 @@ class OracleCache:
         chunk_size: int = 8,
         producer_frequency: int = 4, # Kept for API compatibility, unused
         random_indices: bool = True,
+        page_size: int = 1,
     ) -> None:
         """
         Args:
@@ -48,6 +49,7 @@ class OracleCache:
             chunk_size: Chunk size for selection (for compatibility)
             producer_frequency: Unused
             random_indices: If True, select random indices. If False, select first k contiguous indices.
+            page_size: Size of contiguous pages to select randomly.
         """
         self.config = config
         self.batch_size = batch_size
@@ -64,6 +66,7 @@ class OracleCache:
         self.chunk_size = chunk_size
         self.producer_frequency = producer_frequency # Unused
         self.random_indices = random_indices
+        self.page_size = page_size
         
         # Local window to always include (similar to ShadowKV)
         self.local_window = 32  # Always include last N tokens
@@ -121,7 +124,7 @@ class OracleCache:
         self.copy_stream = torch.cuda.Stream()
 
     def print_stats(self):
-        print(f"OracleCache | sparse_budget {self.sparse_budget} | random_indices {self.random_indices} | cached {self.kv_offset}")
+        print(f"OracleCache | sparse_budget {self.sparse_budget} | random_indices {self.random_indices} | page_size {self.page_size} | cached {self.kv_offset}")
 
     def get_kv_len(self):
         return self.kv_offset
@@ -259,20 +262,51 @@ class OracleCache:
             local_start = max(0, self.kv_offset - self.local_window)
             num_available = local_start # Can pick from [0, local_start)
             
-            num_to_select = min(self.sparse_budget, num_available)
-            
-            if num_to_select > 0:
-                # Generate random positions from [0, num_available) and sort them
-                random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
-                random_positions, _ = random_positions.sort()
-
-                # Expand to [bsz, num_kv_heads, num_to_select]
-                position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+            if self.page_size > 1:
+                # Paged random selection
+                num_pages_available = num_available // self.page_size
+                num_pages_to_select = self.sparse_budget // self.page_size
+                
+                # Ensure we don't select more pages than available
+                num_pages_to_select = min(num_pages_to_select, num_pages_available)
+                
+                if num_pages_to_select > 0:
+                    # Pick random pages
+                    random_page_indices = torch.randperm(num_pages_available, device=self.device)[:num_pages_to_select]
+                    random_page_indices, _ = random_page_indices.sort()
+                    
+                    # Expand to full token indices
+                    # [num_pages_to_select] -> [num_pages_to_select, page_size]
+                    base_indices = random_page_indices * self.page_size
+                    offsets = torch.arange(self.page_size, device=self.device)
+                    
+                    # [num_pages, 1] + [1, page_size] = [num_pages, page_size]
+                    full_indices = base_indices.unsqueeze(1) + offsets.unsqueeze(0)
+                    full_indices = full_indices.view(-1)
+                    
+                    # Expand to batch/heads like before
+                    position_ids = full_indices.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+                else:
+                    position_ids = torch.zeros(
+                        bsz, self.num_key_value_heads, 0,
+                        device=self.device, dtype=torch.long
+                    )
             else:
-                position_ids = torch.zeros(
-                    bsz, self.num_key_value_heads, 0,
-                    device=self.device, dtype=torch.long
-                )
+                # Standard random selection
+                num_to_select = min(self.sparse_budget, num_available)
+                
+                if num_to_select > 0:
+                    # Generate random positions from [0, num_available) and sort them
+                    random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
+                    random_positions, _ = random_positions.sort()
+
+                    # Expand to [bsz, num_kv_heads, num_to_select]
+                    position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
+                else:
+                    position_ids = torch.zeros(
+                        bsz, self.num_key_value_heads, 0,
+                        device=self.device, dtype=torch.long
+                    )
         else:
             # Contiguous First-K selection
             # Just select [0, 1, ..., sparse_budget-1]
