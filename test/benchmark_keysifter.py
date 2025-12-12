@@ -12,6 +12,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 sys.path.insert(0, '/home/afa55/Projects/xKV/xKV')
 
+# Suppress dynamo errors/warnings to avoid spam from skipped CUDAGraphs
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 from models import Llama
 from termcolor import colored
 
@@ -57,6 +61,8 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
 
     print("Initializing model...")
     llm = Llama(**model_kwargs)
+    
+
 
     # Create prompt
     # Use repeated text to reach desired length
@@ -90,6 +96,18 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
     print(f"  Time: {prefill_time:.4f}s")
     print(f"  Throughput: {prefill_tokens_per_sec:.2f} tokens/s")
 
+    if False:
+        # Apply torch.compile AFTER prefill to optimize decode runtime (max-autotune)
+        # This avoids CUDAGraphs errors during prefill chunking loops
+        try:
+            print(f"Compiling model components with torch.compile (max-autotune) for decode...")
+            # Compile layer_compute (most critical)
+            llm.layer_compute = torch.compile(llm.layer_compute, mode="max-autotune")
+            llm.pre_attention_compute = torch.compile(llm.pre_attention_compute, mode="max-autotune") 
+            llm.post_attention_compute = torch.compile(llm.post_attention_compute, mode="max-autotune")
+        except Exception as e:
+            print(f"Compilation warning: {e}")
+
     # Benchmark decode (sampled timings)
     print("\n[DECODE]")
     # Time the Host->Device transfer for KV cache
@@ -122,6 +140,9 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
     for i in range(gen_length):
         # wall-clock start
         torch.cuda.synchronize()
+        # Mark step begin for CUDAGraphs (max-autotune) reliability
+        torch.compiler.cudagraph_mark_step_begin()
+        
         start = time.perf_counter()
 
         next_token = logits.argmax(dim=-1)
@@ -344,7 +365,7 @@ def main():
     print(colored("="*80, 'cyan'))
 
     # Path to trained KeySifter weights
-    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_p4x.pt'
+    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash16.pt'
 
     # Test configurations
     configs = [

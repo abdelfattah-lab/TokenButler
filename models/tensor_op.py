@@ -24,17 +24,29 @@
 import torch
 from torch.nn import functional as F
 
-from flashinfer.norm import rmsnorm
+# from flashinfer.norm import rmsnorm
 from minference import vertical_slash_sparse_attention, block_sparse_attention, streaming_forward
 
 from kernels import shadowkv
+
+# def layer_norm(
+#     hidden_states: torch.Tensor,
+#     eps: float,
+#     w: torch.Tensor,
+# ):
+#     return rmsnorm(hidden_states.view(-1, hidden_states.size(-1)), w, eps).view_as(hidden_states)
 
 def layer_norm(
     hidden_states: torch.Tensor,
     eps: float,
     w: torch.Tensor,
 ):
-    return rmsnorm(hidden_states.view(-1, hidden_states.size(-1)), w, eps).view_as(hidden_states)
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    hidden_states = w * hidden_states.to(input_dtype)
+    return hidden_states
 
 # def layer_norm(
 #     hidden_states: torch.Tensor,
