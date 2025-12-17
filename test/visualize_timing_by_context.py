@@ -27,6 +27,7 @@ COLORS['flash_attn_compute'] = '#D55E00'      # Vermilion
 COLORS['qkv_projection'] = '#56B4E9'          # Sky Blue
 COLORS['rope_embedding'] = '#0072B2'          # Blueish Green
 COLORS['mlp_compute'] = '#F0E442'             # Yellow
+COLORS['prepare_tensors'] = '#AA4499'         # Purple (new)
 
 import torch
 import gc
@@ -258,6 +259,7 @@ def plot_stacked_area_by_context_absolute(results, operations, output_dir):
         labels_map['qkv_projection'] = 'QKV Projection'
         labels_map['rope_embedding'] = 'RoPE'
         labels_map['mlp_compute'] = 'MLP & Output'
+        labels_map['prepare_tensors'] = 'Tensor Prep'
         
         ax.stackplot(ctx_lengths, stacked_data, labels=[labels_map.get(op, op) for op in operations],
                     colors=local_colors, alpha=0.85)
@@ -300,17 +302,18 @@ def main():
     weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash16.pt'
     
     operations = [
-        'qkv_projection',  # Added
-        'predictor_forward',
-        'compute_scores',
-        'topk_selection',
-        'get_key_cache_total',
-        'get_value_cache_total',
-        'rope_embedding',  # Added
-        'update_kv_cache_total',
-        'flash_attn_compute',
-        'mlp_compute',     # Added
-        'other_model_ops',
+        'qkv_projection',  # Pre-attention QKV projection
+        'predictor_forward',  # KeySifter predictor forward pass
+        'prepare_tensors',  # Tensor reshaping for batched operations
+        'compute_scores',  # Score computation via einsum
+        'topk_selection',  # TopK selection
+        'get_key_cache_total',  # Key gathering
+        'get_value_cache_total',  # Value gathering
+        'rope_embedding',  # RoPE embedding
+        'update_kv_cache_total',  # KV cache update (not currently instrumented in KeySifterCache)
+        'flash_attn_compute',  # Flash attention kernel
+        'mlp_compute',  # MLP/FFN computation
+        'other_model_ops',  # Residual overhead
     ]
     
     results = None

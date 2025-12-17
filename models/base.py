@@ -213,13 +213,13 @@ class LLM:
                 with self._maybe_record_function("update_kv_cache"):
                     self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
 
-                # KeySifter: compute importance queries at producer layers
+                # KeySifter: compute importance queries and refetch for layer group at producer layers
                 if isinstance(self.kv_cache, KeySifterCache):
                     producer_frequency = self.kv_cache.producer_frequency
                     if layer_idx % producer_frequency == 0:
-                        with self._maybe_record_function("keysifter_predictor"):
+                        with self._maybe_record_function("keysifter_prefetch"):
                             # hidden_states here is the residual (pre-attention), we need to pass it
-                            self.kv_cache.compute_predictor_importance(residual, layer_idx)
+                            self.kv_cache.prefetch_layer_group(residual, layer_idx)
 
                 # get retrieval idx
                 with self._maybe_record_function("get_retrieval_position_ids"):

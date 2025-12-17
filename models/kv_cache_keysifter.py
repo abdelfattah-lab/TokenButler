@@ -146,7 +146,19 @@ class KeySifterCache:
         # Shape: [batch*heads, N_slots, 1, dDash] (for decode, Lq=1)
         self.q_importance_cache = None
         
+        # Optional profiler for timing instrumentation (set externally)
+        self.profiler = None
+        
         self.copy_stream = torch.cuda.Stream()
+    
+    def _record(self, name):
+        """Context manager for profiling. No-op if profiler is None."""
+        if self.profiler is not None:
+            return self.profiler.record(name)
+        else:
+            # Return a no-op context manager
+            from contextlib import nullcontext
+            return nullcontext()
     
     def print_stats(self):
         print(f"KeySifterCache | sparse_budget {self.sparse_budget} | producer_freq {self.producer_frequency} | dDash {self.dDash} | cached {self.kv_offset}")
@@ -318,193 +330,132 @@ class KeySifterCache:
                     # Update tracking - all buffer contents are now archived
                     self.last_projected_pos = end_pos
     
-    def compute_predictor_importance(
+    def prefetch_layer_group(
         self,
         hidden_states: torch.Tensor,
-        layer_idx: int,
+        start_layer_idx: int,
     ):
         """
-        Compute importance queries using the predictor.
-        Called at producer layers.
+        Compute importance queries and perform batched retrieval for a group of layers.
+        Called at producer layers (every producer_frequency layers).
         
         Args:
             hidden_states: [bsz, seq_len, hidden_size] - hidden states (can be 1 for decode or longer)
-            layer_idx: Layer index
+            start_layer_idx: Start layer index of the group
         """
         # Only use the last token's hidden state for importance computation
-        # This ensures consistent behavior during both prefill and decode
         if hidden_states.shape[1] > 1:
             hidden_states = hidden_states[:, -1:, :]
+            
+        bsz = hidden_states.shape[0]
         
-        # Compute importance queries
-        # Output: [B*H, N_slots, 1, dDash]
-        q_importance = self.predictor(hidden_states, producer_layer_idx=layer_idx)
-        self.q_importance_cache = q_importance
-    
+        # 1. Predict Importance Queries
+        with self._record('predictor_forward'):
+            q_importance = self.predictor(hidden_states, producer_layer_idx=start_layer_idx)
+        
+        # 2. Batched Scoring & Selection & Retrieval
+        producer_group_size = self.producer_frequency
+        end_layer_idx = min(start_layer_idx + producer_group_size, self.num_hidden_layers)
+        num_layers_in_group = end_layer_idx - start_layer_idx
+        
+        # Reshape and prepare tensors for batched operations
+        with self._record('prepare_tensors'):
+            # q_importance: [B*num_attn_heads, N_slots, 1, dDash] -> [B, num_attn_heads, N_slots, 1, dDash]
+            q_importance = q_importance.view(bsz, self.num_attention_heads, self.producer_frequency, 1, self.dDash)
+            q_group = q_importance[:, :, :num_layers_in_group, 0, :]  # [B, num_attn_heads, num_layers, dDash]
+            q_group = q_group.permute(0, 2, 1, 3).unsqueeze(3)  # [B, num_layers, num_attn_heads, 1, dDash]
+            
+            # Get Projected Keys for these layers
+            k_proj_group = self.k_proj_cache[start_layer_idx:end_layer_idx, :, :, :self.last_projected_pos, :]
+            k_proj_group = k_proj_group.permute(1, 0, 2, 3, 4).unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, limit, dDash]
+            
+            # Broadcast q_group to match KV heads (GQA)
+            q_group = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
+            k_proj_group = k_proj_group.unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, 1, limit, dDash]
+        
+        # 3. Compute Scores (Batched)
+        with self._record('compute_scores'):
+            scores = torch.einsum("blhgqd,blhgqkd->blhgqk", q_group, k_proj_group)
+            scores = scores.squeeze(4) / math.sqrt(self.dDash)  # [B, Layers, KvH, Grp, Limit]
+            scores = scores.max(dim=3).values  # [B, Layers, KvH, Limit]
+            
+            # Mask local window
+            local_start = max(0, self.kv_offset - self.local_window)
+            if local_start < self.last_projected_pos:
+                scores[:, :, :, local_start:] = float("-inf")
+            
+        # 4. Select Indices (Batched)
+        num_available = min(local_start, self.last_projected_pos)
+        num_to_select = min(self.sparse_budget, num_available)
+        
+        if num_to_select > 0:
+            with self._record('topk_selection'):
+                _, topk_indices = torch.topk(scores, k=num_to_select, dim=-1)  # [B, Layers, KvH, budget]
+                topk_indices, _ = topk_indices.sort(dim=-1)
+            
+            # 5. Batched Retrieval (Gather)
+            # Prepare indices: [Layers, B, KvH, budget, HeadDim]
+            indices_perm = topk_indices.permute(1, 0, 2, 3)
+            indices_expanded = indices_perm.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
+            
+            sparse_start = self.local_window
+            k_source = self.k_cache[start_layer_idx:end_layer_idx]
+            v_source = self.v_cache[start_layer_idx:end_layer_idx]
+            
+            # Gather K
+            with self._record('get_key_cache_total'):
+                out_k = self.k_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
+                torch.gather(k_source, dim=3, index=indices_expanded, out=out_k)
+            
+            # Gather V
+            with self._record('get_value_cache_total'):
+                out_v = self.v_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
+                torch.gather(v_source, dim=3, index=indices_expanded, out=out_v)
+            
+        else:
+            pass  # Nothing to select, buffer already has local window (handled by update)
+
     def get_retrieval_position_ids(
         self,
         layer_idx: int,
         query_states: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """
-        Get position IDs for sparse attention based on importance scores.
-        
-        Args:
-            layer_idx: Layer index
-            query_states: [bsz, num_heads, 1, head_dim] - query states (for interface compatibility)
-            
-        Returns:
-            position_ids: [bsz, num_kv_heads, sparse_budget] - selected positions
+        No-op for batched KeySifter.
         """
-        bsz = query_states.shape[0]
-        
-        # Determine which slot to use (within producer group)
-        slot_idx = layer_idx % self.producer_frequency
-        
-        # Get importance queries for this slot
-        if self.q_importance_cache is None:
-            raise RuntimeError("Importance queries not computed. Call compute_predictor_importance first.")
-        
-        # q_importance: [B*num_attention_heads, N_slots, Lq, dDash] where Lq should be 1
-        # (predictor uses num_attention_heads=32, not num_kv_heads=8)
-        # Select slot: [B*num_attention_heads, Lq, dDash]
-        q_slot = self.q_importance_cache[:, slot_idx, :, :]  # [B*32, Lq, dDash]
-        
-        # Get projected keys up to last projected position (includes prefill + archived decode tokens)
-        # k_proj: [B, num_key_value_heads, last_projected_pos, dDash]
-        k_proj = self.k_proj_cache[layer_idx, :, :, :self.last_projected_pos]
-        
-        # Reshape q_slot: [B*num_attention_heads, Lq, dDash] -> [B, num_attention_heads, Lq, dDash]
-        Lq = q_slot.shape[1]
-        q_slot = q_slot.view(bsz, self.num_attention_heads, Lq, self.dDash)
-        
-        # Use only the last query position for scoring
-        q_slot = q_slot[:, :, -1:, :]  # [B, num_attention_heads, 1, dDash]
-        
-        # Efficient scoring with broadcasting:
-        # q_slot: [B, num_attention_heads, 1, dDash] -> reshape to [B, num_kv_heads, num_kv_groups, 1, dDash]
-        # k_proj: [B, num_key_value_heads, last_projected_pos, dDash] -> [B, num_kv_heads, 1, last_projected_pos, dDash]
-        # This broadcasts k_proj across the num_kv_groups dimension efficiently
-        q_slot = q_slot.view(bsz, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
-        k_proj = k_proj.unsqueeze(2)  # [B, num_kv_heads, 1, last_projected_pos, dDash]
-
-        # MODIFIED: Skip scoring and topk, use random positions instead
-        # This is for benchmarking to measure topk overhead
-
-        # Compute scores: [B, num_kv_heads, num_kv_groups, 1, last_projected_pos]
-        scores = torch.einsum("bhgqd,bhgkd->bhgqk", q_slot, k_proj)
-        scores = scores.squeeze(3) / math.sqrt(self.dDash)  # [B, num_kv_heads, num_kv_groups, last_projected_pos]
-        
-        # Aggregate scores from attention heads to KV heads
-        # Use max across the group (if any attention head thinks a token is important, keep it)
-        scores = scores.max(dim=2).values  # [B, num_kv_heads, last_projected_pos]
-        
-        # Don't include local window positions (they're always included)
-        # Local window is the most recent tokens: [kv_offset - local_window : kv_offset]
-        # We mask out any projected tokens that fall in this range
-        local_start = max(0, self.kv_offset - self.local_window)
-        if local_start < self.last_projected_pos:
-            scores[:, :, local_start:] = float("-inf")
-        
-        # # Original code (commented out):
-        # Select top-k positions from available tokens (projected tokens outside local window)
-        # num_available = min(local_start, self.last_projected_pos)
-        # num_to_select = min(self.sparse_budget, num_available)
-        # if num_to_select > 0:
-        #     _, position_ids = torch.topk(scores, k=num_to_select, dim=-1)  # [B, num_kv_heads, sparse_budget]
-        #     # Sort positions for better memory access
-        #     position_ids, _ = position_ids.sort(dim=-1)
-        # else:
-        #     position_ids = torch.zeros(
-        #         bsz, self.num_key_value_heads, 0,
-        #         device=self.device, dtype=torch.long
-        #     )
-
-        # New code: Random selection
-        num_available = min(local_start, self.last_projected_pos)
-        num_to_select = min(self.sparse_budget, num_available)
-
-        if num_to_select > 0:
-            # Generate random positions from [0, num_available) and sort them
-            # Use same positions for all batches and KV heads for simplicity
-            random_positions = torch.randperm(num_available, device=self.device)[:num_to_select]
-            random_positions, _ = random_positions.sort()
-
-            # Expand to [bsz, num_kv_heads, num_to_select]
-            position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
-        else:
-            position_ids = torch.zeros(
-                bsz, self.num_key_value_heads, 0,
-                device=self.device, dtype=torch.long
-            )
-
-        return position_ids
+        return None
     
     def get_key_cache(
         self,
         layer_idx: int,
-        position_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         rope_func: Callable = None,
         cos_sin_cache: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Gather selected keys from cache (already RoPEd).
-
-        Args:
-            layer_idx: Layer index
-            position_ids: [bsz, num_kv_heads, sparse_budget] - positions to retrieve
-            rope_func: Unused (kept for interface compatibility). Keys are already RoPEd.
-            cos_sin_cache: Unused (kept for interface compatibility)
-
-        Returns:
-            key_states: [bsz, num_kv_heads, total_len, head_dim] - local + sparse selected keys
+        Return the pre-fetched key cache buffer.
         """
-        num_selected = position_ids.shape[-1]
-
-        # Gather selected keys from main cache (already RoPEd - stored during prefill or archived)
-        # OPTIMIZATION: Use out= parameter to write directly to buffer, eliminating intermediate tensor
-        index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        sparse_start = self.local_window
-        torch.gather(
-            self.k_cache[layer_idx],
-            dim=2,
-            index=index,
-            out=self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
-        )
-
-        # Return buffer: [local_window (circular) | sparse_selected]
-        # Order doesn't matter for flash attention as long as K and V are aligned
+        # We assume local window + sparse budget are already populated in the buffer
+        # Logic for how many tokens to return:
+        # If we selected num_to_select tokens, total is local_window + num_to_select
+        # We typically fill up to sparse_budget if available.
+        
+        num_available = min(max(0, self.kv_offset - self.local_window), self.last_projected_pos)
+        num_selected = min(self.sparse_budget, num_available)
         total_len = self.local_window + num_selected
+        
         return self.k_cache_buffer[layer_idx, :, :, :total_len]
     
     def get_value_cache(
         self,
         layer_idx: int,
-        position_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Gather selected values from cache.
-
-        Args:
-            layer_idx: Layer index
-            position_ids: [bsz, num_kv_heads, sparse_budget] - positions to retrieve
-
-        Returns:
-            value_states: [bsz, num_kv_heads, total_len, head_dim] - local + sparse selected values
+        Return the pre-fetched value cache buffer.
         """
-        num_selected = position_ids.shape[-1]
-
-        # Gather selected values from main cache
-        # OPTIMIZATION: Use out= parameter to write directly to buffer, eliminating intermediate tensor
-        index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        sparse_start = self.local_window
-        torch.gather(
-            self.v_cache[layer_idx],
-            dim=2,
-            index=index,
-            out=self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
-        )
-
-        # Return buffer: [local_window (circular) | sparse_selected]
+        num_available = min(max(0, self.kv_offset - self.local_window), self.last_projected_pos)
+        num_selected = min(self.sparse_budget, num_available)
         total_len = self.local_window + num_selected
+        
         return self.v_cache_buffer[layer_idx, :, :, :total_len]
