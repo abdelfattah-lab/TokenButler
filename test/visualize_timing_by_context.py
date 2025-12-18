@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize KeySifter absolute timing breakdown trends across context lengths.
+Visualize timing breakdown trends across context lengths for different attention modes.
 """
 
 import sys
@@ -51,9 +51,10 @@ plt.rcParams.update({
     'axes.spines.right': False,
 })
 
-def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, predictor_path):
+def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, predictor_path, attn_mode='keysifter'):
     """Run benchmark for a single configuration, measuring TOTAL step time."""
-    print(f"\n  → Context: {prompt_length:,} | topK: {sparse_budget:,}")
+    mode_str = f"topK: {sparse_budget:,}" if attn_mode == 'keysifter' else f"Mode: {attn_mode}"
+    print(f"\n  → Context: {prompt_length:,} | {mode_str}")
     
     model_kwargs = {
         'model_name': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
@@ -61,20 +62,26 @@ def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, pr
         'max_length': 136072,  # Large enough
         'device': 'cuda:0',
         'dtype': torch.bfloat16,
-        'attn_mode': 'keysifter',
-        'sparse_budget': sparse_budget,
-        'chunk_size': 8,
-        'rank': 160,
-        'dDash': 16,
-        'producer_frequency': 4,
-        'keysifter_intermediate_dim': 1024,
-        'predictor_path': predictor_path,
+        'attn_mode': attn_mode,
     }
+    
+    if attn_mode == 'keysifter':
+        model_kwargs.update({
+            'sparse_budget': sparse_budget,
+            'chunk_size': 8,
+            'rank': 160,
+            'dDash': 16,
+            'producer_frequency': 4,
+            'keysifter_intermediate_dim': 1024,
+            'predictor_path': predictor_path,
+        })
 
     llm = Llama(**model_kwargs)
     profiler = DetailedProfiler()
     profiler.active = False # Ensure not profiling prefill
-    monkey_patch_keysifter_for_profiling(llm, profiler)
+    
+    if attn_mode == 'keysifter':
+        monkey_patch_keysifter_for_profiling(llm, profiler)
     
     
     # --- Comprehensive Monkey Patching ---
@@ -164,31 +171,48 @@ def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, pr
         'prompt_length': actual_prompt_len,
         'sparse_budget': sparse_budget,
         'profiling_stats': stats,
+        'attn_mode': attn_mode,
     }
 
-def collect_sweep_data_with_total(context_lengths, topk_values, gen_length, predictor_path):
+def collect_sweep_data_with_total(context_lengths, topk_values, gen_length, predictor_path, attn_mode='keysifter'):
     """Run benchmarks across all configurations using the new total-aware runner."""
     results = []
     
-    total_configs = len(context_lengths) * len(topk_values)
+    # If not keysifter, we only iterate context lengths, topk is ignored/dummy
+    if attn_mode != 'keysifter':
+        # Just use one dummy topk value to iterate context lengths once
+        iter_topk = [0] 
+    else:
+        iter_topk = topk_values
+
+    total_configs = len(context_lengths) * len(iter_topk)
     print(f"\n{'='*60}")
-    print(f"Running {total_configs} configurations (measuring Total Time)...")
+    print(f"Running {total_configs} configurations (Mode: {attn_mode})...")
     print(f"{'='*60}")
     
     for ctx_len in context_lengths:
-        for topk in topk_values:
-            if topk > ctx_len // 2:
-                print(f"  → Skipping topK={topk} > context/2 for ctx={ctx_len}")
-                continue
+        for topk in iter_topk:
+            if attn_mode == 'keysifter':
+                if topk > ctx_len // 2:
+                    print(f"  → Skipping topK={topk} > context/2 for ctx={ctx_len}")
+                    continue
             
-            result = run_single_benchmark_with_total(ctx_len, gen_length, topk, predictor_path)
+            # Pass actual topk only if keysifter, else 0/dummy
+            budget = topk if attn_mode == 'keysifter' else 0
+            
+            result = run_single_benchmark_with_total(ctx_len, gen_length, budget, predictor_path, attn_mode=attn_mode)
             results.append(result)
     
     return results
 
 
-def plot_stacked_area_by_context_absolute(results, operations, output_dir):
+def plot_stacked_area_by_context_absolute(results, operations, output_dir, mode_name="KeySifter"):
     """Create stacked area chart: ABSOLUTE time breakdown vs context length, faceted by topK."""
+    
+    # If not faceted by topK (e.g. baseline), we treat it as a single group
+    # But for consistency, let's look at how results are structured.
+    # If mode is not keysifter, 'sparse_budget' is likely 0 or dummy.
+    
     topk_values = sorted(set(r['sparse_budget'] for r in results))
     
     n_topk = len(topk_values)
@@ -197,7 +221,6 @@ def plot_stacked_area_by_context_absolute(results, operations, output_dir):
         axes = [axes]
     
     # Track max Y for setting consistent limits if desired, or let them float
-    # For comparison, fixed limits might be better, but let's see range first.
     # We will share Y axis so they match automatically.
     
     for ax_idx, topk in enumerate(topk_values):
@@ -265,7 +288,12 @@ def plot_stacked_area_by_context_absolute(results, operations, output_dir):
                     colors=local_colors, alpha=0.85)
         
         ax.set_xlabel('Context Length (tokens)')
-        ax.set_title(f'topK = {topk:,}', fontweight='bold')
+        
+        if mode_name == 'KeySifter':
+            ax.set_title(f'topK = {topk:,}', fontweight='bold')
+        else:
+            ax.set_title(f'{mode_name}', fontweight='bold')
+
         ax.set_xlim(min(ctx_lengths), max(ctx_lengths))
         ax.grid(axis='y', alpha=0.3, linestyle='--')
         
@@ -276,24 +304,28 @@ def plot_stacked_area_by_context_absolute(results, operations, output_dir):
     
     # Legend
     handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles[::-1], labels[::-1], loc='center right', bbox_to_anchor=(1.15, 0.5),
+    # Use center left anchor at x=1.02 to ensure it starts outside the plot area
+    # instead of center right at x=1.15 which might grow leftwards into the plot
+    fig.legend(handles[::-1], labels[::-1], loc='center left', bbox_to_anchor=(1.02, 0.5),
               frameon=True, fancybox=True, shadow=True)
     
-    fig.suptitle('KeySifter Time per Token Breakdown vs Context Length', 
+    fig.suptitle(f'{mode_name} Time per Token Breakdown vs Context Length', 
                 fontsize=14, fontweight='bold', y=1.02)
     
     plt.tight_layout()
-    output_path = output_dir / 'timing_stacked_by_context.png'
+    output_filename = f'timing_stacked_{mode_name.lower().replace(" ", "_")}_by_context.png'
+    output_path = output_dir / output_filename
     plt.savefig(output_path, bbox_inches='tight', dpi=300)
     print(f"  → Saved: {output_path}")
     plt.close()
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize KeySifter absolute timing trends')
+    parser = argparse.ArgumentParser(description='Visualize absolute timing trends')
     parser.add_argument('--quick', action='store_true', help='Quick mode with fewer configs')
     parser.add_argument('--gen-length', type=int, default=1024, help='Generation length per config')
     parser.add_argument('--output-dir', type=str, default='test/output', help='Output directory')
     parser.add_argument('--load-cache', type=str, help='Load cached results from JSON')
+    parser.add_argument('--mode', type=str, default='keysifter', choices=['keysifter', 'full'], help='Attention mode (keysifter or full)')
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
@@ -301,20 +333,33 @@ def main():
     
     weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash16.pt'
     
-    operations = [
-        'qkv_projection',  # Pre-attention QKV projection
-        'predictor_forward',  # KeySifter predictor forward pass
-        'prepare_tensors',  # Tensor reshaping for batched operations
-        'compute_scores',  # Score computation via einsum
-        'topk_selection',  # TopK selection
-        'get_key_cache_total',  # Key gathering
-        'get_value_cache_total',  # Value gathering
-        'rope_embedding',  # RoPE embedding
-        'update_kv_cache_total',  # KV cache update (not currently instrumented in KeySifterCache)
-        'flash_attn_compute',  # Flash attention kernel
-        'mlp_compute',  # MLP/FFN computation
-        'other_model_ops',  # Residual overhead
-    ]
+    # Define operations based on mode
+    if args.mode == 'keysifter':
+        operations = [
+            'qkv_projection',
+            'predictor_forward',
+            'prepare_tensors',
+            'compute_scores',
+            'topk_selection',
+            'get_key_cache_total',
+            'get_value_cache_total',
+            'rope_embedding',
+            'update_kv_cache_total',
+            'flash_attn_compute',
+            'mlp_compute',
+            'other_model_ops',
+        ]
+        mode_display_name = "KeySifter"
+    else:
+        # Full Attention (Baseline)
+        operations = [
+            'qkv_projection',
+            'rope_embedding',
+            'flash_attn_compute',
+            'mlp_compute',
+            'other_model_ops',
+        ]
+        mode_display_name = "Baseline"
     
     results = None
     if args.load_cache and Path(args.load_cache).exists():
@@ -334,16 +379,18 @@ def main():
         
         # Use new collection function
         results = collect_sweep_data_with_total(context_lengths, topk_values, 
-                                     args.gen_length, weights_path)
+                                     args.gen_length, weights_path, attn_mode=args.mode)
                                      
         # Save results
-        cache_file = output_dir / 'timing_sweep_results_absolute.json'
+        cache_filename = f'timing_sweep_results_{args.mode}.json'
+        cache_file = output_dir / cache_filename
         with open(cache_file, 'w') as f:
              json_results = []
              for r in results:
                  jr = {
                      'prompt_length': r['prompt_length'],
                      'sparse_budget': r['sparse_budget'],
+                     'attn_mode': r.get('attn_mode', 'keysifter'),
                      'profiling_stats': {
                          op: {k: float(v) for k, v in stats.items()}
                          for op, stats in r['profiling_stats'].items()
@@ -357,7 +404,7 @@ def main():
     print("Creating visualization...")
     print(f"{'='*60}")
     
-    plot_stacked_area_by_context_absolute(results, operations, output_dir)
+    plot_stacked_area_by_context_absolute(results, operations, output_dir, mode_name=mode_display_name)
     print(f"\n{colored('✓ Visualization saved to ' + str(output_dir), 'green')}")
 
 if __name__ == '__main__':
