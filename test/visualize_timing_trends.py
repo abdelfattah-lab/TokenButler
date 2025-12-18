@@ -62,11 +62,12 @@ OPERATION_LABELS = {
 
 
 class DetailedProfiler:
-    """Context manager for detailed CUDA timing."""
+    """Context manager for detailed CUDA timing with deferred synchronization."""
     
     def __init__(self):
         self.timings = defaultdict(list)
         self.active = True
+        self.pending_events = []
         
     def record(self, name):
         """Returns a context manager for timing a specific operation."""
@@ -85,11 +86,28 @@ class DetailedProfiler:
             def __exit__(self, *args):
                 if self.profiler.active:
                     self.end_event.record()
-                    torch.cuda.synchronize()
-                    elapsed = self.start_event.elapsed_time(self.end_event) / 1000.0
-                    self.profiler.timings[self.name].append(elapsed)
+                    # Defer synchronization!
+                    self.profiler.pending_events.append((self.name, self.start_event, self.end_event))
         
         return Timer(self, name)
+    
+    def step(self):
+        """
+        Synchronize and process all pending events for this step.
+        Must be called once at the end of each sampled step.
+        """
+        if not self.active or not self.pending_events:
+            self.pending_events = [] # Clear anyway just in case
+            return
+
+        # Single synchronization point for the whole step
+        torch.cuda.synchronize()
+        
+        for name, start, end in self.pending_events:
+            elapsed = start.elapsed_time(end) / 1000.0
+            self.timings[name].append(elapsed)
+            
+        self.pending_events = []
     
     def get_stats(self):
         """Get summary statistics for all recorded timings."""

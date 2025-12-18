@@ -144,11 +144,14 @@ def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, pr
         # Only activate profiler for sampled steps to reduce overhead
         profiler.active = (i % sample_rate == 0)
         
-        position_ids = llm.get_ctx(next_token)
-        
-        # Wrap the ENTIRE inference step
+        # Wrap the ENTIRE inference step (including get_ctx overhead)
         with profiler.record('total_step_time'):
+            position_ids = llm.get_ctx(next_token)
             logits = llm.inference(input_ids=next_token, position_ids=position_ids)
+        
+        # Process events if active
+        if profiler.active:
+            profiler.step()
         
         torch.cuda.synchronize()
 
