@@ -104,6 +104,8 @@ class Llama(LLM):
         dDash: int = 16,
         producer_frequency: int = 4,
         keysifter_intermediate_dim: int = 1024,
+        local_window: int = 512,  # Number of recent tokens to always keep (matching KeySifter baseline)
+        min_sparse_index: int = 128,  # Number of sink tokens to always keep (matching KeySifter baseline)
         oracle_random_indices: bool = True,
         page_size: int = 1,
     ) -> None:
@@ -170,16 +172,18 @@ class Llama(LLM):
             )
         
         self.init_kv_cache(
-            sparse_budget, 
-            chunk_size, 
-            self.config, 
-            rank=rank, 
+            sparse_budget,
+            chunk_size,
+            self.config,
+            rank=rank,
             merge_config=self.merge_config,
             keysifter_predictor=self.keysifter_predictor,
             producer_frequency=producer_frequency,
             dDash=dDash,
             oracle_random_indices=oracle_random_indices,
             page_size=page_size,
+            local_window=local_window,
+            min_sparse_index=min_sparse_index,
         )
 
         if self.minference:

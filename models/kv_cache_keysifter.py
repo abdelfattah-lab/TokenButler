@@ -43,6 +43,8 @@ class KeySifterCache:
         sparse_budget: int = 2048,
         chunk_size: int = 8,
         producer_frequency: int = 4,
+        local_window: int = 512,
+        min_sparse_index: int = 128,
     ) -> None:
         """
         Args:
@@ -55,6 +57,8 @@ class KeySifterCache:
             sparse_budget: Number of tokens to select during sparse attention
             chunk_size: Chunk size for selection (for compatibility with ShadowKV interface)
             producer_frequency: Number of layers served by one predictor
+            local_window: Number of recent tokens to always include (default 512, matching KeySifter baseline)
+            min_sparse_index: Number of initial "sink" tokens to always keep (default 128, matching KeySifter baseline)
         """
         self.config = config
         self.predictor = predictor
@@ -73,9 +77,12 @@ class KeySifterCache:
         self.chunk_size = chunk_size
         self.producer_frequency = producer_frequency
         self.dDash = predictor.dDash
-        
-        # Local window to always include (similar to ShadowKV)
-        self.local_window = 32  # Always include last N tokens
+
+        # Local window to always include (matching KeySifter baseline's sliding_window)
+        self.local_window = local_window  # Default 512 to match baseline
+
+        # Sink tokens to always keep (matching KeySifter baseline's min_sparse_index)
+        self.min_sparse_index = min_sparse_index  # Default 128 to match baseline
         
         # Full value cache (CPU for large contexts, GPU for small)
         self.v_cache = torch.zeros(
@@ -113,9 +120,11 @@ class KeySifterCache:
             dtype=dtype,
         )
         
-        # Buffer for assembling KV during decode: [local_window (circular) | sparse_selected]
-        # Only stores recent local_window tokens + space for gathering sparse tokens
-        buffer_size = self.local_window + sparse_budget
+        # Buffer for assembling KV during decode: [sink_tokens | local_window (circular) | sparse_selected]
+        # Layout: first min_sparse_index positions for sink tokens (always kept)
+        #         next local_window positions for recent tokens (circular buffer)
+        #         remaining sparse_budget positions for importance-selected tokens
+        buffer_size = self.min_sparse_index + self.local_window + sparse_budget
         self.k_cache_buffer = torch.zeros(
             self.num_hidden_layers,
             batch_size,
@@ -229,14 +238,27 @@ class KeySifterCache:
         k_proj = torch.einsum("bhlk,hkd->bhld", key_states_roped, proj_weight)
         self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
         
+        # Copy sink tokens to buffer (first min_sparse_index positions)
+        # These are always kept and never overwritten
+        sink_len = min(self.min_sparse_index, seq_len)
+        if sink_len > 0:
+            self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(
+                key_states_roped[:, :, :sink_len]
+            )
+            self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(
+                new_v_cache[:, :, :sink_len]
+            )
+
         # Initialize circular buffer with last local_window tokens from prefill
         # These will be the most recent tokens at the start of decode
+        # Buffer layout: [sink_tokens | local_window | sparse_selected]
+        local_buffer_start = self.min_sparse_index  # Offset for local window in buffer
         local_start = max(0, seq_len - self.local_window)
         local_len = seq_len - local_start
-        self.k_cache_buffer[layer_idx, :, :, :local_len].copy_(
+        self.k_cache_buffer[layer_idx, :, :, local_buffer_start:local_buffer_start + local_len].copy_(
             key_states_roped[:, :, local_start:]
         )
-        self.v_cache_buffer[layer_idx, :, :, :local_len].copy_(
+        self.v_cache_buffer[layer_idx, :, :, local_buffer_start:local_buffer_start + local_len].copy_(
             new_v_cache[:, :, local_start:]
         )
         # Circular buffer starts with head at 0, and local_len items filled
@@ -272,8 +294,17 @@ class KeySifterCache:
                 f"Sequence length {self.kv_offset + incoming} exceeds max_length {self.max_length}"
             )
 
-        # Add new token to circular buffer (buffer[0:local_window] is the circular queue)
-        buffer_pos = self.local_window_head
+        # Store decode token to main cache immediately (needed for layer 0 dense attention)
+        # This ensures layers 0-3 (first producer group) can use full attention
+        current_pos = self.kv_offset
+        self.k_cache[layer_idx, :, :, current_pos:current_pos + incoming].copy_(new_k_cache)
+        self.v_cache[layer_idx, :, :, current_pos:current_pos + incoming].copy_(new_v_cache)
+
+        # Add new token to circular buffer
+        # Buffer layout: [sink_tokens | local_window (circular) | sparse_selected]
+        # Circular buffer starts at offset min_sparse_index
+        local_buffer_start = self.min_sparse_index
+        buffer_pos = local_buffer_start + self.local_window_head
         self.k_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_k_cache)
         self.v_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_v_cache)
 
@@ -378,14 +409,26 @@ class KeySifterCache:
             scores = torch.einsum("blhgqd,blhgqkd->blhgqk", q_group, k_proj_group)
             scores = scores.squeeze(4) / math.sqrt(self.dDash)  # [B, Layers, KvH, Grp, Limit]
             scores = scores.max(dim=3).values  # [B, Layers, KvH, Limit]
-            
-            # Mask local window
+
+            # Apply softmax normalization before selection (matching KeySifter baseline)
+            # This normalizes scores across all positions for better top-k selection
+            scores = torch.softmax(scores, dim=-1)
+
+            # Mask out sink tokens (first min_sparse_index positions) - they're always kept
+            if self.min_sparse_index > 0:
+                scores[:, :, :, :self.min_sparse_index] = float("-inf")
+
+            # Mask local window (last local_window positions) - they're already in buffer
             local_start = max(0, self.kv_offset - self.local_window)
             if local_start < self.last_projected_pos:
                 scores[:, :, :, local_start:] = float("-inf")
             
         # 4. Select Indices (Batched)
-        num_available = min(local_start, self.last_projected_pos)
+        # Available positions are between sink tokens and local window
+        # Exclude: [0:min_sparse_index] (sink) and [local_start:] (local window)
+        selection_end = min(local_start, self.last_projected_pos)
+        selection_start = self.min_sparse_index
+        num_available = max(0, selection_end - selection_start)
         num_to_select = min(self.sparse_budget, num_available)
         
         if num_to_select > 0:
@@ -397,16 +440,18 @@ class KeySifterCache:
             # Prepare indices: [Layers, B, KvH, budget, HeadDim]
             indices_perm = topk_indices.permute(1, 0, 2, 3)
             indices_expanded = indices_perm.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-            
-            sparse_start = self.local_window
+
+            # Buffer layout: [sink_tokens | local_window | sparse_selected]
+            # Sparse tokens go after sink_tokens and local_window
+            sparse_start = self.min_sparse_index + self.local_window
             k_source = self.k_cache[start_layer_idx:end_layer_idx]
             v_source = self.v_cache[start_layer_idx:end_layer_idx]
-            
+
             # Gather K
             with self._record('get_key_cache_total'):
                 out_k = self.k_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
                 torch.gather(k_source, dim=3, index=indices_expanded, out=out_k)
-            
+
             # Gather V
             with self._record('get_value_cache_total'):
                 out_v = self.v_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
@@ -434,18 +479,31 @@ class KeySifterCache:
     ) -> torch.Tensor:
         """
         Return the pre-fetched key cache buffer.
+
+        For layer 0 (and the first producer group), return FULL cache to keep it dense.
+        This matches KeySifter baseline behavior where layer 0 always uses dense attention.
+
+        For other layers:
+        Buffer layout: [sink_tokens | local_window | sparse_selected]
+        Total length: min_sparse_index + local_window + num_selected
         """
-        # We assume local window + sparse budget are already populated in the buffer
-        # Logic for how many tokens to return:
-        # If we selected num_to_select tokens, total is local_window + num_to_select
-        # We typically fill up to sparse_budget if available.
-        
-        num_available = min(max(0, self.kv_offset - self.local_window), self.last_projected_pos)
+        # Layer 0 (first producer group) uses full attention - return full cache
+        if layer_idx < self.producer_frequency:
+            return self.k_cache[layer_idx, :, :, :self.kv_offset]
+
+        # Calculate how many sparse tokens were selected
+        # Available for selection: positions between sink tokens and local window
+        local_start = max(0, self.kv_offset - self.local_window)
+        selection_end = min(local_start, self.last_projected_pos)
+        selection_start = self.min_sparse_index
+        num_available = max(0, selection_end - selection_start)
         num_selected = min(self.sparse_budget, num_available)
-        total_len = self.local_window + num_selected
-        
+
+        # Total tokens: sink + local_window + selected sparse
+        total_len = self.min_sparse_index + self.local_window + num_selected
+
         return self.k_cache_buffer[layer_idx, :, :, :total_len]
-    
+
     def get_value_cache(
         self,
         layer_idx: int,
@@ -453,9 +511,26 @@ class KeySifterCache:
     ) -> torch.Tensor:
         """
         Return the pre-fetched value cache buffer.
+
+        For layer 0 (and the first producer group), return FULL cache to keep it dense.
+        This matches KeySifter baseline behavior where layer 0 always uses dense attention.
+
+        For other layers:
+        Buffer layout: [sink_tokens | local_window | sparse_selected]
+        Total length: min_sparse_index + local_window + num_selected
         """
-        num_available = min(max(0, self.kv_offset - self.local_window), self.last_projected_pos)
+        # Layer 0 (first producer group) uses full attention - return full cache
+        if layer_idx < self.producer_frequency:
+            return self.v_cache[layer_idx, :, :, :self.kv_offset]
+
+        # Calculate how many sparse tokens were selected
+        local_start = max(0, self.kv_offset - self.local_window)
+        selection_end = min(local_start, self.last_projected_pos)
+        selection_start = self.min_sparse_index
+        num_available = max(0, selection_end - selection_start)
         num_selected = min(self.sparse_budget, num_available)
-        total_len = self.local_window + num_selected
-        
+
+        # Total tokens: sink + local_window + selected sparse
+        total_len = self.min_sparse_index + self.local_window + num_selected
+
         return self.v_cache_buffer[layer_idx, :, :, :total_len]

@@ -46,7 +46,7 @@ class LLM:
         """Return record_function context if profiling is enabled, otherwise nullcontext"""
         return record_function(name) if getattr(self, '_profiling_enabled', False) else nullcontext()
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -65,15 +65,17 @@ class LLM:
             if keysifter_predictor is None:
                 raise ValueError("KeySifter mode requires a predictor. Pass keysifter_predictor to init_kv_cache.")
             self.kv_cache = KeySifterCache(
-                config, 
+                config,
                 predictor=keysifter_predictor,
-                max_length=self.max_length, 
-                device=self.device, 
-                dtype=self.dtype, 
-                batch_size=self.batch_size, 
-                sparse_budget=sparse_budget, 
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
                 chunk_size=chunk_size,
                 producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
             )
         elif self.attn_mode.lower() == 'oracle':
             self.kv_cache = OracleCache(
@@ -214,9 +216,10 @@ class LLM:
                     self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
 
                 # KeySifter: compute importance queries and refetch for layer group at producer layers
+                # Skip layer 0 to keep it dense (matching KeySifter baseline behavior)
                 if isinstance(self.kv_cache, KeySifterCache):
                     producer_frequency = self.kv_cache.producer_frequency
-                    if layer_idx % producer_frequency == 0:
+                    if layer_idx % producer_frequency == 0 and layer_idx > 0:
                         with self._maybe_record_function("keysifter_prefetch"):
                             # hidden_states here is the residual (pre-attention), we need to pass it
                             self.kv_cache.prefetch_layer_group(residual, layer_idx)
