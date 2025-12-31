@@ -78,10 +78,10 @@ class LlamaLayer:
         self.down_proj =  self.down_proj.to(device, non_blocking=True)
 
 class Llama(LLM):
-    def __init__(self, 
+    def __init__(self,
         model_name: str = "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
         batch_size :int = 1,
-        max_length :int = 64*1024, 
+        max_length :int = 64*1024,
         device :str = 'cuda:0',
         dtype = torch.bfloat16,
         attn_mode: str = 'full',
@@ -106,6 +106,7 @@ class Llama(LLM):
         keysifter_intermediate_dim: int = 1024,
         local_window: int = 512,  # Number of recent tokens to always keep (matching KeySifter baseline)
         min_sparse_index: int = 128,  # Number of sink tokens to always keep (matching KeySifter baseline)
+        quantize_int8: bool = False,  # Enable INT8 quantization for k_proj_cache
         oracle_random_indices: bool = True,
         page_size: int = 1,
     ) -> None:
@@ -184,6 +185,7 @@ class Llama(LLM):
             page_size=page_size,
             local_window=local_window,
             min_sparse_index=min_sparse_index,
+            quantize_int8=quantize_int8,
         )
 
         if self.minference:

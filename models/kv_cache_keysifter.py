@@ -14,6 +14,13 @@ from typing import Optional, Callable
 
 from .keysifter_predictor import KeySifterPredictor
 
+# Try to import fused INT8 kernel
+try:
+    from kernels.int8_score_fused import score_int8_fused
+    HAS_INT8_FUSED_KERNEL = True
+except ImportError:
+    HAS_INT8_FUSED_KERNEL = False
+
 
 class KeySifterCache:
     """
@@ -45,6 +52,7 @@ class KeySifterCache:
         producer_frequency: int = 4,
         local_window: int = 512,
         min_sparse_index: int = 128,
+        quantize_int8: bool = False,
     ) -> None:
         """
         Args:
@@ -59,6 +67,7 @@ class KeySifterCache:
             producer_frequency: Number of layers served by one predictor
             local_window: Number of recent tokens to always include (default 512, matching KeySifter baseline)
             min_sparse_index: Number of initial "sink" tokens to always keep (default 128, matching KeySifter baseline)
+            quantize_int8: If True, store k_proj_cache as INT8 for memory bandwidth reduction
         """
         self.config = config
         self.predictor = predictor
@@ -66,6 +75,7 @@ class KeySifterCache:
         self.max_length = max_length
         self.device = device
         self.dtype = dtype
+        self.quantize_int8 = quantize_int8
         
         self.num_hidden_layers = config.num_hidden_layers
         self.num_key_value_heads = config.num_key_value_heads
@@ -110,15 +120,39 @@ class KeySifterCache:
         # Shape: [num_layers, batch, num_key_value_heads, max_length, dDash]
         # Store projections per KV head (8) - will broadcast to attention heads (32) during scoring
         # This saves 4x memory compared to storing per attention head
-        self.k_proj_cache = torch.zeros(
-            self.num_hidden_layers,
-            batch_size,
-            self.num_key_value_heads,  # Use KV heads (8), not attention heads (32)
-            max_length,
-            self.dDash,
-            device=device,
-            dtype=dtype,
-        )
+        if self.quantize_int8:
+            # INT8 storage for memory bandwidth reduction
+            self.k_proj_cache = torch.zeros(
+                self.num_hidden_layers,
+                batch_size,
+                self.num_key_value_heads,
+                max_length,
+                self.dDash,
+                device=device,
+                dtype=torch.int8,
+            )
+            # Per-layer, per-head scale factors for dequantization
+            # Shape: [num_layers, 1, num_key_value_heads, 1, 1]
+            self.k_proj_scale = torch.ones(
+                self.num_hidden_layers,
+                1,
+                self.num_key_value_heads,
+                1,
+                1,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            self.k_proj_cache = torch.zeros(
+                self.num_hidden_layers,
+                batch_size,
+                self.num_key_value_heads,
+                max_length,
+                self.dDash,
+                device=device,
+                dtype=dtype,
+            )
+            self.k_proj_scale = None
         
         # Buffer for assembling KV during decode: [sink_tokens | local_window (circular) | sparse_selected]
         # Layout: first min_sparse_index positions for sink tokens (always kept)
@@ -150,6 +184,7 @@ class KeySifterCache:
         self.gen_offset = 0
         self.last_projected_pos = 0  # Track up to which position we've projected decode tokens
         self.local_window_head = 0  # Circular queue head pointer for local window
+        self._dense_decode_cutoff = 0  # Position after which to apply sparsity (keeps first decode token dense)
         
         # Store importance queries from producer layers
         # Shape: [batch*heads, N_slots, 1, dDash] (for decode, Lq=1)
@@ -180,6 +215,8 @@ class KeySifterCache:
         self.k_cache.zero_()
         self.v_cache.zero_()
         self.k_proj_cache.zero_()
+        if self.k_proj_scale is not None:
+            self.k_proj_scale.fill_(1.0)
         self.k_cache_buffer.zero_()
         self.v_cache_buffer.zero_()
         self.kv_offset = 0
@@ -236,7 +273,19 @@ class KeySifterCache:
         # proj_weight: [num_kv_heads, head_dim, dDash] (aggregated during predictor loading)
         proj_weight = self.predictor.key_cache_proj[layer_idx]  # [num_kv_heads, head_dim, dDash]
         k_proj = torch.einsum("bhlk,hkd->bhld", key_states_roped, proj_weight)
-        self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
+
+        if self.quantize_int8:
+            # Quantize to INT8: compute per-head scale and store quantized values
+            # k_proj: [B, num_kv_heads, L, dDash]
+            # Compute scale per head (max abs value across positions and dDash dimensions)
+            scale = k_proj.abs().amax(dim=(0, 2, 3), keepdim=True) / 127.0  # [1, num_kv_heads, 1, 1]
+            scale = scale.clamp(min=1e-8)  # Avoid division by zero
+            k_proj_int8 = (k_proj / scale).round().clamp(-128, 127).to(torch.int8)
+            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj_int8)
+            # Store scale - reshape to match [num_layers, 1, num_kv_heads, 1, 1]
+            self.k_proj_scale[layer_idx].copy_(scale.squeeze(0).unsqueeze(0))
+        else:
+            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
         
         # Copy sink tokens to buffer (first min_sparse_index positions)
         # These are always kept and never overwritten
@@ -271,6 +320,7 @@ class KeySifterCache:
             self.kv_offset = seq_len
             self.gen_offset = 0
             self.last_projected_pos = seq_len  # Prefill tokens are already projected
+            self._dense_decode_cutoff = seq_len + 1  # Keep first decode token dense (matching baseline)
     
     def update_kv_cache(
         self,
@@ -355,8 +405,15 @@ class KeySifterCache:
                     # all_keys: [L, B, H, T, K] x proj_weights: [L, H, K, D] -> [L, B, H, T, D]
                     all_k_proj = torch.einsum("lbhtk,lhkd->lbhtd", all_keys_to_archive, self.predictor.key_cache_proj)
 
-                    # Store all projections in one batched copy
-                    self.k_proj_cache[:, :, :, start_pos:end_pos].copy_(all_k_proj)
+                    if self.quantize_int8:
+                        # Quantize to INT8 using existing per-layer, per-head scales
+                        # all_k_proj: [L, B, H, T, D]
+                        # k_proj_scale: [L, 1, H, 1, 1]
+                        all_k_proj_int8 = (all_k_proj / self.k_proj_scale).round().clamp(-128, 127).to(torch.int8)
+                        self.k_proj_cache[:, :, :, start_pos:end_pos].copy_(all_k_proj_int8)
+                    else:
+                        # Store all projections in one batched copy
+                        self.k_proj_cache[:, :, :, start_pos:end_pos].copy_(all_k_proj)
 
                     # Update tracking - all buffer contents are now archived
                     self.last_projected_pos = end_pos
@@ -369,15 +426,20 @@ class KeySifterCache:
         """
         Compute importance queries and perform batched retrieval for a group of layers.
         Called at producer layers (every producer_frequency layers).
-        
+
         Args:
             hidden_states: [bsz, seq_len, hidden_size] - hidden states (can be 1 for decode or longer)
             start_layer_idx: Start layer index of the group
         """
+        # Skip sparse selection for first decode token after prefill (matching baseline behavior)
+        # Baseline keeps first decode token dense to avoid applying sparsity immediately after prefill
+        if self.kv_offset <= self._dense_decode_cutoff:
+            return  # Skip sparse selection, layers will use full cache via get_key_cache check
+
         # Only use the last token's hidden state for importance computation
         if hidden_states.shape[1] > 1:
             hidden_states = hidden_states[:, -1:, :]
-            
+
         bsz = hidden_states.shape[0]
         
         # 1. Predict Importance Queries
@@ -395,26 +457,43 @@ class KeySifterCache:
             q_importance = q_importance.view(bsz, self.num_attention_heads, self.producer_frequency, 1, self.dDash)
             q_group = q_importance[:, :, :num_layers_in_group, 0, :]  # [B, num_attn_heads, num_layers, dDash]
             q_group = q_group.permute(0, 2, 1, 3).unsqueeze(3)  # [B, num_layers, num_attn_heads, 1, dDash]
-            
+
             # Get Projected Keys for these layers
             k_proj_group = self.k_proj_cache[start_layer_idx:end_layer_idx, :, :, :self.last_projected_pos, :]
-            k_proj_group = k_proj_group.permute(1, 0, 2, 3, 4).unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, limit, dDash]
-            
-            # Broadcast q_group to match KV heads (GQA)
-            q_group = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
-            k_proj_group = k_proj_group.unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, 1, limit, dDash]
-        
+
         # 3. Compute Scores (Batched)
         with self._record('compute_scores'):
-            scores = torch.einsum("blhgqd,blhgqkd->blhgqk", q_group, k_proj_group)
-            scores = scores.squeeze(4) / math.sqrt(self.dDash)  # [B, Layers, KvH, Grp, Limit]
-            scores = scores.max(dim=3).values  # [B, Layers, KvH, Limit]
+            if self.quantize_int8 and HAS_INT8_FUSED_KERNEL:
+                # Use fused kernel: loads INT8, dequantizes on-the-fly, computes scores
+                # This avoids creating a full bfloat16 copy of k_proj_group
+                # q_group needs to be reshaped for the fused kernel: [B, L, H, G, D]
+                q_for_fused = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, self.dDash)
+                # k_proj_group is [L, B, H, Limit, D] int8
+                # scale is [L, 1, H, 1, 1] float32
+                scale_group = self.k_proj_scale[start_layer_idx:end_layer_idx]
+                # Fused kernel returns [B, L, H, G, Limit]
+                scores = score_int8_fused(q_for_fused, k_proj_group, scale_group)
+                scores = scores / math.sqrt(self.dDash)  # [B, L, H, G, Limit]
+                scores = scores.max(dim=3).values  # [B, L, H, Limit]
+            else:
+                # Non-INT8 path or fallback
+                if self.quantize_int8:
+                    # Fallback: Dequantize INT8 to float (less efficient, creates full copy)
+                    scale_group = self.k_proj_scale[start_layer_idx:end_layer_idx].to(self.dtype)
+                    k_proj_group = k_proj_group.to(self.dtype) * scale_group
 
-            # Apply softmax normalization before selection (matching KeySifter baseline)
-            # This normalizes scores across all positions for better top-k selection
-            scores = torch.softmax(scores, dim=-1)
+                k_proj_group = k_proj_group.permute(1, 0, 2, 3, 4).unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, limit, dDash]
+
+                # Broadcast q_group to match KV heads (GQA)
+                q_group = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
+                k_proj_group = k_proj_group.unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, 1, limit, dDash]
+
+                scores = torch.einsum("blhgqd,blhgqkd->blhgqk", q_group, k_proj_group)
+                scores = scores.squeeze(4) / math.sqrt(self.dDash)  # [B, Layers, KvH, Grp, Limit]
+                scores = scores.max(dim=3).values  # [B, Layers, KvH, Limit]
 
             # Mask out sink tokens (first min_sparse_index positions) - they're always kept
+            # IMPORTANT: Mask BEFORE softmax to ensure proper probability normalization
             if self.min_sparse_index > 0:
                 scores[:, :, :, :self.min_sparse_index] = float("-inf")
 
@@ -422,6 +501,10 @@ class KeySifterCache:
             local_start = max(0, self.kv_offset - self.local_window)
             if local_start < self.last_projected_pos:
                 scores[:, :, :, local_start:] = float("-inf")
+
+            # Apply softmax normalization AFTER masking (matching KeySifter baseline)
+            # This ensures the probabilities sum to 1 over only the candidate positions
+            scores = torch.softmax(scores, dim=-1)
             
         # 4. Select Indices (Batched)
         # Available positions are between sink tokens and local window
@@ -480,15 +563,18 @@ class KeySifterCache:
         """
         Return the pre-fetched key cache buffer.
 
-        For layer 0 (and the first producer group), return FULL cache to keep it dense.
-        This matches KeySifter baseline behavior where layer 0 always uses dense attention.
+        For layer 0 ONLY, return FULL cache to keep it dense.
+        This matches KeySifter baseline behavior where only layer 0 uses dense attention.
 
-        For other layers:
+        For first decode token after prefill, also return FULL cache (matching baseline).
+
+        For other layers during normal decode:
         Buffer layout: [sink_tokens | local_window | sparse_selected]
         Total length: min_sparse_index + local_window + num_selected
         """
-        # Layer 0 (first producer group) uses full attention - return full cache
-        if layer_idx < self.producer_frequency:
+        # Layer 0 uses full attention - always return full cache
+        # Also return full cache for first decode token after prefill (matching baseline)
+        if layer_idx == 0 or self.kv_offset <= self._dense_decode_cutoff:
             return self.k_cache[layer_idx, :, :, :self.kv_offset]
 
         # Calculate how many sparse tokens were selected
@@ -512,15 +598,18 @@ class KeySifterCache:
         """
         Return the pre-fetched value cache buffer.
 
-        For layer 0 (and the first producer group), return FULL cache to keep it dense.
-        This matches KeySifter baseline behavior where layer 0 always uses dense attention.
+        For layer 0 ONLY, return FULL cache to keep it dense.
+        This matches KeySifter baseline behavior where only layer 0 uses dense attention.
 
-        For other layers:
+        For first decode token after prefill, also return FULL cache (matching baseline).
+
+        For other layers during normal decode:
         Buffer layout: [sink_tokens | local_window | sparse_selected]
         Total length: min_sparse_index + local_window + num_selected
         """
-        # Layer 0 (first producer group) uses full attention - return full cache
-        if layer_idx < self.producer_frequency:
+        # Layer 0 uses full attention - always return full cache
+        # Also return full cache for first decode token after prefill (matching baseline)
+        if layer_idx == 0 or self.kv_offset <= self._dense_decode_cutoff:
             return self.v_cache[layer_idx, :, :, :self.kv_offset]
 
         # Calculate how many sparse tokens were selected
