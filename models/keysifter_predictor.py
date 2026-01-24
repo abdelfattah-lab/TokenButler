@@ -345,10 +345,24 @@ def load_keysifter_predictor(
             print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
         
         def _extract_key_cache_proj(sd: dict) -> Optional[torch.Tensor]:
+            candidates: list[tuple[str, torch.Tensor]] = []
             for k, v in sd.items():
                 if k.endswith("key_cache_proj"):
-                    return v
-            return None
+                    candidates.append((k, v))
+            if not candidates:
+                return None
+
+            # Prefer the least-prefixed key (closest to the base module).
+            # Example preferred order:
+            #   sparse_token_predictor.key_cache_proj
+            #   producer.sparse_token_predictor.key_cache_proj
+            #   producer.producer.sparse_token_predictor.key_cache_proj
+            def _rank_key(item: tuple[str, torch.Tensor]) -> tuple[int, int]:
+                k, _ = item
+                return (k.count("producer."), len(k))
+
+            candidates.sort(key=_rank_key)
+            return candidates[0][1]
 
         sample_key_proj = None
         for sd in state_dict_list:
