@@ -192,9 +192,21 @@ class KeySifterCache:
         
         # Optional profiler for timing instrumentation (set externally)
         self.profiler = None
-        
+
         self.copy_stream = torch.cuda.Stream()
-    
+
+        # During a single decode token, kv_offset is only "committed" at the last layer,
+        # but caches for earlier layers already wrote the new token at position kv_offset.
+        # We track an "uncommitted" increment so retrieval/selection uses the correct kv_len.
+        self._uncommitted_decode = False
+        self._uncommitted_incoming = 0
+
+    def _kv_len_eff(self) -> int:
+        """Effective KV length INCLUDING the current decode token (before last-layer commit)."""
+        if self._uncommitted_decode and self._uncommitted_incoming > 0:
+            return self.kv_offset + self._uncommitted_incoming
+        return self.kv_offset
+
     def _record(self, name):
         """Context manager for profiling. No-op if profiler is None."""
         if self.profiler is not None:
@@ -225,6 +237,8 @@ class KeySifterCache:
         self.last_projected_pos = 0
         self.local_window_head = 0
         self.q_importance_cache = None
+        self._uncommitted_decode = False
+        self._uncommitted_incoming = 0
 
     def H2D(self):
         """Host to device transfer (no-op if already on GPU)."""
@@ -321,6 +335,8 @@ class KeySifterCache:
             self.gen_offset = 0
             self.last_projected_pos = seq_len  # Prefill tokens are already projected
             self._dense_decode_cutoff = seq_len + 1  # Keep first decode token dense (matching baseline)
+            self._uncommitted_decode = False
+            self._uncommitted_incoming = 0
     
     def update_kv_cache(
         self,
@@ -358,6 +374,12 @@ class KeySifterCache:
         self.k_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_k_cache)
         self.v_cache_buffer[layer_idx, :, :, buffer_pos:buffer_pos + incoming].copy_(new_v_cache)
 
+        # Mark: there is an uncommitted token present at [kv_offset : kv_offset+incoming)
+        # until the last layer increments kv_offset.
+        if layer_idx != self.num_hidden_layers - 1:
+            self._uncommitted_decode = True
+            self._uncommitted_incoming = incoming
+
         if layer_idx == self.num_hidden_layers - 1:
             # Update circular buffer head (wraps around within local_window)
             old_head = self.local_window_head
@@ -366,6 +388,9 @@ class KeySifterCache:
             # Update position tracking
             self.kv_offset += incoming
             self.gen_offset += incoming
+            # Now the kv_offset is committed.
+            self._uncommitted_decode = False
+            self._uncommitted_incoming = 0
 
             # Archive when circular buffer is full (pointer just wrapped to 0)
             # At this point, the buffer contains exactly local_window tokens that need archiving.
@@ -385,12 +410,15 @@ class KeySifterCache:
                     num_to_archive = end_pos - start_pos
                     # Offset within the buffer: buffer is linear [0:local_window] mapping to [archive_start:archive_end]
                     offset_in_buffer = start_pos - archive_start
+                    # NOTE: local window region begins at min_sparse_index in k_cache_buffer
+                    buf_start = local_buffer_start + offset_in_buffer
+                    buf_end = buf_start + num_to_archive
 
                     # Archive keys and values for all layers
                     for archive_layer_idx in range(self.num_hidden_layers):
                         # Extract the slice to archive from circular buffer
-                        keys_to_archive = self.k_cache_buffer[archive_layer_idx, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
-                        values_to_archive = self.v_cache_buffer[archive_layer_idx, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
+                        keys_to_archive = self.k_cache_buffer[archive_layer_idx, :, :, buf_start:buf_end]
+                        values_to_archive = self.v_cache_buffer[archive_layer_idx, :, :, buf_start:buf_end]
 
                         # Store to main cache
                         self.k_cache[archive_layer_idx, :, :, start_pos:end_pos].copy_(keys_to_archive)
@@ -399,7 +427,7 @@ class KeySifterCache:
                     # OPTIMIZATION: Batch project RoPEd keys for ALL layers at once
                     # Instead of 32 separate einsum ops, do 1 batched einsum
                     # Extract keys for all layers: [num_layers, B, num_kv_heads, num_to_archive, head_dim]
-                    all_keys_to_archive = self.k_cache_buffer[:, :, :, offset_in_buffer:offset_in_buffer + num_to_archive]
+                    all_keys_to_archive = self.k_cache_buffer[:, :, :, buf_start:buf_end]
 
                     # Batched einsum across all layers
                     # all_keys: [L, B, H, T, K] x proj_weights: [L, H, K, D] -> [L, B, H, T, D]
@@ -433,7 +461,8 @@ class KeySifterCache:
         """
         # Skip sparse selection for first decode token after prefill (matching baseline behavior)
         # Baseline keeps first decode token dense to avoid applying sparsity immediately after prefill
-        if self.kv_offset <= self._dense_decode_cutoff:
+        kv_len = self._kv_len_eff()
+        if kv_len <= self._dense_decode_cutoff:
             return  # Skip sparse selection, layers will use full cache via get_key_cache check
 
         # Only use the last token's hidden state for importance computation
@@ -445,32 +474,47 @@ class KeySifterCache:
         # 1. Predict Importance Queries
         with self._record('predictor_forward'):
             q_importance = self.predictor(hidden_states, producer_layer_idx=start_layer_idx)
-        
-        # 2. Batched Scoring & Selection & Retrieval
-        producer_group_size = self.producer_frequency
-        end_layer_idx = min(start_layer_idx + producer_group_size, self.num_hidden_layers)
-        num_layers_in_group = end_layer_idx - start_layer_idx
+
+        # --- IMPORTANT (baseline parity) ---
+        # Producer at layer p serves consumer layers (p+1 ... p+G), not (p ... p+G-1).
+        consumer_start = start_layer_idx + 1
+        if consumer_start >= self.num_hidden_layers:
+            return
+        consumer_end = min(consumer_start + self.producer_frequency, self.num_hidden_layers)
+        num_layers_in_group = consumer_end - consumer_start
+        if num_layers_in_group <= 0:
+            return
         
         # Reshape and prepare tensors for batched operations
         with self._record('prepare_tensors'):
-            # q_importance: [B*num_attn_heads, N_slots, 1, dDash] -> [B, num_attn_heads, N_slots, 1, dDash]
+            # q_importance: [B*H, N_slots, 1, dDash] -> [B, H, N_slots, 1, dDash]
             q_importance = q_importance.view(bsz, self.num_attention_heads, self.producer_frequency, 1, self.dDash)
-            q_group = q_importance[:, :, :num_layers_in_group, 0, :]  # [B, num_attn_heads, num_layers, dDash]
-            q_group = q_group.permute(0, 2, 1, 3).unsqueeze(3)  # [B, num_layers, num_attn_heads, 1, dDash]
+            # slots 0.. correspond to consumer layers p+1, p+2, ...
+            q_slots = q_importance[:, :, :num_layers_in_group, 0, :]  # [B, H_attn, Lgrp, dDash]
+            q_slots = q_slots.permute(0, 2, 1, 3)  # [B, Lgrp, H_attn, dDash]
+            # Group by KV heads: [B, Lgrp, H_kv, G, dDash]
+            q_group = q_slots.view(
+                bsz,
+                num_layers_in_group,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.dDash,
+            )
 
-            # Get Projected Keys for these layers
-            k_proj_group = self.k_proj_cache[start_layer_idx:end_layer_idx, :, :, :self.last_projected_pos, :]
+            # Get projected keys for CONSUMER layers
+            limit = self.last_projected_pos
+            k_proj_group = self.k_proj_cache[consumer_start:consumer_end, :, :, :limit, :]  # [Lgrp, B, H_kv, limit, dDash]
 
         # 3. Compute Scores (Batched)
         with self._record('compute_scores'):
             if self.quantize_int8 and HAS_INT8_FUSED_KERNEL:
                 # Use fused kernel: loads INT8, dequantizes on-the-fly, computes scores
                 # This avoids creating a full bfloat16 copy of k_proj_group
-                # q_group needs to be reshaped for the fused kernel: [B, L, H, G, D]
-                q_for_fused = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, self.dDash)
+                # q_group already: [B, Lgrp, H_kv, G, dDash]
+                q_for_fused = q_group
                 # k_proj_group is [L, B, H, Limit, D] int8
                 # scale is [L, 1, H, 1, 1] float32
-                scale_group = self.k_proj_scale[start_layer_idx:end_layer_idx]
+                scale_group = self.k_proj_scale[consumer_start:consumer_end]
                 # Fused kernel returns [B, L, H, G, Limit]
                 scores = score_int8_fused(q_for_fused, k_proj_group, scale_group)
                 scores = scores / math.sqrt(self.dDash)  # [B, L, H, G, Limit]
@@ -479,32 +523,29 @@ class KeySifterCache:
                 # Non-INT8 path or fallback
                 if self.quantize_int8:
                     # Fallback: Dequantize INT8 to float (less efficient, creates full copy)
-                    scale_group = self.k_proj_scale[start_layer_idx:end_layer_idx].to(self.dtype)
+                    scale_group = self.k_proj_scale[consumer_start:consumer_end].to(self.dtype)
                     k_proj_group = k_proj_group.to(self.dtype) * scale_group
+                # [Lgrp, B, H_kv, limit, dDash] -> [B, Lgrp, H_kv, limit, dDash]
+                k_proj_f = k_proj_group.permute(1, 0, 2, 3, 4)
+                # scores: [B, Lgrp, H_kv, G, limit]
+                scores = torch.einsum("blhgd,blhkd->blhgk", q_group, k_proj_f)
+                scores = scores / math.sqrt(self.dDash)
+                scores = scores.max(dim=3).values  # [B, Lgrp, H_kv, limit]
 
-                k_proj_group = k_proj_group.permute(1, 0, 2, 3, 4).unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, limit, dDash]
-
-                # Broadcast q_group to match KV heads (GQA)
-                q_group = q_group.view(bsz, num_layers_in_group, self.num_key_value_heads, self.num_key_value_groups, 1, self.dDash)
-                k_proj_group = k_proj_group.unsqueeze(3)  # [B, num_layers, num_kv_heads, 1, 1, limit, dDash]
-
-                scores = torch.einsum("blhgqd,blhgqkd->blhgqk", q_group, k_proj_group)
-                scores = scores.squeeze(4) / math.sqrt(self.dDash)  # [B, Layers, KvH, Grp, Limit]
-                scores = scores.max(dim=3).values  # [B, Layers, KvH, Limit]
-
-            # Mask out sink tokens (first min_sparse_index positions) - they're always kept
-            # IMPORTANT: Mask BEFORE softmax to ensure proper probability normalization
+            # Mask sink tokens (always kept)
+            limit = scores.size(-1)
             if self.min_sparse_index > 0:
-                scores[:, :, :, :self.min_sparse_index] = float("-inf")
+                sink = min(self.min_sparse_index, limit)
+                scores[:, :, :, :sink] = float("-inf")
 
-            # Mask local window (last local_window positions) - they're already in buffer
-            local_start = max(0, self.kv_offset - self.local_window)
-            if local_start < self.last_projected_pos:
+            # Mask local window tokens (always kept) based on *effective* kv_len
+            local_start = max(0, kv_len - self.local_window)
+            if local_start < limit:
                 scores[:, :, :, local_start:] = float("-inf")
 
-            # Apply softmax normalization AFTER masking (matching KeySifter baseline)
-            # This ensures the probabilities sum to 1 over only the candidate positions
-            scores = torch.softmax(scores, dim=-1)
+            # Match baseline numerical behavior more closely:
+            # do softmax in fp32 for long contexts.
+            scores = torch.softmax(scores.float(), dim=-1).to(self.dtype)
             
         # 4. Select Indices (Batched)
         # Available positions are between sink tokens and local window
@@ -527,17 +568,17 @@ class KeySifterCache:
             # Buffer layout: [sink_tokens | local_window | sparse_selected]
             # Sparse tokens go after sink_tokens and local_window
             sparse_start = self.min_sparse_index + self.local_window
-            k_source = self.k_cache[start_layer_idx:end_layer_idx]
-            v_source = self.v_cache[start_layer_idx:end_layer_idx]
+            k_source = self.k_cache[consumer_start:consumer_end]
+            v_source = self.v_cache[consumer_start:consumer_end]
 
             # Gather K
             with self._record('get_key_cache_total'):
-                out_k = self.k_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
+                out_k = self.k_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_to_select]
                 torch.gather(k_source, dim=3, index=indices_expanded, out=out_k)
 
             # Gather V
             with self._record('get_value_cache_total'):
-                out_v = self.v_cache_buffer[start_layer_idx:end_layer_idx, :, :, sparse_start:sparse_start+num_to_select]
+                out_v = self.v_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_to_select]
                 torch.gather(v_source, dim=3, index=indices_expanded, out=out_v)
             
         else:
@@ -574,12 +615,13 @@ class KeySifterCache:
         """
         # Layer 0 uses full attention - always return full cache
         # Also return full cache for first decode token after prefill (matching baseline)
-        if layer_idx == 0 or self.kv_offset <= self._dense_decode_cutoff:
-            return self.k_cache[layer_idx, :, :, :self.kv_offset]
+        kv_len = self._kv_len_eff()
+        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff:
+            return self.k_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
         # Available for selection: positions between sink tokens and local window
-        local_start = max(0, self.kv_offset - self.local_window)
+        local_start = max(0, kv_len - self.local_window)
         selection_end = min(local_start, self.last_projected_pos)
         selection_start = self.min_sparse_index
         num_available = max(0, selection_end - selection_start)
@@ -609,11 +651,12 @@ class KeySifterCache:
         """
         # Layer 0 uses full attention - always return full cache
         # Also return full cache for first decode token after prefill (matching baseline)
-        if layer_idx == 0 or self.kv_offset <= self._dense_decode_cutoff:
-            return self.v_cache[layer_idx, :, :, :self.kv_offset]
+        kv_len = self._kv_len_eff()
+        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff:
+            return self.v_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
-        local_start = max(0, self.kv_offset - self.local_window)
+        local_start = max(0, kv_len - self.local_window)
         selection_end = min(local_start, self.last_projected_pos)
         selection_start = self.min_sparse_index
         num_available = max(0, selection_end - selection_start)

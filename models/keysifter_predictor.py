@@ -54,6 +54,7 @@ class KeySifterPredictor(nn.Module):
         self.config = config
         self.hidden_size = pred_hid_size
         self.num_heads = num_heads
+        # NOTE: this arg is actually N_slots == producer_frequency (not total transformer layers)
         self.num_hidden_layers = num_hidden_layers  # N_slots
         self.dropout = dropout
         self.dDash = dDash
@@ -73,25 +74,37 @@ class KeySifterPredictor(nn.Module):
         # Number of KV heads (for GQA models, this is less than num_attention_heads)
         self.num_key_value_heads = getattr(config, "num_key_value_heads", num_heads)
         self.num_key_value_groups = num_heads // self.num_key_value_heads
-        
-        # Shared LayerNorm for the importance branch
-        self.norm_importance = nn.LayerNorm(self.hidden_size)
-        
+
+        # --- IMPORTANT ---
+        # Baseline KeySifter has one predictor *per producer layer* (layers 0, G, 2G, ...),
+        # i.e. Q-MLP weights are *not* shared across producers.
+        # Your previous xKV port loaded only producer 0 weights → large accuracy drop.
+        self.producer_frequency = self.num_hidden_layers
+        total_layers = getattr(config, "num_hidden_layers", 32)
+        self.num_producers = math.ceil(total_layers / self.producer_frequency)
+
+        # Per-producer LayerNorm + Q-MLP
+        self.norm_importance = nn.ModuleList(
+            [nn.LayerNorm(self.hidden_size) for _ in range(self.num_producers)]
+        )
+
         # Q-MLP: predicts queries for N_slots layers
         # Output: [B, L, N_slots * H * dDash] (H = num_attention_heads for Q)
         out_dim = self.num_hidden_layers * self.num_heads * self.dDash
-        
-        self.q_mlp = nn.Sequential(
-            nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
-            nn.SiLU(),
-            nn.Linear(self.intermediate_dim, out_dim, bias=False),
-        )
-        
+
+        self.q_mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(pred_hid_size, self.intermediate_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(self.intermediate_dim, out_dim, bias=False),
+            )
+            for _ in range(self.num_producers)
+        ])
+
         # Per-(layer, kv_head) projection of real KV cache keys
         # Shape: [num_hidden_layers (total), num_key_value_heads, head_dim, dDash]
         # We store per KV head (8) not per attention head (32) to save 4x memory
         # During loading, we aggregate per-attention-head projections to per-KV-head
-        total_layers = getattr(config, "num_hidden_layers", 32)
         self.key_cache_proj = nn.Parameter(
             torch.empty(total_layers, self.num_key_value_heads, self.model_head_dim, self.dDash)
         )
@@ -137,13 +150,21 @@ class KeySifterPredictor(nn.Module):
         B, L, _ = hidden_states.size()
         H = self.num_heads # This is the number of attention heads
         N_slots = self.num_hidden_layers
-        
+
+        # Select producer id based on producer_layer_idx (0, G, 2G, ...)
+        # Clamp for safety in case of odd configs.
+        prod_id = int(producer_layer_idx // self.producer_frequency)
+        prod_id = max(0, min(prod_id, self.num_producers - 1))
+
+        mlp = self.q_mlp[prod_id]
+        norm = self.norm_importance[prod_id]
+
         # Normalize and project through MLP
-        hidden_states = hidden_states.to(self.q_mlp[0].weight.dtype)
-        hidden_for_importance = self.norm_importance(hidden_states)
-        
+        hidden_states = hidden_states.to(mlp[0].weight.dtype)
+        hidden_for_importance = norm(hidden_states)
+
         # MLP output: [B, L, N_slots * H * dDash]
-        q_flat = self.q_mlp(hidden_for_importance)
+        q_flat = mlp(hidden_for_importance)
         
         # Reshape: [B, L, N_slots, H, dDash]
         q_slot = q_flat.view(B, L, N_slots, H, self.dDash)
@@ -285,117 +306,107 @@ def load_keysifter_predictor(
             predictor.eval()
             return predictor
         
-        # state_dict_list is a list of state_dicts, one per producer layer
-        # We need to merge them into a single predictor
+        # state_dict_list is a list of state_dicts, one per producer layer.
+        # We merge:
+        #   - per-producer Q-MLP + norm weights (NOT shared)
+        #   - per-layer key_cache_proj rows from the *correct* producer (shifted mapping)
         print(f"Found {len(state_dict_list)} producer layer weights in checkpoint")
-        
-        # Load weights from the first producer layer (they share Q-MLP architecture)
-        first_state_dict = state_dict_list[0]
-        
-        # Map KeySifter's naming to our naming
-        # KeySifter: sparse_token_predictor.q_mlps.0.0.weight -> q_mlp.0.weight
-        # KeySifter: sparse_token_predictor.norm_importance.weight -> norm_importance.weight
-        mapped_state_dict = {}
-        
-        for key, value in first_state_dict.items():
-            # Remove 'sparse_token_predictor.' prefix if present
-            if key.startswith('sparse_token_predictor.'):
-                key = key.replace('sparse_token_predictor.', '')
-            
-            # Map q_mlps.0 -> q_mlp (we have a single MLP)
-            if key.startswith('q_mlps.0.'):
-                new_key = key.replace('q_mlps.0.', 'q_mlp.')
-                mapped_state_dict[new_key] = value
-            elif key == 'key_cache_proj':
-                # Skip key_cache_proj for now, we'll handle it separately
-                pass
-            else:
-                mapped_state_dict[key] = value
-        
-        # Load the Q-MLP and normalization weights
+
+        mapped_state_dict: dict[str, torch.Tensor] = {}
+
+        for prod_idx, prod_sd in enumerate(state_dict_list):
+            for key, value in prod_sd.items():
+                k = key
+                if k.startswith("sparse_token_predictor."):
+                    k = k.replace("sparse_token_predictor.", "")
+
+                # Per-producer Q-MLP:
+                # baseline key: q_mlps.0.0.weight / q_mlps.0.2.weight
+                # ours:         q_mlp.{prod_idx}.0.weight / q_mlp.{prod_idx}.2.weight
+                if k.startswith("q_mlps.0."):
+                    mapped_state_dict[k.replace("q_mlps.0.", f"q_mlp.{prod_idx}.")] = value
+                    continue
+
+                # Per-producer LayerNorm:
+                if k == "norm_importance.weight":
+                    mapped_state_dict[f"norm_importance.{prod_idx}.weight"] = value
+                    continue
+                if k == "norm_importance.bias":
+                    mapped_state_dict[f"norm_importance.{prod_idx}.bias"] = value
+                    continue
+
+                # key_cache_proj handled separately (merged by correct producer mapping)
+                if k.endswith("key_cache_proj"):
+                    continue
+
         missing, unexpected = predictor.load_state_dict(mapped_state_dict, strict=False)
-        print(f"Loaded Q-MLP weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        print(f"Loaded per-producer Q-MLP+norm weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
         if missing:
             print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
         
-        # Check shape from first available key_proj to determine if we need aggregation
+        def _extract_key_cache_proj(sd: dict) -> Optional[torch.Tensor]:
+            for k, v in sd.items():
+                if k.endswith("key_cache_proj"):
+                    return v
+            return None
+
         sample_key_proj = None
-        for state_dict in state_dict_list:
-            for key, value in state_dict.items():
-                if 'key_cache_proj' in key:
-                    sample_key_proj = value
-                    break
+        for sd in state_dict_list:
+            sample_key_proj = _extract_key_cache_proj(sd)
             if sample_key_proj is not None:
                 break
-        
+
         is_already_gqa = False
         num_key_value_heads = getattr(config, "num_key_value_heads", num_heads)
         total_layers = config.num_hidden_layers
-        
+
         if sample_key_proj is not None and sample_key_proj.shape[1] == num_key_value_heads:
             is_already_gqa = True
             print(f"  Checkpoint has GQA shape ({num_key_value_heads} heads). Loading directly.")
-        
+
+        # --- IMPORTANT: correct producer→layer mapping (matches baseline) ---
+        # Baseline mapping for consumer layers:
+        #   producer at p serves layers (p+1 ... p+G)
+        # So the producer index for a given layer L>0 is: (L-1)//G.
+        # (Layer 0 doesn't use key_cache_proj for sparsity; we still fill it from producer 0.)
         if is_already_gqa:
-             merged_key_proj = torch.zeros(
+            merged_key_proj = torch.zeros(
                 total_layers,
-                num_key_value_heads, 
+                num_key_value_heads,
                 predictor.model_head_dim,
-                dDash
+                dDash,
             )
-             for prod_idx, state_dict in enumerate(state_dict_list):
-                key_proj = None
-                for key, value in state_dict.items():
-                    if 'key_cache_proj' in key:
-                        key_proj = value
-                        break
-                
-                if key_proj is not None:
-                    start_layer = prod_idx * producer_frequency
-                    end_layer = min(start_layer + producer_frequency, total_layers)
-                    
-                    for layer_idx in range(start_layer, end_layer):
-                        if layer_idx < key_proj.shape[0]:
-                            merged_key_proj[layer_idx] = key_proj[layer_idx]
-                    
-                    print(f"  Producer {prod_idx}: loaded key_cache_proj for layers {start_layer}-{end_layer-1}")
+            for layer_idx in range(total_layers):
+                prod_idx = 0 if layer_idx == 0 else (layer_idx - 1) // producer_frequency
+                prod_idx = min(prod_idx, len(state_dict_list) - 1)
+                key_proj = _extract_key_cache_proj(state_dict_list[prod_idx])
+                if key_proj is None:
+                    continue
+                merged_key_proj[layer_idx] = key_proj[layer_idx]
         else:
-            # Aggregate per-attention-head projections to per-KV-head by averaging within GQA groups
-            # First, collect all per-attention-head projections
             merged_key_proj_full = torch.zeros(
                 total_layers,
-                num_heads,  # 32 attention heads
+                num_heads,
                 predictor.model_head_dim,
-                dDash
+                dDash,
             )
-            
-            for prod_idx, state_dict in enumerate(state_dict_list):
-                # Find key_cache_proj in this state_dict
-                key_proj = None
-                for key, value in state_dict.items():
-                    if 'key_cache_proj' in key:
-                        key_proj = value
-                        break
-                
-                if key_proj is not None:
-                    # Determine which layers this producer serves
-                    start_layer = prod_idx * producer_frequency
-                    end_layer = min(start_layer + producer_frequency, total_layers)
-                    
-                    # Copy the projections for these layers
-                    for layer_idx in range(start_layer, end_layer):
-                        if layer_idx < key_proj.shape[0]:
-                            merged_key_proj_full[layer_idx] = key_proj[layer_idx]
-                    
-                    print(f"  Producer {prod_idx}: loaded key_cache_proj for layers {start_layer}-{end_layer-1}")
+            for layer_idx in range(total_layers):
+                prod_idx = 0 if layer_idx == 0 else (layer_idx - 1) // producer_frequency
+                prod_idx = min(prod_idx, len(state_dict_list) - 1)
+                key_proj = _extract_key_cache_proj(state_dict_list[prod_idx])
+                if key_proj is None:
+                    continue
+                merged_key_proj_full[layer_idx] = key_proj[layer_idx]
 
-            # [total_layers, 32, head_dim, dDash] -> [total_layers, 8, 4, head_dim, dDash] -> mean -> [total_layers, 8, head_dim, dDash]
             num_key_value_groups = num_heads // num_key_value_heads
             merged_key_proj = merged_key_proj_full.view(
-                total_layers, num_key_value_heads, num_key_value_groups, predictor.model_head_dim, dDash
+                total_layers,
+                num_key_value_heads,
+                num_key_value_groups,
+                predictor.model_head_dim,
+                dDash,
             ).mean(dim=2)
-            
-            print(f"  Aggregated key_cache_proj: {num_heads} attention heads -> {num_key_value_heads} KV heads (averaged within GQA groups)")
+            print(f"  Aggregated key_cache_proj: {num_heads} attn heads -> {num_key_value_heads} KV heads")
         
         # Assign aggregated key_cache_proj
         predictor.key_cache_proj.data.copy_(merged_key_proj)
