@@ -109,6 +109,7 @@ class Llama(LLM):
         quantize_int8: bool = False,  # Enable INT8 quantization for k_proj_cache
         oracle_random_indices: bool = True,
         page_size: int = 1,
+        cpu_chunk_size: int = 4096,  # Chunk size for dense CPU offloading attention
     ) -> None:
         # assert batch_size == 1, "Batch size must be 1"
         self.batch_size = batch_size
@@ -160,7 +161,7 @@ class Llama(LLM):
         # Initialize KeySifter predictor if needed
         self.keysifter_predictor = None
         self.producer_frequency = producer_frequency
-        if attn_mode.lower() == 'keysifter':
+        if attn_mode.lower() in ('keysifter', 'keysifter_cpu'):
             self.keysifter_predictor = load_keysifter_predictor(
                 config=self.config,
                 predictor_path=predictor_path,
@@ -186,6 +187,7 @@ class Llama(LLM):
             local_window=local_window,
             min_sparse_index=min_sparse_index,
             quantize_int8=quantize_int8,
+            cpu_chunk_size=cpu_chunk_size,
         )
 
         if self.minference:

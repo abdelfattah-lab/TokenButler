@@ -33,7 +33,10 @@ from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 from .kv_cache_xkv import ShadowKVCache_xKey, ShadowKVCache_xKV, ShadowKVCache_xKey_CPU, ShadowKVCache_xKV_CPU
 from .kv_cache_keysifter import KeySifterCache
+from .kv_cache_keysifter_cpu import KeySifterCache_CPU
+from .kv_cache_cpu import KV_Cache_CPU
 from .kv_cache_oracle import OracleCache
+from .kv_cache_oracle_cpu import OracleCache_CPU
 from .merge_configs import xKVConfig
 
 class LLM:
@@ -46,7 +49,7 @@ class LLM:
         """Return record_function context if profiling is enabled, otherwise nullcontext"""
         return record_function(name) if getattr(self, '_profiling_enabled', False) else nullcontext()
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -89,6 +92,47 @@ class LLM:
                 chunk_size=chunk_size,
                 random_indices=oracle_random_indices,
                 page_size=page_size,
+            )
+        elif self.attn_mode.lower() == 'keysifter_cpu':
+            if keysifter_predictor is None:
+                raise ValueError("KeySifter CPU mode requires a predictor. Pass keysifter_predictor to init_kv_cache.")
+            self.kv_cache = KeySifterCache_CPU(
+                config,
+                predictor=keysifter_predictor,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
+                quantize_int8=quantize_int8,
+            )
+        elif self.attn_mode.lower() == 'oracle_cpu':
+            self.kv_cache = OracleCache_CPU(
+                config,
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
+                random_indices=oracle_random_indices,
+                page_size=page_size,
+            )
+        elif self.attn_mode.lower() == 'full_cpu':
+            self.kv_cache = KV_Cache_CPU(
+                config,
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                chunk_size=cpu_chunk_size,
             )
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
@@ -181,10 +225,11 @@ class LLM:
         elif isinstance(self.kv_cache, ShadowKVCache) or isinstance(self.kv_cache, ShadowKVCache_CPU) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey) or isinstance(self.kv_cache, ShadowKVCache_xKV) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) or \
-             isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+             isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or \
+             isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
 
             # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle
-            is_keysifter_first_pass = (isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache)) and self.kv_cache.prefill_len == 0
+            is_keysifter_first_pass = (isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU)) and self.kv_cache.prefill_len == 0
             if q_len > 1024 or is_keysifter_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):
                     # svd unrope key and save
@@ -194,7 +239,7 @@ class LLM:
                         self.kv_cache.get_svd(key_states, value_states, layer_idx, fake_svd=self.fake_svd)
                     elif isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                         self.kv_cache.get_svd(key_states, value_states, layer_idx)
-                    elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                    elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
                         # Store un-RoPEd keys and compute projections of keys for importance scoring (skipped for Oracle)
                         self.kv_cache.get_svd(key_states, layer_idx)
                     else:
@@ -218,11 +263,17 @@ class LLM:
 
                 # KeySifter: compute importance queries and refetch for layer group at producer layers
                 # Note: layer 0 also needs to run predictor for layers 1-3, so don't skip it here
-                if isinstance(self.kv_cache, KeySifterCache):
+                if isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU):
                     producer_frequency = self.kv_cache.producer_frequency
                     if layer_idx % producer_frequency == 0:
                         with self._maybe_record_function("keysifter_prefetch"):
                             # hidden_states here is the residual (pre-attention), we need to pass it
+                            self.kv_cache.prefetch_layer_group(residual, layer_idx)
+                elif isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
+                    producer_frequency = self.kv_cache.producer_frequency
+                    if layer_idx % producer_frequency == 0:
+                        with self._maybe_record_function("oracle_prefetch"):
+                            # Oracle prefetch
                             self.kv_cache.prefetch_layer_group(residual, layer_idx)
 
                 # get retrieval idx
@@ -230,14 +281,14 @@ class LLM:
                     position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
 
                 # multi-stream
-                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache) and not isinstance(self.kv_cache, OracleCache):
+                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache) and not isinstance(self.kv_cache, KeySifterCache_CPU) and not isinstance(self.kv_cache, OracleCache) and not isinstance(self.kv_cache, OracleCache_CPU):
                     curr_stream = torch.cuda.current_stream()
                     get_value_stream = self.kv_cache.copy_stream
 
                 if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_value_cache_xKV_cpu"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
                     with self._maybe_record_function("get_value_cache_keysifter_or_oracle"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
                 else:
@@ -250,7 +301,7 @@ class LLM:
                 if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, OracleCache):
+                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
                     with self._maybe_record_function("get_key_cache_keysifter_or_oracle"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
                 else:
@@ -264,6 +315,34 @@ class LLM:
                 # flash attention
                 with self._maybe_record_function("flash_attn_with_kvcache"):
                     hidden_states = flash_attn_with_kvcache(q=query_states.transpose(1, 2), k_cache=key_states.transpose(1, 2), v_cache=value_states.transpose(1, 2), causal=True)
+
+        elif isinstance(self.kv_cache, KV_Cache_CPU):
+            # Dense attention with CPU offloading - uses chunked streaming
+            query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
+            
+            if q_len > 1:  # Prefill
+                # Store to CPU cache
+                self.kv_cache.prefill_kv_cache(value_states, layer_idx, key_states)
+                # For prefill, compute attention with flash_attn using GPU tensors
+                hidden_states = flash_attn_with_kvcache(
+                    q=query_states.transpose(1, 2), 
+                    k_cache=key_states.transpose(1, 2), 
+                    v_cache=value_states.transpose(1, 2), 
+                    causal=True
+                )
+            else:  # Decode
+                # Update CPU cache with new token
+                total_kv_len, _ = self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
+                
+                # Use chunked attention for long contexts
+                # query_states: [bsz, num_heads, 1, head_dim]
+                hidden_states = self.kv_cache.compute_chunked_attention(
+                    query=query_states,
+                    layer_idx=layer_idx,
+                    total_kv_len=total_kv_len,
+                )
+                # Reshape from [bsz, num_heads, 1, head_dim] to [bsz, 1, num_heads, head_dim]
+                hidden_states = hidden_states.transpose(1, 2)
 
         else:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
