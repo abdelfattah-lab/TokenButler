@@ -216,6 +216,7 @@ class KeySifterCache_CPU(CPUOffloadCacheBase):
     ):
         """
         Store prefill K/V cache on CPU and prepare for sparse decode.
+        Supports chunked prefill by accumulating across multiple calls.
         
         Args:
             new_v_cache: [bsz, num_kv_heads, seq_len, head_dim] - value states (GPU)
@@ -223,12 +224,14 @@ class KeySifterCache_CPU(CPUOffloadCacheBase):
             key_states_roped: [bsz, num_kv_heads, seq_len, head_dim] - RoPEd key states (GPU)
             query: Optional query states (unused)
         """
-        seq_len = new_v_cache.shape[2]
+        incoming_len = new_v_cache.shape[2]
+        current_len = self.prefill_len  # Start position for this chunk
+        new_total_len = current_len + incoming_len
         
-        # Copy to CPU cache (async for efficiency)
+        # Copy to CPU cache at the correct position (async for efficiency)
         with torch.cuda.stream(self.copy_stream):
-            self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states_roped.cpu(), non_blocking=True)
-            self.v_cache[layer_idx, :, :, :seq_len].copy_(new_v_cache.cpu(), non_blocking=True)
+            self.k_cache[layer_idx, :, :, current_len:new_total_len].copy_(key_states_roped.cpu(), non_blocking=True)
+            self.v_cache[layer_idx, :, :, current_len:new_total_len].copy_(new_v_cache.cpu(), non_blocking=True)
         
         # Project RoPEd keys for importance scoring (keep on GPU)
         proj_weight = self.predictor.key_cache_proj[layer_idx]
@@ -238,21 +241,22 @@ class KeySifterCache_CPU(CPUOffloadCacheBase):
             scale = k_proj.abs().amax(dim=(0, 2, 3), keepdim=True) / 127.0
             scale = scale.clamp(min=1e-8)
             k_proj_int8 = (k_proj / scale).round().clamp(-128, 127).to(torch.int8)
-            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj_int8)
+            self.k_proj_cache[layer_idx, :, :, current_len:new_total_len].copy_(k_proj_int8)
             self.k_proj_scale[layer_idx].copy_(scale.squeeze(0).unsqueeze(0))
         else:
-            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
+            self.k_proj_cache[layer_idx, :, :, current_len:new_total_len].copy_(k_proj)
         
-        # Copy sink tokens to GPU buffer (always kept)
-        sink_len = min(self.min_sparse_index, seq_len)
-        if sink_len > 0:
-            self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(key_states_roped[:, :, :sink_len])
-            self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(new_v_cache[:, :, :sink_len])
+        # Copy sink tokens to GPU buffer (only on first chunk)
+        if current_len == 0:
+            sink_len = min(self.min_sparse_index, incoming_len)
+            if sink_len > 0:
+                self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(key_states_roped[:, :, :sink_len])
+                self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(new_v_cache[:, :, :sink_len])
         
-        # Initialize circular buffer with last local_window tokens
+        # Initialize circular buffer with last local_window tokens from current chunk
         local_buffer_start = self.min_sparse_index
-        local_start = max(0, seq_len - self.local_window)
-        local_len = seq_len - local_start
+        local_start = max(0, incoming_len - self.local_window)
+        local_len = incoming_len - local_start
         self.k_cache_buffer[layer_idx, :, :, local_buffer_start:local_buffer_start + local_len].copy_(
             key_states_roped[:, :, local_start:]
         )
@@ -262,11 +266,11 @@ class KeySifterCache_CPU(CPUOffloadCacheBase):
         
         if layer_idx == self.num_hidden_layers - 1:
             self.copy_stream.synchronize()  # Ensure CPU copies complete
-            self.prefill_len = seq_len
-            self.kv_offset = seq_len
+            self.prefill_len = new_total_len
+            self.kv_offset = new_total_len
             self.gen_offset = 0
-            self.last_projected_pos = seq_len
-            self._dense_decode_cutoff = seq_len + 1
+            self.last_projected_pos = new_total_len
+            self._dense_decode_cutoff = new_total_len + 1
             self._uncommitted_decode = False
             self._uncommitted_incoming = 0
     

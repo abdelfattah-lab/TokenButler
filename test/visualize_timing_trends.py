@@ -10,6 +10,7 @@ import torch
 import time
 import sys
 import gc
+import csv
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
@@ -133,10 +134,72 @@ def monkey_patch_keysifter_for_profiling(llm, profiler):
     """
     if not hasattr(llm.kv_cache, 'profiler'):
         print("Warning: Not a KeySifter cache (no profiler attribute), skipping profiling")
-        return
+        return False
     
     # Simply set the profiler - the production code has conditional hooks
     llm.kv_cache.profiler = profiler
+    return True
+
+
+def export_to_csv(results, operations, output_path):
+    """
+    Export timing measurements to a CSV file for flexible post-processing.
+    
+    The CSV has one row per (context_length, topK, operation) combination,
+    with columns for all statistics (mean, std, min, max, count).
+    """
+    output_path = Path(output_path)
+    
+    # Create header
+    fieldnames = [
+        'context_length', 'topk', 'operation',
+        'mean_ms', 'std_ms', 'min_ms', 'max_ms', 'count',
+        'total_step_time_ms', 'pct_of_step'
+    ]
+    
+    rows = []
+    for result in results:
+        ctx_len = result['prompt_length']
+        topk = result['sparse_budget']
+        stats = result['profiling_stats']
+        
+        # Calculate total step time for percentage computation
+        total_step_time = sum(
+            stats[op]['mean'] for op in operations if op in stats
+        )
+        
+        for op in operations:
+            if op not in stats:
+                continue
+            op_stats = stats[op]
+            mean_ms = op_stats['mean'] * 1000  # Convert to ms
+            std_ms = op_stats['std'] * 1000
+            min_ms = op_stats['min'] * 1000
+            max_ms = op_stats['max'] * 1000
+            count = op_stats['count']
+            total_ms = total_step_time * 1000
+            pct = (op_stats['mean'] / total_step_time * 100) if total_step_time > 0 else 0
+            
+            rows.append({
+                'context_length': ctx_len,
+                'topk': topk,
+                'operation': op,
+                'mean_ms': f'{mean_ms:.4f}',
+                'std_ms': f'{std_ms:.4f}',
+                'min_ms': f'{min_ms:.4f}',
+                'max_ms': f'{max_ms:.4f}',
+                'count': count,
+                'total_step_time_ms': f'{total_ms:.4f}',
+                'pct_of_step': f'{pct:.2f}',
+            })
+    
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    print(f"  → Saved CSV: {output_path}")
+    return output_path
 
 
 def run_single_benchmark(prompt_length, gen_length, sparse_budget, predictor_path):
@@ -153,7 +216,7 @@ def run_single_benchmark(prompt_length, gen_length, sparse_budget, predictor_pat
         'sparse_budget': sparse_budget,
         'chunk_size': 8,
         'rank': 160,
-        'dDash': 8,
+        'dDash': 16,
         'producer_frequency': 4,
         'keysifter_intermediate_dim': 1024,
         'predictor_path': predictor_path,
@@ -191,6 +254,8 @@ def run_single_benchmark(prompt_length, gen_length, sparse_budget, predictor_pat
         profiler.active = (i % sample_rate == 0)
         position_ids = llm.get_ctx(next_token)
         logits = llm.inference(input_ids=next_token, position_ids=position_ids)
+        # Must call step() to synchronize and collect pending CUDA events
+        profiler.step()
         torch.cuda.synchronize()
 
     stats = profiler.get_stats()
@@ -689,12 +754,14 @@ def main():
     parser.add_argument('--gen-length', type=int, default=256, help='Generation length per config')
     parser.add_argument('--output-dir', type=str, default='test/output', help='Output directory')
     parser.add_argument('--load-cache', type=str, help='Load cached results from JSON')
+    parser.add_argument('--csv-only', action='store_true', help='Only export CSV, skip visualizations')
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
-    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash8.pt'
+    # weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash8.pt'
+    weights_path = ''
     
     # Key operations to track
     operations = [
@@ -716,7 +783,7 @@ def main():
             topk_values = [512, 1024, 2048]
         else:
             context_lengths = [4096, 8192, 16384, 32768, 65536]
-            topk_values = [1024, 2048, 4096]
+            topk_values = [2048, 8192]
         
         results = collect_sweep_data(context_lengths, topk_values, 
                                      args.gen_length, weights_path)
@@ -739,6 +806,14 @@ def main():
                 json_results.append(jr)
             json.dump(json_results, f, indent=2)
         print(f"\n✓ Cached results to {cache_file}")
+    
+    # Export to CSV for flexible post-processing
+    csv_file = output_dir / 'timing_measurements.csv'
+    export_to_csv(results, operations, csv_file)
+    
+    if args.csv_only:
+        print(f"\n{colored('✓ CSV export complete (--csv-only mode)', 'green')}")
+        return
     
     # Create visualizations
     print(f"\n{'='*60}")

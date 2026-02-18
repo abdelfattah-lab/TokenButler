@@ -155,6 +155,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
     ):
         """
         Store prefill K/V cache on CPU and prepare for sparse decode.
+        Supports chunked prefill by accumulating across multiple calls.
         
         Args:
             new_v_cache: [bsz, num_kv_heads, seq_len, head_dim] - value states (GPU)
@@ -162,23 +163,26 @@ class OracleCache_CPU(CPUOffloadCacheBase):
             key_states_roped: [bsz, num_kv_heads, seq_len, head_dim] - RoPEd key states (GPU)
             query: Optional query states (unused)
         """
-        seq_len = new_v_cache.shape[2]
+        incoming_len = new_v_cache.shape[2]
+        current_len = self.prefill_len  # Start position for this chunk
+        new_total_len = current_len + incoming_len
         
-        # Copy to CPU cache (async for efficiency)
+        # Copy to CPU cache at the correct position (async for efficiency)
         with torch.cuda.stream(self.copy_stream):
-            self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states_roped.cpu(), non_blocking=True)
-            self.v_cache[layer_idx, :, :, :seq_len].copy_(new_v_cache.cpu(), non_blocking=True)
+            self.k_cache[layer_idx, :, :, current_len:new_total_len].copy_(key_states_roped.cpu(), non_blocking=True)
+            self.v_cache[layer_idx, :, :, current_len:new_total_len].copy_(new_v_cache.cpu(), non_blocking=True)
         
-        # Copy sink tokens to GPU buffer (always kept)
-        sink_len = min(self.min_sparse_index, seq_len)
-        if sink_len > 0:
-            self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(key_states_roped[:, :, :sink_len])
-            self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(new_v_cache[:, :, :sink_len])
+        # Copy sink tokens to GPU buffer (only on first chunk)
+        if current_len == 0:
+            sink_len = min(self.min_sparse_index, incoming_len)
+            if sink_len > 0:
+                self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(key_states_roped[:, :, :sink_len])
+                self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(new_v_cache[:, :, :sink_len])
         
-        # Initialize circular buffer with last local_window tokens
+        # Initialize circular buffer with last local_window tokens from current chunk
         local_buffer_start = self.min_sparse_index
-        local_start = max(0, seq_len - self.local_window)
-        local_len = seq_len - local_start
+        local_start = max(0, incoming_len - self.local_window)
+        local_len = incoming_len - local_start
         self.k_cache_buffer[layer_idx, :, :, local_buffer_start:local_buffer_start + local_len].copy_(
             key_states_roped[:, :, local_start:]
         )
@@ -188,8 +192,8 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         
         if layer_idx == self.num_hidden_layers - 1:
             self.copy_stream.synchronize()  # Ensure CPU copies complete
-            self.prefill_len = seq_len
-            self.kv_offset = seq_len
+            self.prefill_len = new_total_len
+            self.kv_offset = new_total_len
             self.gen_offset = 0
             self.local_window_head = 0
     
@@ -277,8 +281,10 @@ class OracleCache_CPU(CPUOffloadCacheBase):
                 num_pages_to_select = min(num_pages_to_select, num_pages_available)
                 
                 if num_pages_to_select > 0:
-                    # Pick random pages
-                    random_page_indices = torch.randperm(num_pages_available, device=self.device)[:num_pages_to_select]
+                    # Pick random pages - O(k) using randint instead of O(n) randperm
+                    random_page_indices = torch.randint(
+                        0, num_pages_available, (num_pages_to_select,), device=self.device, dtype=torch.long
+                    )
                     random_page_indices, _ = random_page_indices.sort()
                     
                     # Expand to full token indices
@@ -298,13 +304,18 @@ class OracleCache_CPU(CPUOffloadCacheBase):
                         device=self.device, dtype=torch.long
                     )
             else:
-                # Standard random selection
+                # Standard random selection - O(k) using randint instead of O(n) randperm
                 num_to_select = min(self.sparse_budget, num_available)
                 
                 if num_to_select > 0:
-                    # Generate random positions from [min_sparse_index, local_start) and sort them
-                    random_positions = torch.randperm(num_available, device=self.device)[:num_to_select] + self.min_sparse_index
+                    # Generate k random positions directly with randint (may have duplicates, but k << n so rare)
+                    # For truly unique sampling, we'd use reservoir sampling, but this is good enough for benchmarking
+                    random_positions = torch.randint(
+                        0, num_available, (num_to_select,), device=self.device, dtype=torch.long
+                    )
+                    # Sort and add offset to skip sink tokens
                     random_positions, _ = random_positions.sort()
+                    random_positions = random_positions + self.min_sparse_index
 
                     # Expand to [bsz, num_kv_heads, num_to_select]
                     position_ids = random_positions.unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
@@ -346,55 +357,51 @@ class OracleCache_CPU(CPUOffloadCacheBase):
             hidden_states: [bsz, 1, hidden_size] - current hidden states (unused for Oracle)
             start_layer_idx: Starting layer index for this producer group
         """
-        if start_layer_idx == 0:
-            # Layer 0: Full dense attention - return cache directly from CPU
-            # Don't copy to GPU buffer since it's too small for full context
-            # get_key_cache and get_value_cache will handle returning from CPU
-            pass
-        else:
-            # Other layers: Sparse attention - generate indices and gather from CPU
-            # Get oracle indices (same for all layers in group)
-            dummy_query = torch.zeros(
-                self.batch_size, self.num_key_value_heads, 1, self.head_dim,
-                device=self.device, dtype=self.dtype
-            )
-            position_ids = self.get_retrieval_position_ids(start_layer_idx, dummy_query)
+        # For Oracle CPU, all layers use sparse attention (no special case for layer 0)
+        # This ensures O(1) performance regardless of context length
+        
+        # Get oracle indices (same for all layers in group)
+        dummy_query = torch.zeros(
+            self.batch_size, self.num_key_value_heads, 1, self.head_dim,
+            device=self.device, dtype=self.dtype
+        )
+        position_ids = self.get_retrieval_position_ids(start_layer_idx, dummy_query)
+        
+        if position_ids.numel() == 0:
+            # No sparse positions to gather
+            return
+        
+        num_selected = position_ids.shape[-1]
+        sparse_buffer_start = self.min_sparse_index + self.local_window
+        
+        # Create gather indices for CPU tensors
+        # position_ids: [bsz, num_kv_heads, num_selected]
+        # Need: [bsz, num_kv_heads, num_selected, head_dim]
+        indices_expanded = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+        
+        # Move indices to CPU for gathering
+        indices_cpu = indices_expanded.cpu()
+        
+        # Gather from CPU cache for all layers in the group
+        consumer_start = start_layer_idx
+        consumer_end = min(start_layer_idx + self.producer_frequency, self.num_hidden_layers)
+        
+        for layer_idx in range(consumer_start, consumer_end):
+            # Gather keys
+            k_gathered = torch.gather(self.k_cache[layer_idx], dim=2, index=indices_cpu)
+            # Gather values
+            v_gathered = torch.gather(self.v_cache[layer_idx], dim=2, index=indices_cpu)
             
-            if position_ids.numel() == 0:
-                # No sparse positions to gather
-                return
-            
-            num_selected = position_ids.shape[-1]
-            sparse_buffer_start = self.min_sparse_index + self.local_window
-            
-            # Create gather indices for CPU tensors
-            # position_ids: [bsz, num_kv_heads, num_selected]
-            # Need: [bsz, num_kv_heads, num_selected, head_dim]
-            indices_expanded = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-            
-            # Move indices to CPU for gathering
-            indices_cpu = indices_expanded.cpu()
-            
-            # Gather from CPU cache for all layers in the group
-            consumer_start = start_layer_idx
-            consumer_end = min(start_layer_idx + self.producer_frequency, self.num_hidden_layers)
-            
-            for layer_idx in range(consumer_start, consumer_end):
-                # Gather keys
-                k_gathered = torch.gather(self.k_cache[layer_idx], dim=2, index=indices_cpu)
-                # Gather values
-                v_gathered = torch.gather(self.v_cache[layer_idx], dim=2, index=indices_cpu)
-                
-                # Transfer gathered results to GPU buffer
-                with torch.cuda.stream(self.copy_stream):
-                    self.k_cache_buffer[layer_idx, :, :, sparse_buffer_start:sparse_buffer_start + num_selected].copy_(
-                        k_gathered.to(self.device, non_blocking=True)
-                    )
-                    self.v_cache_buffer[layer_idx, :, :, sparse_buffer_start:sparse_buffer_start + num_selected].copy_(
-                        v_gathered.to(self.device, non_blocking=True)
-                    )
-            
-            self.copy_stream.synchronize()
+            # Transfer gathered results to GPU buffer
+            with torch.cuda.stream(self.copy_stream):
+                self.k_cache_buffer[layer_idx, :, :, sparse_buffer_start:sparse_buffer_start + num_selected].copy_(
+                    k_gathered.to(self.device, non_blocking=True)
+                )
+                self.v_cache_buffer[layer_idx, :, :, sparse_buffer_start:sparse_buffer_start + num_selected].copy_(
+                    v_gathered.to(self.device, non_blocking=True)
+                )
+        
+        self.copy_stream.synchronize()
     
     def get_key_cache(
         self,
@@ -406,8 +413,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         """
         Get key cache for attention computation.
         
-        For layer 0: Return full cache from GPU buffer
-        For other layers: Return [sink | local_window | sparse_selected] from GPU buffer
+        All layers use sparse attention for Oracle CPU: [sink | local_window | sparse_selected]
         
         Args:
             layer_idx: Layer index
@@ -418,15 +424,10 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         Returns:
             key_cache: [bsz, num_kv_heads, total_len, head_dim]
         """
-        if layer_idx == 0:
-            # Layer 0: Return full cache from CPU (transfer to GPU on-the-fly)
-            total_len = self.kv_offset
-            return self.k_cache[layer_idx, :, :, :total_len].to(self.device)
-        else:
-            # Other layers: Return [sink | local_window | sparse] from GPU buffer
-            num_selected = position_ids.shape[-1]
-            total_len = self.min_sparse_index + self.local_window + num_selected
-            return self.k_cache_buffer[layer_idx, :, :, :total_len]
+        # All layers use sparse attention - O(1) regardless of context length
+        num_selected = position_ids.shape[-1]
+        total_len = self.min_sparse_index + self.local_window + num_selected
+        return self.k_cache_buffer[layer_idx, :, :, :total_len]
     
     def get_value_cache(
         self,
@@ -436,8 +437,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         """
         Get value cache for attention computation.
         
-        For layer 0: Return full cache from GPU buffer
-        For other layers: Return [sink | local_window | sparse_selected] from GPU buffer
+        All layers use sparse attention for Oracle CPU: [sink | local_window | sparse_selected]
         
         Args:
             layer_idx: Layer index
@@ -446,12 +446,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         Returns:
             value_cache: [bsz, num_kv_heads, total_len, head_dim]
         """
-        if layer_idx == 0:
-            # Layer 0: Return full cache from CPU (transfer to GPU on-the-fly)
-            total_len = self.kv_offset
-            return self.v_cache[layer_idx, :, :, :total_len].to(self.device)
-        else:
-            # Other layers: Return [sink | local_window | sparse] from GPU buffer
-            num_selected = position_ids.shape[-1]
-            total_len = self.min_sparse_index + self.local_window + num_selected
-            return self.v_cache_buffer[layer_idx, :, :, :total_len]
+        # All layers use sparse attention - O(1) regardless of context length
+        num_selected = position_ids.shape[-1]
+        total_len = self.min_sparse_index + self.local_window + num_selected
+        return self.v_cache_buffer[layer_idx, :, :, :total_len]

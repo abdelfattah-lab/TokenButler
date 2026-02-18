@@ -267,6 +267,7 @@ class KeySifterCache:
     ):
         """
         Store prefill K/V cache and prepare for sparse decode.
+        Supports chunked prefill by accumulating across multiple calls.
         
         Args:
             new_v_cache: [bsz, num_kv_heads, seq_len, head_dim] - value states
@@ -274,13 +275,15 @@ class KeySifterCache:
             key_states_roped: [bsz, num_kv_heads, seq_len, head_dim] - RoPEd key states
             query: Optional query states (unused)
         """
-        seq_len = new_v_cache.shape[2]
+        incoming_len = new_v_cache.shape[2]
+        current_len = self.prefill_len  # Start position for this chunk
+        new_total_len = current_len + incoming_len
         
-        # Store full RoPEd key cache (for sparse retrieval during decode)
-        self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states_roped)
+        # Store full RoPEd key cache at the correct position (for sparse retrieval during decode)
+        self.k_cache[layer_idx, :, :, current_len:new_total_len].copy_(key_states_roped)
         
         # Store value cache
-        self.v_cache[layer_idx, :, :, :seq_len].copy_(new_v_cache)
+        self.v_cache[layer_idx, :, :, current_len:new_total_len].copy_(new_v_cache)
         
         # Project RoPEd keys for importance scoring (per KV head)
         # key_states_roped: [B, num_kv_heads, L, head_dim]
@@ -295,29 +298,29 @@ class KeySifterCache:
             scale = k_proj.abs().amax(dim=(0, 2, 3), keepdim=True) / 127.0  # [1, num_kv_heads, 1, 1]
             scale = scale.clamp(min=1e-8)  # Avoid division by zero
             k_proj_int8 = (k_proj / scale).round().clamp(-128, 127).to(torch.int8)
-            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj_int8)
+            self.k_proj_cache[layer_idx, :, :, current_len:new_total_len].copy_(k_proj_int8)
             # Store scale - reshape to match [num_layers, 1, num_kv_heads, 1, 1]
             self.k_proj_scale[layer_idx].copy_(scale.squeeze(0).unsqueeze(0))
         else:
-            self.k_proj_cache[layer_idx, :, :, :seq_len].copy_(k_proj)
+            self.k_proj_cache[layer_idx, :, :, current_len:new_total_len].copy_(k_proj)
         
-        # Copy sink tokens to buffer (first min_sparse_index positions)
-        # These are always kept and never overwritten
-        sink_len = min(self.min_sparse_index, seq_len)
-        if sink_len > 0:
-            self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(
-                key_states_roped[:, :, :sink_len]
-            )
-            self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(
-                new_v_cache[:, :, :sink_len]
-            )
+        # Copy sink tokens to buffer (first min_sparse_index positions) - only on first chunk
+        if current_len == 0:
+            sink_len = min(self.min_sparse_index, incoming_len)
+            if sink_len > 0:
+                self.k_cache_buffer[layer_idx, :, :, :sink_len].copy_(
+                    key_states_roped[:, :, :sink_len]
+                )
+                self.v_cache_buffer[layer_idx, :, :, :sink_len].copy_(
+                    new_v_cache[:, :, :sink_len]
+                )
 
-        # Initialize circular buffer with last local_window tokens from prefill
+        # Initialize circular buffer with last local_window tokens from current chunk
         # These will be the most recent tokens at the start of decode
         # Buffer layout: [sink_tokens | local_window | sparse_selected]
         local_buffer_start = self.min_sparse_index  # Offset for local window in buffer
-        local_start = max(0, seq_len - self.local_window)
-        local_len = seq_len - local_start
+        local_start = max(0, incoming_len - self.local_window)
+        local_len = incoming_len - local_start
         self.k_cache_buffer[layer_idx, :, :, local_buffer_start:local_buffer_start + local_len].copy_(
             key_states_roped[:, :, local_start:]
         )
@@ -325,16 +328,16 @@ class KeySifterCache:
             new_v_cache[:, :, local_start:]
         )
         # Circular buffer starts with head at 0, and local_len items filled
-        # If seq_len < local_window, only first local_len positions are valid
+        # If incoming_len < local_window, only first local_len positions are valid
         
-        # Only update prefill_len after the last layer to ensure all layers see prefill_len=0
+        # Only update prefill_len after the last layer to ensure all layers see same prefill_len
         # during the prefill pass (otherwise subsequent layers think prefill is complete)
         if layer_idx == self.num_hidden_layers - 1:
-            self.prefill_len = seq_len
-            self.kv_offset = seq_len
+            self.prefill_len = new_total_len
+            self.kv_offset = new_total_len
             self.gen_offset = 0
-            self.last_projected_pos = seq_len  # Prefill tokens are already projected
-            self._dense_decode_cutoff = seq_len + 1  # Keep first decode token dense (matching baseline)
+            self.last_projected_pos = new_total_len  # Prefill tokens are already projected
+            self._dense_decode_cutoff = new_total_len + 1  # Keep first decode token dense (matching baseline)
             self._uncommitted_decode = False
             self._uncommitted_incoming = 0
     

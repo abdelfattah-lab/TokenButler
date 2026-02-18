@@ -153,7 +153,9 @@ class KV_Cache_CPU(CPUOffloadCacheBase):
         """
         bsz, _, incoming, _ = new_v_cache.shape
         
-        if bsz == self.batch_size:
+        # For batch_size=1 (single sequence), always use prefilled_batch=0
+        # For batch_size>1, reset at layer 0 for each new forward pass
+        if layer_idx == 0:
             self.prefilled_batch = 0
         
         # Store to CPU cache
@@ -356,6 +358,7 @@ class KV_Cache_CPU(CPUOffloadCacheBase):
     ):
         """
         Store prefill K/V cache.
+        Supports chunked prefill by accumulating across multiple calls.
         
         Args:
             new_v_cache: [bsz, num_kv_heads, seq_len, head_dim]
@@ -363,20 +366,22 @@ class KV_Cache_CPU(CPUOffloadCacheBase):
             key_states_roped: [bsz, num_kv_heads, seq_len, head_dim]
             query: Optional (unused)
         """
-        seq_len = new_v_cache.shape[2]
+        incoming_len = new_v_cache.shape[2]
+        current_len = self.kv_offset  # Start position for this chunk
+        new_total_len = current_len + incoming_len
         
-        # Copy to CPU cache
+        # Copy to CPU cache at the correct position (accumulate for chunked prefill)
         with torch.cuda.stream(self.copy_stream):
-            self.k_cache[layer_idx, :, :, :seq_len].copy_(
+            self.k_cache[layer_idx, :, :, current_len:new_total_len].copy_(
                 key_states_roped.cpu(), non_blocking=True
             )
-            self.v_cache[layer_idx, :, :, :seq_len].copy_(
+            self.v_cache[layer_idx, :, :, current_len:new_total_len].copy_(
                 new_v_cache.cpu(), non_blocking=True
             )
         
         if layer_idx == self.num_layers - 1:
             self.copy_stream.synchronize()
-            self.kv_offset = seq_len
+            self.kv_offset = new_total_len
     
     def get_key_cache(
         self,

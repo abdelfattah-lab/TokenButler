@@ -69,7 +69,8 @@ class KV_Cache:
 
         bsz, _, incoming, _ = new_v_cache.shape # [bsz, num_kv_heads, incoming, head_dim]
 
-        if bsz == self.batch_size:
+        # Reset prefilled_batch at the start of each forward pass (layer 0)
+        if layer_idx == 0:
             self.prefilled_batch = 0
 
         self.k_cache[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.kv_offset:self.kv_offset + incoming].copy_(new_k_cache)
@@ -86,6 +87,9 @@ class KV_Cache:
             self.prefilled_batch += bsz
             if self.prefilled_batch == self.batch_size:
                 self.kv_offset += incoming
+                # Debug print for chunked prefill
+                if self.kv_offset % (64 * 1024) == 0 and incoming > 1024:
+                    print(f"[KV_Cache] Chunk processed: kv_offset now {self.kv_offset}, incoming was {incoming}")
         
         return key.to(self.device), value.to(self.device)
     

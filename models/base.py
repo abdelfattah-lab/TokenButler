@@ -48,6 +48,16 @@ class LLM:
     def _maybe_record_function(self, name):
         """Return record_function context if profiling is enabled, otherwise nullcontext"""
         return record_function(name) if getattr(self, '_profiling_enabled', False) else nullcontext()
+    
+    def set_prefill_chunk_size(self, chunk_size: int):
+        """Set the chunk size for chunked prefill (to handle very long contexts without OOM).
+        
+        Args:
+            chunk_size: Maximum tokens to process in a single prefill pass. 
+                       Longer sequences will be split into chunks.
+                       Set to None or 0 to disable chunking.
+        """
+        self.prefill_chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
 
     def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096):
         if self.attn_mode == 'full':
@@ -172,7 +182,33 @@ class LLM:
     @torch.inference_mode()
     def prefill(self, input_ids: torch.LongTensor):
         self.kv_cache.clear()
-        logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
+        
+        # Check if we need to chunk the prefill
+        seq_len = input_ids.shape[1]
+        chunk_size = getattr(self, 'prefill_chunk_size', None)
+        
+        if chunk_size is not None and seq_len > chunk_size:
+            # Chunked prefill: process the prompt in chunks to avoid OOM on very long contexts
+            num_chunks = (seq_len + chunk_size - 1) // chunk_size
+            print(f"[Chunked Prefill] Processing {seq_len} tokens in {num_chunks} chunks of {chunk_size} tokens")
+            
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, seq_len)
+                chunk_ids = input_ids[:, start_idx:end_idx]
+                
+                # Get position ids for this chunk
+                position_ids = self.get_ctx(chunk_ids)
+                
+                # Process chunk (accumulates KV cache)
+                logits = self.inference(input_ids=chunk_ids, position_ids=position_ids)
+                
+                # Free memory after each chunk
+                if i < num_chunks - 1:  # Don't clear on last chunk
+                    torch.cuda.empty_cache()
+        else:
+            # Normal prefill: process entire sequence at once
+            logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
 
         assert self.kv_cache.get_kv_len() == input_ids.shape[-1], f"KV length mismatch, got {self.kv_cache.get_kv_len()}, expected {input_ids.shape[-1]}"
         return logits
@@ -229,6 +265,8 @@ class LLM:
              isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
 
             # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle
+            # NOTE: When using chunked prefill, each chunk goes through this prefill path separately.
+            # The decode path below (q_len == 1) is completely unaffected by chunking.
             is_keysifter_first_pass = (isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU)) and self.kv_cache.prefill_len == 0
             if q_len > 1024 or is_keysifter_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):

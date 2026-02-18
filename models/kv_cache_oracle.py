@@ -157,18 +157,21 @@ class OracleCache:
     ):
         """
         Store prefill K/V cache.
+        Supports chunked prefill by accumulating across multiple calls.
         """
-        seq_len = new_v_cache.shape[2]
+        incoming_len = new_v_cache.shape[2]
+        current_len = self.prefill_len  # Start position for this chunk
+        new_total_len = current_len + incoming_len
         
-        # Store full RoPEd key cache (for sparse retrieval during decode)
-        self.k_cache[layer_idx, :, :, :seq_len].copy_(key_states_roped)
+        # Store full RoPEd key cache at the correct position (for sparse retrieval during decode)
+        self.k_cache[layer_idx, :, :, current_len:new_total_len].copy_(key_states_roped)
         
         # Store value cache
-        self.v_cache[layer_idx, :, :, :seq_len].copy_(new_v_cache)
+        self.v_cache[layer_idx, :, :, current_len:new_total_len].copy_(new_v_cache)
         
-        # Initialize circular buffer with last local_window tokens from prefill
-        local_start = max(0, seq_len - self.local_window)
-        local_len = seq_len - local_start
+        # Initialize circular buffer with last local_window tokens from current chunk
+        local_start = max(0, incoming_len - self.local_window)
+        local_len = incoming_len - local_start
         self.k_cache_buffer[layer_idx, :, :, :local_len].copy_(
             key_states_roped[:, :, local_start:]
         )
@@ -177,8 +180,8 @@ class OracleCache:
         )
         
         if layer_idx == self.num_hidden_layers - 1:
-            self.prefill_len = seq_len
-            self.kv_offset = seq_len
+            self.prefill_len = new_total_len
+            self.kv_offset = new_total_len
             self.gen_offset = 0
     
     def update_kv_cache(
@@ -245,6 +248,20 @@ class OracleCache:
     
     def compute_predictor_importance(self, hidden_states: torch.Tensor, layer_idx: int):
         """No-op for OracleCache."""
+        pass
+    
+    def prefetch_layer_group(
+        self,
+        hidden_states: torch.Tensor,
+        start_layer_idx: int,
+    ):
+        """
+        No-op for OracleCache since all data is already on GPU.
+        
+        Args:
+            hidden_states: [bsz, 1, hidden_size] - current hidden states (unused)
+            start_layer_idx: Starting layer index for this producer group (unused)
+        """
         pass
     
     def get_retrieval_position_ids(

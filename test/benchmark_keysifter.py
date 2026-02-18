@@ -28,8 +28,9 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
     # Initialize model
     model_kwargs = {
         'model_name': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
+        # 'model_name': 'meta-llama/Llama-3.2-1B',
         'batch_size': 1,
-        'max_length': 136072,
+        'max_length': prompt_length + gen_length + 16,
         'device': 'cuda:0',
         'dtype': torch.bfloat16,
         'attn_mode': attn_mode,
@@ -62,6 +63,14 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
     print("Initializing model...")
     llm = Llama(**model_kwargs)
     
+    # Enable chunked prefill for very long contexts (> 128K tokens)
+    # This splits prefill into chunks to avoid OOM from attention computation
+    PREFILL_CHUNK_THRESHOLD = 128 * 1024
+    PREFILL_CHUNK_SIZE = 64 * 1024  # 64K tokens per chunk
+    
+    if prompt_length > PREFILL_CHUNK_THRESHOLD:
+        print(f"[Chunked Prefill Enabled] Context length {prompt_length} > {PREFILL_CHUNK_THRESHOLD}, using chunks of {PREFILL_CHUNK_SIZE}")
+        llm.set_prefill_chunk_size(PREFILL_CHUNK_SIZE)
 
 
     # Create prompt
