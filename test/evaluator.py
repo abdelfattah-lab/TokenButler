@@ -55,10 +55,35 @@ class Evaluator:
         if self.dist_config.is_distributed:
             dist.barrier()
 
+        is_multi_turn_ruler = (
+            getattr(dataset, 'inference_mode', 'single_turn') == 'multi_turn'
+            and 'ruler' in dataset.dataset_name
+            and dataset.tokenized_contexts is not None
+        )
+
         progress_bar = tqdm(range(dataset.num_samples // bsz), desc='Testing', disable=self.dist_config.is_distributed and not self.dist_config.master_process)
         for i in range(dataset.num_samples // bsz):
             prompt = torch.cat([dataset.tokenized_prompts[i*bsz+j] for j in range(bsz)], dim=0)
-            if 'persona' in dataset.dataset_name:
+            if is_multi_turn_ruler:
+                assert bsz == 1, "Multi-turn ruler evaluation requires batch_size=1"
+                context = dataset.tokenized_contexts[i]
+                query = dataset.tokenized_queries[i]
+                if context is not None and query is not None:
+                    # Turn 1: prefill context only (no extra tokens generated)
+                    llm.prefill(context.to(llm.device))
+                    llm.kv_cache.H2D()
+                    # Turn 2: generate from query using cached context
+                    rets = llm.generate(query.to(llm.device), cont=True, gen_len=dataset.gen_len, top_p=1.0, temperature=0.0)
+                else:
+                    # Fallback to single-turn if split failed
+                    rets = llm.generate(prompt.to(llm.device), gen_len=dataset.gen_len, verbose=False, top_p=1.0, temperature=0.0)
+                for (pred, gt) in zip(rets, dataset.gt[i*bsz:(i+1)*bsz]):
+                    if isinstance(gt, list):
+                        if len(gt) == 1:
+                            gt = gt[0]
+                    scores.append(dataset.metric(pred, gt))
+
+            elif 'persona' in dataset.dataset_name:
                 assert bsz == 1
                 llm.generate(prompt.to(llm.device), gen_len=0, verbose=False, top_p=0.9, temperature=0.0) # prefill ctx
                 queries = dataset.queries[i]

@@ -101,6 +101,10 @@ def parse_args() -> Namespace:
     p.add_argument("--dDash", type=int, default=32, help="Reduced dimension for KeySifter importance computation")
     p.add_argument("--producer_frequency", type=int, default=4, help="Number of layers served by one KeySifter predictor")
     p.add_argument("--keysifter_intermediate_dim", type=int, default=512, help="KeySifter MLP intermediate dimension")
+    p.add_argument("--predict_interval", type=int, default=1, help="Predict important tokens every N decode tokens (1=every token, baseline)")
+    p.add_argument("--enable_neighbor_fetch", action='store_true', default=False, help="Enable neighbor fetching with 2x sparse buffer")
+    p.add_argument("--inference_mode", type=str, default="single_turn", choices=["single_turn", "multi_turn"],
+                   help="Inference mode: single_turn (combined prompt) or multi_turn (prefill context, then query)")
 
     return p.parse_args()
 
@@ -142,13 +146,14 @@ if __name__ == '__main__':
 
     llm = LLM(model_name=model_name, batch_size=batch_size, device=dist_config.device, max_length=datalen+2048, attn_mode=args.method, dtype=dtype,
               sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd,
-              predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim)
+              predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim,
+              predict_interval=args.predict_interval, enable_neighbor_fetch=args.enable_neighbor_fetch)
 
     if dist_config.master_process:
         llm.print_kv_stats()
 
     for dataset_name in dataset_names:
-        dataset = Dataset(dataset_name, llm.tokenizer, datalen, num_samples, evaluator.dist_config.rank, evaluator.dist_config.world_size)
+        dataset = Dataset(dataset_name, llm.tokenizer, datalen, num_samples, evaluator.dist_config.rank, evaluator.dist_config.world_size, inference_mode=args.inference_mode)
         evaluator.test(llm, dataset, f"archive/{model_name.split('/')[-1]}/{dataset_name}_{datalen}_{args.method}_b{sparse_budget}_c{chunk_size}_x{args.group_size}_r{rank}_k{rank_k}_v{rank_v}.jsonl", args.method)
 
     evaluator.summarize()
