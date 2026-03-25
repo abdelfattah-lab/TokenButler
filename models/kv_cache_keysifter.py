@@ -53,6 +53,8 @@ class KeySifterCache:
         local_window: int = 512,
         min_sparse_index: int = 128,
         quantize_int8: bool = False,
+        predict_interval: int = 1,
+        enable_neighbor_fetch: bool = False,
     ) -> None:
         """
         Args:
@@ -68,6 +70,8 @@ class KeySifterCache:
             local_window: Number of recent tokens to always include (default 512, matching KeySifter baseline)
             min_sparse_index: Number of initial "sink" tokens to always keep (default 128, matching KeySifter baseline)
             quantize_int8: If True, store k_proj_cache as INT8 for memory bandwidth reduction
+            predict_interval: Predict important tokens every N decode tokens (1 = every token, baseline)
+            enable_neighbor_fetch: If True, double the sparse buffer and fetch neighbor tokens alongside important ones
         """
         self.config = config
         self.predictor = predictor
@@ -87,6 +91,9 @@ class KeySifterCache:
         self.chunk_size = chunk_size
         self.producer_frequency = producer_frequency
         self.dDash = predictor.dDash
+        self.predict_interval = predict_interval
+        self.enable_neighbor_fetch = enable_neighbor_fetch
+        self.effective_sparse_capacity = sparse_budget * 2 if enable_neighbor_fetch else sparse_budget
 
         # Local window to always include (matching KeySifter baseline's sliding_window)
         self.local_window = local_window  # Default 512 to match baseline
@@ -157,8 +164,8 @@ class KeySifterCache:
         # Buffer for assembling KV during decode: [sink_tokens | local_window (circular) | sparse_selected]
         # Layout: first min_sparse_index positions for sink tokens (always kept)
         #         next local_window positions for recent tokens (circular buffer)
-        #         remaining sparse_budget positions for importance-selected tokens
-        buffer_size = self.min_sparse_index + self.local_window + sparse_budget
+        #         remaining positions for importance-selected tokens (2x when neighbor fetch is enabled)
+        buffer_size = self.min_sparse_index + self.local_window + self.effective_sparse_capacity
         self.k_cache_buffer = torch.zeros(
             self.num_hidden_layers,
             batch_size,
@@ -185,7 +192,10 @@ class KeySifterCache:
         self.last_projected_pos = 0  # Track up to which position we've projected decode tokens
         self.local_window_head = 0  # Circular queue head pointer for local window
         self._dense_decode_cutoff = 0  # Position after which to apply sparsity (keeps first decode token dense)
-        
+        self._last_num_sparse_selected = 0  # Actual number of sparse tokens in buffer (for neighbor fetch)
+        self._force_next_prediction = False  # Force prediction on next decode step (used after prefill_cont)
+        self.prefill_cont_dense = True  # If True, force predict_interval=1 during prefill_cont
+
         # Store importance queries from producer layers
         # Shape: [batch*heads, N_slots, 1, dDash] (for decode, Lq=1)
         self.q_importance_cache = None
@@ -237,6 +247,7 @@ class KeySifterCache:
         self.last_projected_pos = 0
         self.local_window_head = 0
         self.q_importance_cache = None
+        self._last_num_sparse_selected = 0
         self._uncommitted_decode = False
         self._uncommitted_incoming = 0
 
@@ -394,6 +405,7 @@ class KeySifterCache:
             # Now the kv_offset is committed.
             self._uncommitted_decode = False
             self._uncommitted_incoming = 0
+            self._force_next_prediction = False
 
             # Archive when circular buffer is full (pointer just wrapped to 0)
             # At this point, the buffer contains exactly local_window tokens that need archiving.
@@ -467,6 +479,16 @@ class KeySifterCache:
         kv_len = self._kv_len_eff()
         if kv_len <= self._dense_decode_cutoff:
             return  # Skip sparse selection, layers will use full cache via get_key_cache check
+
+        # Prediction stride: skip prediction on non-stride tokens, reuse previous buffer.
+        # gen_offset reflects completed decode tokens (committed at last layer).
+        # The first decode token (gen_offset==0) is always dense (skipped above).
+        # The first non-dense token (gen_offset==1) must always run prediction.
+        # After that, predict every N tokens relative to the first non-dense token.
+        if self.predict_interval > 1 and not self._force_next_prediction:
+            non_dense_offset = self.gen_offset - 1  # 0-based from first non-dense token
+            if non_dense_offset > 0 and non_dense_offset % self.predict_interval != 0:
+                return
 
         # Only use the last token's hidden state for importance computation
         if hidden_states.shape[1] > 1:
@@ -562,9 +584,20 @@ class KeySifterCache:
             with self._record('topk_selection'):
                 _, topk_indices = torch.topk(scores, k=num_to_select, dim=-1)  # [B, Layers, KvH, budget]
                 topk_indices, _ = topk_indices.sort(dim=-1)
-            
+
+            # Expand with neighbors if enabled
+            if self.enable_neighbor_fetch:
+                topk_indices = self._expand_with_neighbors(
+                    topk_indices, selection_start, selection_end
+                )
+                num_in_buffer = topk_indices.shape[-1]
+            else:
+                num_in_buffer = num_to_select
+
+            self._last_num_sparse_selected = num_in_buffer
+
             # 5. Batched Retrieval (Gather)
-            # Prepare indices: [Layers, B, KvH, budget, HeadDim]
+            # Prepare indices: [Layers, B, KvH, num_in_buffer, HeadDim]
             indices_perm = topk_indices.permute(1, 0, 2, 3)
             indices_expanded = indices_perm.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
 
@@ -576,16 +609,95 @@ class KeySifterCache:
 
             # Gather K
             with self._record('get_key_cache_total'):
-                out_k = self.k_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_to_select]
+                out_k = self.k_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_in_buffer]
                 torch.gather(k_source, dim=3, index=indices_expanded, out=out_k)
 
             # Gather V
             with self._record('get_value_cache_total'):
-                out_v = self.v_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_to_select]
+                out_v = self.v_cache_buffer[consumer_start:consumer_end, :, :, sparse_start:sparse_start+num_in_buffer]
                 torch.gather(v_source, dim=3, index=indices_expanded, out=out_v)
-            
+
         else:
-            pass  # Nothing to select, buffer already has local window (handled by update)
+            self._last_num_sparse_selected = 0
+
+    def _expand_with_neighbors(
+        self,
+        topk_indices: torch.Tensor,
+        selection_start: int,
+        selection_end: int,
+    ) -> torch.Tensor:
+        """
+        Expand top-k indices by adding unique neighboring tokens.
+        Fully GPU-based using cluster-aware offsets.
+
+        For each selected index, computes the size of its consecutive cluster
+        and adds (index + cluster_size) as the neighbor. This ensures each
+        element's neighbor lands just past the cluster end, producing unique
+        entries without collisions within a cluster.
+
+        Remaining gaps (from inter-cluster collisions or boundary clamping)
+        are filled with sequential positions after the last valid entry.
+
+        Target size: sparse_budget * 2.
+
+        Args:
+            topk_indices: [B, Layers, KvH, budget] sorted indices
+            selection_start: Lower bound for valid indices (min_sparse_index)
+            selection_end: Upper bound (exclusive) for valid indices
+
+        Returns:
+            Expanded sorted indices [B, Layers, KvH, target]
+        """
+        target = self.sparse_budget * 2
+        B, L, H, K = topk_indices.shape
+        device = topk_indices.device
+
+        # Step 1: Compute cluster sizes for each element
+        diffs = torch.zeros(B, L, H, K, device=device, dtype=topk_indices.dtype)
+        diffs[..., 1:] = topk_indices[..., 1:] - topk_indices[..., :-1]
+        is_cluster_start = (diffs != 1)  # position 0 has diff=0, so always True
+
+        cluster_ids = is_cluster_start.long().cumsum(dim=-1) - 1
+        num_clusters = int(cluster_ids.max().item()) + 1
+
+        count_shape = list(cluster_ids.shape[:-1]) + [num_clusters]
+        cluster_counts = torch.zeros(count_shape, device=device, dtype=topk_indices.dtype)
+        cluster_counts.scatter_add_(-1, cluster_ids, torch.ones_like(topk_indices))
+
+        elem_cluster_size = cluster_counts.gather(-1, cluster_ids)
+
+        # Step 2: Neighbors skip past cluster end
+        neighbors = (topk_indices + elem_cluster_size).clamp(max=selection_end - 1)
+
+        # Step 3: Combine, sort, deduplicate
+        combined = torch.cat([topk_indices, neighbors], dim=-1)
+        combined_sorted, _ = combined.sort(dim=-1)
+
+        dup_mask = torch.zeros_like(combined_sorted, dtype=torch.bool)
+        dup_mask[..., 1:] = combined_sorted[..., 1:] == combined_sorted[..., :-1]
+        combined_sorted[dup_mask] = selection_end
+        combined_sorted, _ = combined_sorted.sort(dim=-1)
+
+        # Step 4: Truncate or pad to target
+        if combined_sorted.shape[-1] >= target:
+            result = combined_sorted[..., :target]
+        else:
+            pad_val = combined_sorted[..., -1:]
+            padding = pad_val.expand(*combined_sorted.shape[:-1], target - combined_sorted.shape[-1])
+            result = torch.cat([combined_sorted, padding], dim=-1)
+
+        # Step 5: Replace sentinels with sequential fill after last valid entry
+        sentinel_mask = result >= selection_end
+        if sentinel_mask.any():
+            valid_vals = result.clone()
+            valid_vals[sentinel_mask] = 0
+            last_valid = valid_vals.max(dim=-1, keepdim=True).values
+
+            sentinel_cumsum = sentinel_mask.long().cumsum(dim=-1)
+            fill = (last_valid + sentinel_cumsum).clamp(max=selection_end - 1)
+            result[sentinel_mask] = fill[sentinel_mask]
+
+        return result
 
     def get_retrieval_position_ids(
         self,
@@ -623,12 +735,14 @@ class KeySifterCache:
             return self.k_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
-        # Available for selection: positions between sink tokens and local window
-        local_start = max(0, kv_len - self.local_window)
-        selection_end = min(local_start, self.last_projected_pos)
-        selection_start = self.min_sparse_index
-        num_available = max(0, selection_end - selection_start)
-        num_selected = min(self.sparse_budget, num_available)
+        if self.enable_neighbor_fetch:
+            num_selected = min(self._last_num_sparse_selected, self.effective_sparse_capacity)
+        else:
+            local_start = max(0, kv_len - self.local_window)
+            selection_end = min(local_start, self.last_projected_pos)
+            selection_start = self.min_sparse_index
+            num_available = max(0, selection_end - selection_start)
+            num_selected = min(self.sparse_budget, num_available)
 
         # Total tokens: sink + local_window + selected sparse
         total_len = self.min_sparse_index + self.local_window + num_selected
@@ -659,11 +773,14 @@ class KeySifterCache:
             return self.v_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
-        local_start = max(0, kv_len - self.local_window)
-        selection_end = min(local_start, self.last_projected_pos)
-        selection_start = self.min_sparse_index
-        num_available = max(0, selection_end - selection_start)
-        num_selected = min(self.sparse_budget, num_available)
+        if self.enable_neighbor_fetch:
+            num_selected = min(self._last_num_sparse_selected, self.effective_sparse_capacity)
+        else:
+            local_start = max(0, kv_len - self.local_window)
+            selection_end = min(local_start, self.last_projected_pos)
+            selection_start = self.min_sparse_index
+            num_available = max(0, selection_end - selection_start)
+            num_selected = min(self.sparse_budget, num_available)
 
         # Total tokens: sink + local_window + selected sparse
         total_len = self.min_sparse_index + self.local_window + num_selected

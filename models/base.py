@@ -37,6 +37,7 @@ from .kv_cache_keysifter_cpu import KeySifterCache_CPU
 from .kv_cache_cpu import KV_Cache_CPU
 from .kv_cache_oracle import OracleCache
 from .kv_cache_oracle_cpu import OracleCache_CPU
+from .kv_cache_dsa import DSACache
 from .merge_configs import xKVConfig
 
 class LLM:
@@ -59,7 +60,7 @@ class LLM:
         """
         self.prefill_chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096, predict_interval: int = 1, enable_neighbor_fetch: bool = False):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -90,6 +91,32 @@ class LLM:
                 local_window=local_window,
                 min_sparse_index=min_sparse_index,
                 quantize_int8=quantize_int8,
+                predict_interval=predict_interval,
+                enable_neighbor_fetch=enable_neighbor_fetch,
+            )
+        elif self.attn_mode.lower() == 'dsa':
+            from models.kv_cache_dsa import DSACache, LightningIndexer
+            dsa_indexer = LightningIndexer(
+                hidden_size=config.hidden_size,
+                num_hidden_layers=config.num_hidden_layers,
+                producer_frequency=producer_frequency,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self.kv_cache = DSACache(
+                config,
+                indexer=dsa_indexer,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
+                predict_interval=predict_interval,
+                enable_neighbor_fetch=enable_neighbor_fetch,
             )
         elif self.attn_mode.lower() == 'oracle':
             self.kv_cache = OracleCache(
@@ -119,6 +146,8 @@ class LLM:
                 local_window=local_window,
                 min_sparse_index=min_sparse_index,
                 quantize_int8=quantize_int8,
+                predict_interval=predict_interval,
+                enable_neighbor_fetch=enable_neighbor_fetch,
             )
         elif self.attn_mode.lower() == 'oracle_cpu':
             self.kv_cache = OracleCache_CPU(
@@ -215,8 +244,34 @@ class LLM:
 
     @torch.inference_mode()
     def prefill_cont(self, input_ids: torch.LongTensor):
-        logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
-        return logits
+        if isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+            # Process tokens one by one to maintain causality.
+            # The decode path's update_kv_cache + flash_attn_with_kvcache assumes single-token input;
+            # batching multiple tokens causes q[0] to attend to future tokens via k_cache.
+            #
+            # During continuation (new query), optionally override predict_interval
+            # to 1 so every query token gets a fresh sparse selection.
+            # When prefill_cont_dense=True (default), interval is forced to 1.
+            # When prefill_cont_dense=False, the original interval is kept.
+            saved_interval = None
+            if getattr(self.kv_cache, 'prefill_cont_dense', True):
+                saved_interval = self.kv_cache.predict_interval
+                self.kv_cache.predict_interval = 1
+            seq_len = input_ids.size(1)
+            for t in range(seq_len):
+                token = input_ids[:, t:t+1]
+                logits = self.inference(input_ids=token, position_ids=self.get_ctx(token))
+            # Restore the interval for the upcoming decode (answer generation).
+            if saved_interval is not None:
+                self.kv_cache.predict_interval = saved_interval
+            # Force a fresh prediction on the first real generated token so it
+            # starts from accurate importance scores regardless of predict_interval.
+            if hasattr(self.kv_cache, '_force_next_prediction'):
+                self.kv_cache._force_next_prediction = True
+            return logits
+        else:
+            logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
+            return logits
     
     def encode(self, text: str, template=None, truncation=False):
         if template == 'chat':
@@ -262,12 +317,13 @@ class LLM:
              isinstance(self.kv_cache, ShadowKVCache_xKey) or isinstance(self.kv_cache, ShadowKVCache_xKV) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) or \
              isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or \
-             isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
+             isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU) or \
+             isinstance(self.kv_cache, DSACache):
 
-            # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle
+            # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle/DSA
             # NOTE: When using chunked prefill, each chunk goes through this prefill path separately.
             # The decode path below (q_len == 1) is completely unaffected by chunking.
-            is_keysifter_first_pass = (isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU)) and self.kv_cache.prefill_len == 0
+            is_keysifter_first_pass = (isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache))) and self.kv_cache.prefill_len == 0
             if q_len > 1024 or is_keysifter_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):
                     # svd unrope key and save
@@ -277,8 +333,8 @@ class LLM:
                         self.kv_cache.get_svd(key_states, value_states, layer_idx, fake_svd=self.fake_svd)
                     elif isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                         self.kv_cache.get_svd(key_states, value_states, layer_idx)
-                    elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
-                        # Store un-RoPEd keys and compute projections of keys for importance scoring (skipped for Oracle)
+                    elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+                        # Store un-RoPEd keys and compute projections of keys for importance scoring (skipped for Oracle/DSA)
                         self.kv_cache.get_svd(key_states, layer_idx)
                     else:
                         self.kv_cache.get_svd(key_states, layer_idx)
@@ -301,7 +357,7 @@ class LLM:
 
                 # KeySifter: compute importance queries and refetch for layer group at producer layers
                 # Note: layer 0 also needs to run predictor for layers 1-3, so don't skip it here
-                if isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU):
+                if isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, DSACache)):
                     producer_frequency = self.kv_cache.producer_frequency
                     if layer_idx % producer_frequency == 0:
                         with self._maybe_record_function("keysifter_prefetch"):
@@ -319,14 +375,14 @@ class LLM:
                     position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
 
                 # multi-stream
-                if not isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) and not isinstance(self.kv_cache, KeySifterCache) and not isinstance(self.kv_cache, KeySifterCache_CPU) and not isinstance(self.kv_cache, OracleCache) and not isinstance(self.kv_cache, OracleCache_CPU):
+                if not isinstance(self.kv_cache, (ShadowKVCache_xKV_CPU, KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
                     curr_stream = torch.cuda.current_stream()
                     get_value_stream = self.kv_cache.copy_stream
 
                 if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_value_cache_xKV_cpu"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
+                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
                     with self._maybe_record_function("get_value_cache_keysifter_or_oracle"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
                 else:
@@ -339,7 +395,7 @@ class LLM:
                 if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
-                elif isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
+                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
                     with self._maybe_record_function("get_key_cache_keysifter_or_oracle"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
                 else:

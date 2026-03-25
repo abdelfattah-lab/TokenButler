@@ -107,6 +107,8 @@ class Llama(LLM):
         local_window: int = 512,  # Number of recent tokens to always keep (matching KeySifter baseline)
         min_sparse_index: int = 128,  # Number of sink tokens to always keep (matching KeySifter baseline)
         quantize_int8: bool = False,  # Enable INT8 quantization for k_proj_cache
+        predict_interval: int = 1,  # Predict important tokens every N decode tokens (1 = baseline)
+        enable_neighbor_fetch: bool = False,  # Enable neighbor fetching with 2x sparse buffer
         oracle_random_indices: bool = True,
         page_size: int = 1,
         cpu_chunk_size: int = 4096,  # Chunk size for dense CPU offloading attention
@@ -188,6 +190,8 @@ class Llama(LLM):
             min_sparse_index=min_sparse_index,
             quantize_int8=quantize_int8,
             cpu_chunk_size=cpu_chunk_size,
+            predict_interval=predict_interval,
+            enable_neighbor_fetch=enable_neighbor_fetch,
         )
 
         if self.minference:

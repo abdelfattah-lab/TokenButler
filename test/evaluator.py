@@ -55,16 +55,38 @@ class Evaluator:
         if self.dist_config.is_distributed:
             dist.barrier()
 
+        is_niah_multiturn = 'niah_multiturn' in dataset.dataset_name
+
         is_multi_turn_ruler = (
             getattr(dataset, 'inference_mode', 'single_turn') == 'multi_turn'
             and 'ruler' in dataset.dataset_name
             and dataset.tokenized_contexts is not None
+            and not is_niah_multiturn
         )
 
         progress_bar = tqdm(range(dataset.num_samples // bsz), desc='Testing', disable=self.dist_config.is_distributed and not self.dist_config.master_process)
         for i in range(dataset.num_samples // bsz):
             prompt = torch.cat([dataset.tokenized_prompts[i*bsz+j] for j in range(bsz)], dim=0)
-            if is_multi_turn_ruler:
+            if is_niah_multiturn:
+                assert bsz == 1, "Multi-turn evaluation requires batch_size=1"
+                # Turn 1: full prefill + generate on (context + first query)
+                rets_turn1 = llm.generate(prompt.to(llm.device), gen_len=dataset.gen_len, top_p=1.0, temperature=0.0)
+                all_rets = list(rets_turn1)  # ['response_string']
+
+                # Turns 2..N: generate from subsequent queries using cached KV
+                for query in dataset.tokenized_queries[i]:
+                    rets_turn_k = llm.generate(query.to(llm.device), cont=True, gen_len=10, top_p=1.0, temperature=0.0)
+                    all_rets.extend(rets_turn_k)
+
+                # Score each turn independently against corresponding ground truth
+                rets = all_rets
+                for (pred, gt) in zip(all_rets, dataset.gt[i]):
+                    if isinstance(gt, list):
+                        if len(gt) == 1:
+                            gt = gt[0]
+                    scores.append(dataset.metric(pred, gt))
+
+            elif is_multi_turn_ruler:
                 assert bsz == 1, "Multi-turn ruler evaluation requires batch_size=1"
                 context = dataset.tokenized_contexts[i]
                 query = dataset.tokenized_queries[i]

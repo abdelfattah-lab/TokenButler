@@ -103,6 +103,8 @@ def parse_args() -> Namespace:
     p.add_argument("--keysifter_intermediate_dim", type=int, default=512, help="KeySifter MLP intermediate dimension")
     p.add_argument("--predict_interval", type=int, default=1, help="Predict important tokens every N decode tokens (1=every token, baseline)")
     p.add_argument("--enable_neighbor_fetch", action='store_true', default=False, help="Enable neighbor fetching with 2x sparse buffer")
+    p.add_argument("--force_query_prediction", action='store_true', default=False, help="Force prediction at the start of each new query in multi-turn (refreshes sparse selection immediately)")
+    p.add_argument("--no_prefill_cont_dense", action='store_true', default=False, help="Disable dense prediction during prefill_cont (use config's predict_interval instead of forcing i=1)")
     p.add_argument("--inference_mode", type=str, default="single_turn", choices=["single_turn", "multi_turn"],
                    help="Inference mode: single_turn (combined prompt) or multi_turn (prefill context, then query)")
 
@@ -148,6 +150,10 @@ if __name__ == '__main__':
               sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd,
               predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim,
               predict_interval=args.predict_interval, enable_neighbor_fetch=args.enable_neighbor_fetch)
+
+    # Set prefill_cont_dense on the kv_cache
+    if args.no_prefill_cont_dense and hasattr(llm.kv_cache, 'prefill_cont_dense'):
+        llm.kv_cache.prefill_cont_dense = False
 
     if dist_config.master_process:
         llm.print_kv_stats()

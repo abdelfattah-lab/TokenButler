@@ -19,7 +19,7 @@ torch._dynamo.config.suppress_errors = True
 from models import Llama
 from termcolor import colored
 
-def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, predictor_path='', oracle_random_indices=True):
+def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, predictor_path='', oracle_random_indices=True, predict_interval=1, enable_neighbor_fetch=False):
     """Benchmark a single configuration."""
     print(f"\n{'='*60}")
     print(f"Benchmarking: {attn_mode.upper()} | Prompt: {prompt_length} tokens | Gen: {gen_length} tokens")
@@ -43,8 +43,10 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
             'rank': 160,
             'dDash': 16,
             'producer_frequency': 4,
-            'keysifter_intermediate_dim': 1024,
+            'keysifter_intermediate_dim': 512,
             'predictor_path': predictor_path,
+            'predict_interval': predict_interval,
+            'enable_neighbor_fetch': enable_neighbor_fetch,
         })
     elif attn_mode == 'oracle':
         model_kwargs.update({
@@ -52,6 +54,14 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
             'chunk_size': 8,
             'dDash': 16,  # Or whatever default
             'oracle_random_indices': oracle_random_indices,
+        })
+    elif attn_mode == 'dsa':
+        model_kwargs.update({
+            'sparse_budget': sparse_budget,
+            'chunk_size': 8,
+            'producer_frequency': 4,
+            'predict_interval': predict_interval,
+            'enable_neighbor_fetch': enable_neighbor_fetch,
         })
     elif attn_mode == 'shadowkv':
         model_kwargs.update({
