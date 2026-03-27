@@ -9,7 +9,6 @@
 ################################################################################
 
 import torch
-import torch.nn.functional as F
 import math
 from typing import Optional, Callable
 from contextlib import nullcontext
@@ -465,7 +464,7 @@ class KeySifterCache_CPU(CPUOffloadCacheBase):
             if local_start < limit:
                 scores[:, :, :, local_start:] = float("-inf")
             
-            scores = torch.softmax(scores.float(), dim=-1).to(self.dtype)
+            scores = scores.to(self.dtype)
         
         # Select indices and gather from CPU
         selection_end = min(local_start, self.last_projected_pos)

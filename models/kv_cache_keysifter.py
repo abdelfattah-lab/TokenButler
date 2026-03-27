@@ -8,7 +8,6 @@
 ################################################################################
 
 import torch
-import torch.nn.functional as F
 import math
 from typing import Optional, Callable
 
@@ -195,6 +194,7 @@ class KeySifterCache:
         self._last_num_sparse_selected = 0  # Actual number of sparse tokens in buffer (for neighbor fetch)
         self._force_next_prediction = False  # Force prediction on next decode step (used after prefill_cont)
         self.prefill_cont_dense = True  # If True, force predict_interval=1 during prefill_cont
+        self._force_dense = False  # If True, get_key_cache/get_value_cache return full cache (dense attention)
 
         # Store importance queries from producer layers
         # Shape: [batch*heads, N_slots, 1, dDash] (for decode, Lq=1)
@@ -248,6 +248,7 @@ class KeySifterCache:
         self.local_window_head = 0
         self.q_importance_cache = None
         self._last_num_sparse_selected = 0
+        self._force_dense = False
         self._uncommitted_decode = False
         self._uncommitted_incoming = 0
 
@@ -474,6 +475,10 @@ class KeySifterCache:
             hidden_states: [bsz, seq_len, hidden_size] - hidden states (can be 1 for decode or longer)
             start_layer_idx: Start layer index of the group
         """
+        # Skip sparse selection when forced dense (e.g., late turns in hybrid mode)
+        if self._force_dense:
+            return
+
         # Skip sparse selection for first decode token after prefill (matching baseline behavior)
         # Baseline keeps first decode token dense to avoid applying sparsity immediately after prefill
         kv_len = self._kv_len_eff()
@@ -568,9 +573,9 @@ class KeySifterCache:
             if local_start < limit:
                 scores[:, :, :, local_start:] = float("-inf")
 
-            # Match baseline numerical behavior more closely:
-            # do softmax in fp32 for long contexts.
-            scores = torch.softmax(scores.float(), dim=-1).to(self.dtype)
+            # Cast to the working dtype for top-k selection (no softmax needed
+            # since we only care about relative ordering for top-k).
+            scores = scores.to(self.dtype)
             
         # 4. Select Indices (Batched)
         # Available positions are between sink tokens and local window
@@ -731,7 +736,7 @@ class KeySifterCache:
         # Layer 0 uses full attention - always return full cache
         # Also return full cache for first decode token after prefill (matching baseline)
         kv_len = self._kv_len_eff()
-        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff:
+        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff or self._force_dense:
             return self.k_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
@@ -769,7 +774,7 @@ class KeySifterCache:
         # Layer 0 uses full attention - always return full cache
         # Also return full cache for first decode token after prefill (matching baseline)
         kv_len = self._kv_len_eff()
-        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff:
+        if layer_idx == 0 or kv_len <= self._dense_decode_cutoff or self._force_dense:
             return self.v_cache[layer_idx, :, :, :kv_len]
 
         # Calculate how many sparse tokens were selected
