@@ -35,7 +35,14 @@ from tqdm import tqdm
 import random
 import string
 import numpy as np
-from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+try:
+    from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
+except ImportError:
+    import json
+    def write_manifest(save_file, write_jsons):
+        with open(save_file, 'w') as f:
+            for entry in write_jsons:
+                f.write(json.dumps(entry) + '\n')
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")) 
 from tokenizer import select_tokenizer

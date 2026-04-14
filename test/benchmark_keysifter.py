@@ -4,13 +4,14 @@ Benchmark KeySifter vs Full Attention for runtime efficiency.
 Tests prefill and decode performance across different sequence lengths.
 """
 
+import os
 import torch
 import time
 import sys
 import gc
 import matplotlib.pyplot as plt
 import numpy as np
-sys.path.insert(0, '/home/afa55/Projects/xKV/xKV')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 # Suppress dynamo errors/warnings to avoid spam from skipped CUDAGraphs
 import torch._dynamo
@@ -385,7 +386,7 @@ def main():
     print(colored("="*80, 'cyan'))
 
     # Path to trained KeySifter weights
-    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash16.pt'
+    weights_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'L3_8Bi_d16_i512_pf4.pt')
 
     # Test configurations
     configs = [

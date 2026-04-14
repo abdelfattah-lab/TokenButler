@@ -6,3 +6,43 @@ build/
 *.jsonl
 *.log
 *.csv
+
+# Predictor weights (hosted externally)
+*.pt
+
+# Generated plots and figures
+*.png
+*.pdf
+*.svg
+
+# Experiment results and outputs
+results/
+longbench_results_*/
+archive/
+evals/
+test/output*/
+test/incorrect_output*/
+test/data/
+
+# IDE and editor
+.vscode/
+.idea/
+
+# Development artifacts
+temporary/
+keysifter_profile/
+thoughts/
+slides/
+paper_plots/
+modify_models/
+__pycache__/
+
+# Patches
+*.patch
+*.diff
+
+# Benchmark outputs
+benchmark_results.json
+page_size_benchmark.json
+niah_results_*.json
+*.trace.json

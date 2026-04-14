@@ -26,10 +26,10 @@ build_folder = os.path.join(os.getcwd(), 'kernels')
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 setup(
-    name='shadowkv',
+    name='xkv',
     ext_modules=[
         CUDAExtension(
-            name='shadowkv',
+            name='xkv',
             sources=[
                 'kernels/main.cu',
                 'kernels/rope.cu',

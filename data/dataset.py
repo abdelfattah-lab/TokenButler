@@ -117,7 +117,7 @@ Templates = {
 
 
 class Dataset:
-    def __init__(self, dataset_name, tokenizer, datalen, num_samples, rank=0, world_size=1):
+    def __init__(self, dataset_name, tokenizer, datalen, num_samples, rank=0, world_size=1, inference_mode='single_turn'):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.datalen = datalen
@@ -125,6 +125,9 @@ class Dataset:
         self.rank = rank
         self.world_size = world_size
         self.is_sharded = False
+        self.inference_mode = inference_mode
+        self.tokenized_contexts = None
+        self.tokenized_queries = None
 
         if dataset_name == 'niah':
             self.tokenized_prompts, self.gt, self.ctx_len, self.depth_pct = self.get_dataset()
@@ -132,7 +135,7 @@ class Dataset:
             self.tokenized_prompts, self.gt, self.classes = self.get_dataset()
         else:
             self.tokenized_prompts, self.gt = self.get_dataset()
-        
+
         self.num_samples = len(self.tokenized_prompts)
         self.gen_len = self.get_gen_len()
         self.metric = self.get_metric()
@@ -154,6 +157,10 @@ class Dataset:
             shard_tokenized_prompts, shard_gt = self.tokenized_prompts[start:end], self.gt[start:end]
             self.tokenized_prompts = shard_tokenized_prompts
             self.gt = shard_gt
+            if self.tokenized_contexts is not None:
+                self.tokenized_contexts = self.tokenized_contexts[start:end]
+            if self.tokenized_queries is not None:
+                self.tokenized_queries = self.tokenized_queries[start:end]
             self.num_samples = len(shard_tokenized_prompts)
 
         self.is_sharded = True
@@ -199,6 +206,25 @@ class Dataset:
         else:
             raise Exception("Metric not found")
 
+    @staticmethod
+    def _find_query_boundary(text):
+        """Find the character index where the query starts in a ruler input.
+
+        Searches for dataset-specific question markers near the end of the text.
+        Returns the index of the newline before the query, or None if not found.
+        """
+        import re
+        patterns = [
+            r'\nWhat (?:is|are) (?:the |all the )?special magic number',
+            r'\n+Question:',
+            r'\n+Answer the question',
+        ]
+        best = -1
+        for pattern in patterns:
+            for m in re.finditer(pattern, text):
+                best = max(best, m.start())
+        return best if best > 0 else None
+
     def get_dataset(self):
         if 'ruler' in self.dataset_name: # ruler/xxx
             task = self.dataset_name.split('/')[-1]
@@ -227,15 +253,71 @@ class Dataset:
             else:
                 self.num_samples = len(dataset)
             tokenized_prompts = []
+            tokenized_contexts = []
+            tokenized_queries = []
             gt = []
 
-            for i in range(self.num_samples):
-                input_text = dataset[i]['input']
-                input_ids = self.tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=False)
-                tokenized_prompts.append(input_ids)
-                gt.append(dataset[i]['outputs'])
+            if 'multiturn' in self.dataset_name:
+                # Multi-turn format: input + queries[] + answers[]
+                for i in range(self.num_samples):
+                    input_text = dataset[i]['input']
+                    first_query = dataset[i]['queries'][0]
+                    combined_text = input_text + first_query
+                    input_ids = self.tokenizer.encode(combined_text, return_tensors="pt", add_special_tokens=False)
+                    tokenized_prompts.append(input_ids)
 
-            return tokenized_prompts, gt
+                    # Tokenize remaining queries individually
+                    tokenized_query_list = []
+                    for query in dataset[i]['queries'][1:]:
+                        query_ids = self.tokenizer.encode(query, return_tensors="pt", add_special_tokens=False)
+                        tokenized_query_list.append(query_ids)
+                    tokenized_queries.append(tokenized_query_list)
+                    gt.append(dataset[i]['answers'])
+
+                self.tokenized_contexts = [None] * self.num_samples
+                self.tokenized_queries = tokenized_queries
+                return tokenized_prompts, gt
+            else:
+                for i in range(self.num_samples):
+                    # Check for explicit context/query fields first (KeySifter approach)
+                    if 'context' in dataset[i] and 'query' in dataset[i]:
+                        context = dataset[i]['context']
+                        query = dataset[i]['query']
+                        input_text = context + query
+                        input_ids = self.tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=False)
+                        tokenized_prompts.append(input_ids)
+                        gt.append(dataset[i]['outputs'])
+
+                        if self.inference_mode == 'multi_turn':
+                            ctx_ids = self.tokenizer.encode(context, return_tensors="pt", add_special_tokens=False)
+                            q_ids = self.tokenizer.encode(query, return_tensors="pt", add_special_tokens=False)
+                            tokenized_contexts.append(ctx_ids)
+                            tokenized_queries.append(q_ids)
+                    else:
+                        input_text = dataset[i]['input']
+                        input_ids = self.tokenizer.encode(input_text, return_tensors="pt", add_special_tokens=False)
+                        tokenized_prompts.append(input_ids)
+                        gt.append(dataset[i]['outputs'])
+
+                        if self.inference_mode == 'multi_turn':
+                            boundary = self._find_query_boundary(input_text)
+                            if boundary is not None:
+                                context_text = input_text[:boundary]
+                                query_text = input_text[boundary:]
+                                ctx_ids = self.tokenizer.encode(context_text, return_tensors="pt", add_special_tokens=False)
+                                q_ids = self.tokenizer.encode(query_text, return_tensors="pt", add_special_tokens=False)
+                                tokenized_contexts.append(ctx_ids)
+                                tokenized_queries.append(q_ids)
+                            else:
+                                print(colored(f"[Warning] Could not find query boundary for sample {i} in {self.dataset_name}, falling back to single_turn", 'red'))
+                                tokenized_contexts.append(None)
+                                tokenized_queries.append(None)
+
+                if self.inference_mode == 'multi_turn':
+                    self.tokenized_contexts = tokenized_contexts
+                    self.tokenized_queries = tokenized_queries
+
+                return tokenized_prompts, gt
 
         elif self.dataset_name == 'niah':
             print(colored(f"[Warning] NIAH dataset cannot set # samples, it is up to world_size, which is set to {self.world_size}", 'red'))

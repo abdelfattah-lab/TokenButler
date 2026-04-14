@@ -20,7 +20,7 @@ import math
 import gc
 from torch import nn
 from models.tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
-from kernels import shadowkv
+from kernels import xkv
 
 class KV_Cache:
     """Full Attention"""
@@ -625,7 +625,7 @@ class ShadowKVCache_CPU:
         self.incoming_q_len = query_states.shape[-2] # 1
 
         # gemm_softmax
-        shadowkv.batch_gemm_softmax(
+        xkv.batch_gemm_softmax(
             query_states.contiguous(),
             self.k_landmark[layer_idx].contiguous(),
             self.gemm_o,
@@ -646,13 +646,13 @@ class ShadowKVCache_CPU:
         merged_results = torch.topk(chunk_attn.view(self.batch_size, self.num_key_value_heads, -1), k=self.select_sets, dim=-1).indices
         # use merged_results to gather the position_ids: [bsz, 8, select_sets] --> [bsz, 8, select_sets]
         selected_chunks = self.k_landmark_idx[layer_idx].gather(dim=-1, index=merged_results) # [bsz, 8, select_sets]
-        shadowkv.reorder_keys_and_compute_offsets(self.position_ids[layer_idx], selected_chunks, self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, self.select_sets)
+        xkv.reorder_keys_and_compute_offsets(self.position_ids[layer_idx], selected_chunks, self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, self.select_sets)
 
         return self.position_ids[layer_idx]
 
     def get_value_cache(self, layer_idx, position_ids):
 
-        shadowkv.gather_copy_with_offsets(self.v_cache_cpu[layer_idx], self.v_cache_buffer[layer_idx], self.temp, self.offsets, self.cnts, self.signals, self.batch_size, self.num_key_value_heads, int(self.max_ctx_chunks_len*self.head_dim), int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
+        xkv.gather_copy_with_offsets(self.v_cache_cpu[layer_idx], self.v_cache_buffer[layer_idx], self.temp, self.offsets, self.cnts, self.signals, self.batch_size, self.num_key_value_heads, int(self.max_ctx_chunks_len*self.head_dim), int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
 
         gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
 
@@ -664,7 +664,7 @@ class ShadowKVCache_CPU:
         u = self.U[layer_idx] # [bsz, 128k, rank]
         sv = self.SV[layer_idx] # [bsz, 8, 128, rank]
         #print(f"avg cnts: {self.cnts.float().mean()} hit rate: {self.cnts.float().mean() / (self.sparse_budget / 8.0) * 100:.2f}%")
-        shadowkv.gather_copy_d2d_with_offsets(self.k_cache_buffer[layer_idx], self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
+        xkv.gather_copy_d2d_with_offsets(self.k_cache_buffer[layer_idx], self.offsets, self.cnts, self.batch_size, self.num_key_value_heads, int(self.sparse_budget*self.head_dim), self.kernel_offset, self.kernel_stride, self.select_sets)
         batch_gather_gemm_rotary_pos_emb_cuda(u, sv, cos_sin_cache, position_ids, self.output, self.chunk_size, self.k_cache_buffer[layer_idx], self.sparse_start, self.sparse_end, self.cnts)
 
         gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len

@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an idea for ShadowKV
+about: Suggest an idea for xKV
 title: "[ENHANCEMENT]"
 labels: ''
 assignees: ''

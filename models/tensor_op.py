@@ -27,7 +27,7 @@ from torch.nn import functional as F
 # from flashinfer.norm import rmsnorm
 from minference import vertical_slash_sparse_attention, block_sparse_attention, streaming_forward
 
-from kernels import shadowkv
+from kernels import xkv
 
 # def layer_norm(
 #     hidden_states: torch.Tensor,
@@ -170,7 +170,7 @@ def apply_rotary_pos_emb_cuda(x, cos_sin, position_ids):
         position_ids = position_ids.unsqueeze(1).expand(-1, heads, -1).contiguous()
 
     output = torch.empty_like(x)
-    shadowkv.apply_rotary_pos_emb_new(
+    xkv.apply_rotary_pos_emb_new(
         x, cos_sin, position_ids, output,
         int(batch_size), int(heads), int(seq_len), int(embed_dim),
         int(x.stride(0)), int(x.stride(1)), int(x.stride(2)), int(x.stride(3)),
@@ -186,7 +186,7 @@ def apply_rotary_pos_emb_cuda_push_cache(x, cos_sin, position_ids, chunk_size, c
     half_dim = embed_dim // 2
 
     if cos_sin.shape[-1] == 128:
-        shadowkv.apply_rotary_pos_emb_push_cache_opt(
+        xkv.apply_rotary_pos_emb_push_cache_opt(
             x, cos_sin, position_ids, cache, cnts,
             int(batch_size), int(heads), int(seq_len), int(embed_dim),
             int(x.stride(0)), int(x.stride(1)), int(x.stride(2)), int(x.stride(3)),
@@ -197,7 +197,7 @@ def apply_rotary_pos_emb_cuda_push_cache(x, cos_sin, position_ids, chunk_size, c
             int(half_dim), int(chunk_size)
         )
     elif cos_sin.shape[-1] == 64:
-        shadowkv.apply_rotary_pos_emb_push_cache_opt_glm(
+        xkv.apply_rotary_pos_emb_push_cache_opt_glm(
             x, cos_sin, position_ids, cache, cnts,
             int(batch_size), int(heads), int(seq_len), int(embed_dim),
             int(x.stride(0)), int(x.stride(1)), int(x.stride(2)), int(x.stride(3)),
@@ -243,7 +243,7 @@ def batch_gather_gemm_rotary_pos_emb_cuda(
     # exit()
 
     # NOTE(max410011): cos_sin is the same afer the kernel
-    shadowkv.batch_gather_gemm(
+    xkv.batch_gather_gemm(
         a.contiguous(),
         b.contiguous(),
         cos_sin.contiguous(),
