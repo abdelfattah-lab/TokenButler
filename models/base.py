@@ -129,6 +129,7 @@ class LLM:
                 chunk_size=chunk_size,
                 random_indices=oracle_random_indices,
                 page_size=page_size,
+                predict_interval=predict_interval,
             )
         elif self.attn_mode.lower() == 'keysifter_cpu':
             if keysifter_predictor is None:
@@ -163,6 +164,7 @@ class LLM:
                 min_sparse_index=min_sparse_index,
                 random_indices=oracle_random_indices,
                 page_size=page_size,
+                predict_interval=predict_interval,
             )
         elif self.attn_mode.lower() == 'full_cpu':
             self.kv_cache = KV_Cache_CPU(
@@ -357,7 +359,11 @@ class LLM:
 
                 # KeySifter: compute importance queries and refetch for layer group at producer layers
                 # Note: layer 0 also needs to run predictor for layers 1-3, so don't skip it here
-                if isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, DSACache)):
+                if isinstance(self.kv_cache, DSACache):
+                    # DSA: run indexer at every layer (faithful to original DSA paper)
+                    with self._maybe_record_function("dsa_prefetch"):
+                        self.kv_cache.prefetch_single_layer(residual, layer_idx)
+                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU)):
                     producer_frequency = self.kv_cache.producer_frequency
                     if layer_idx % producer_frequency == 0:
                         with self._maybe_record_function("keysifter_prefetch"):

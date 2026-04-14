@@ -36,7 +36,7 @@ class Evaluator:
         # init final report
         self.all_stats = []
 
-    def test(self, llm: LLM, dataset: Dataset, output_path: str, setting: str = 'baseline'):
+    def test(self, llm: LLM, dataset: Dataset, output_path: str, setting: str = 'baseline', sparse_turns: int = -1):
 
         # mkdir if not exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -74,9 +74,24 @@ class Evaluator:
                 all_rets = list(rets_turn1)  # ['response_string']
 
                 # Turns 2..N: generate from subsequent queries using cached KV
-                for query in dataset.tokenized_queries[i]:
+                # sparse_turns controls how many turns use sparse attention:
+                #   -1 = all turns sparse (default, backward compatible)
+                #   Y  = first Y turns sparse (turn 1 counted), rest dense
+                for turn_idx, query in enumerate(dataset.tokenized_queries[i]):
+                    # turn_idx=0 is turn 2 (turn 1 was the initial prefill+generate above)
+                    current_turn = turn_idx + 2  # 1-indexed turn number
+
+                    # Switch to dense if we've exceeded sparse_turns
+                    if sparse_turns > 0 and current_turn > sparse_turns:
+                        if hasattr(llm.kv_cache, '_force_dense'):
+                            llm.kv_cache._force_dense = True
+
                     rets_turn_k = llm.generate(query.to(llm.device), cont=True, gen_len=10, top_p=1.0, temperature=0.0)
                     all_rets.extend(rets_turn_k)
+
+                # Reset force_dense for next sample
+                if hasattr(llm.kv_cache, '_force_dense'):
+                    llm.kv_cache._force_dense = False
 
                 # Score each turn independently against corresponding ground truth
                 rets = all_rets

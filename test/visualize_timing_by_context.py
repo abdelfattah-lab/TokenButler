@@ -51,7 +51,7 @@ plt.rcParams.update({
     'axes.spines.right': False,
 })
 
-def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, predictor_path, attn_mode='keysifter'):
+def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, predictor_path, attn_mode='keysifter', predict_interval=1, enable_neighbor_fetch=False):
     """Run benchmark for a single configuration, measuring TOTAL step time."""
     mode_str = f"topK: {sparse_budget:,}" if attn_mode == 'keysifter' else f"Mode: {attn_mode}"
     print(f"\n  → Context: {prompt_length:,} | {mode_str}")
@@ -72,8 +72,10 @@ def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, pr
             'rank': 160,
             'dDash': 16,
             'producer_frequency': 4,
-            'keysifter_intermediate_dim': 1024,
+            'keysifter_intermediate_dim': 512,
             'predictor_path': predictor_path,
+            'predict_interval': predict_interval,
+            'enable_neighbor_fetch': enable_neighbor_fetch,
         })
 
     llm = Llama(**model_kwargs)
@@ -177,7 +179,7 @@ def run_single_benchmark_with_total(prompt_length, gen_length, sparse_budget, pr
         'attn_mode': attn_mode,
     }
 
-def collect_sweep_data_with_total(context_lengths, topk_values, gen_length, predictor_path, attn_mode='keysifter'):
+def collect_sweep_data_with_total(context_lengths, topk_values, gen_length, predictor_path, attn_mode='keysifter', predict_interval=1, enable_neighbor_fetch=False):
     """Run benchmarks across all configurations using the new total-aware runner."""
     results = []
     
@@ -203,7 +205,7 @@ def collect_sweep_data_with_total(context_lengths, topk_values, gen_length, pred
             # Pass actual topk only if keysifter, else 0/dummy
             budget = topk if attn_mode == 'keysifter' else 0
             
-            result = run_single_benchmark_with_total(ctx_len, gen_length, budget, predictor_path, attn_mode=attn_mode)
+            result = run_single_benchmark_with_total(ctx_len, gen_length, budget, predictor_path, attn_mode=attn_mode, predict_interval=predict_interval, enable_neighbor_fetch=enable_neighbor_fetch)
             results.append(result)
     
     return results
@@ -329,12 +331,14 @@ def main():
     parser.add_argument('--output-dir', type=str, default='test/output', help='Output directory')
     parser.add_argument('--load-cache', type=str, help='Load cached results from JSON')
     parser.add_argument('--mode', type=str, default='keysifter', choices=['keysifter', 'full'], help='Attention mode (keysifter or full)')
+    parser.add_argument('--predict-interval', type=int, default=1, help='Predict important tokens every N decode steps (1=every step)')
+    parser.add_argument('--enable-neighbor-fetch', action='store_true', help='Enable neighbor fetching with 2x sparse buffer')
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     
-    weights_path = '/home/afa55/Projects/xKV/xKV/Llama_31_8bi_GQA_dDash16.pt'
+    weights_path = '/home/afa55/Projects/xKV/xKV/L3_8Bi_d16_i512_pf4.pt'
     
     # Define operations based on mode
     if args.mode == 'keysifter':
@@ -352,7 +356,8 @@ def main():
             'mlp_compute',
             'other_model_ops',
         ]
-        mode_display_name = "KeySifter"
+        interval_suffix = f' (i={args.predict_interval}' + ('+nb)' if args.enable_neighbor_fetch else ')')
+        mode_display_name = "KeySifter" + interval_suffix
     else:
         # Full Attention (Baseline)
         operations = [
@@ -381,11 +386,14 @@ def main():
             topk_values = [1024, 2048, 4096, 8192]
         
         # Use new collection function
-        results = collect_sweep_data_with_total(context_lengths, topk_values, 
-                                     args.gen_length, weights_path, attn_mode=args.mode)
+        results = collect_sweep_data_with_total(context_lengths, topk_values,
+                                     args.gen_length, weights_path, attn_mode=args.mode,
+                                     predict_interval=args.predict_interval,
+                                     enable_neighbor_fetch=args.enable_neighbor_fetch)
                                      
         # Save results
-        cache_filename = f'timing_sweep_results_{args.mode}.json'
+        interval_tag = f'_i{args.predict_interval}' + ('_nb' if args.enable_neighbor_fetch else '')
+        cache_filename = f'timing_sweep_results_{args.mode}{interval_tag}.json'
         cache_file = output_dir / cache_filename
         with open(cache_file, 'w') as f:
              json_results = []

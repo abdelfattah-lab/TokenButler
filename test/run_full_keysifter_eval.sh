@@ -23,7 +23,7 @@ EVAL_SCRIPT=test/eval_acc.py
 # Model and KeySifter params
 MODEL_NAME="meta-llama/Meta-Llama-3.1-8B-Instruct"
 METHOD="KeySifter"
-DATALEN=131072
+DATALEN=65536
 SPARSE_BUDGET=2048
 CHUNK_SIZE=8
 RANK=160
@@ -38,15 +38,6 @@ PREDICTOR_PATH="L3_8Bi_d16_i512_pf4.pt"
 # Datasets (excluding niah_multiturn which has a different schema)
 # TODO: Let's add niah_multiturn results in the results table as well. We can run it separately after collecting results from the others if needed.
 DATASETS=(
-    "ruler/niah_single_1"
-    "ruler/niah_single_2"
-    "ruler/niah_multikey_1"
-    "ruler/niah_multikey_2"
-    "ruler/niah_multiquery"
-    "ruler/niah_multivalue"
-    "ruler/qa_1"
-    "ruler/qa_2"
-    "ruler/vt"
     "ruler/fwe"
 )
 
@@ -134,7 +125,9 @@ for mode_spec in "${MODES[@]}"; do
             continue
         fi
 
-        # Build command
+        # Build command — write results directly to cfg_dir via --output_dir.
+        # eval_acc.py writes each dataset's result file as soon as it finishes,
+        # so completed datasets survive even if the process dies mid-config.
         dataset_str=$(IFS=,; echo "${datasets_to_run[*]}")
         cmd=(
             "$PYTHON" "$EVAL_SCRIPT"
@@ -142,6 +135,7 @@ for mode_spec in "${MODES[@]}"; do
             --method "$METHOD"
             --datalen "$DATALEN"
             --dataset_name "$dataset_str"
+            --output_dir "$cfg_dir"
             --sparse_budget "$SPARSE_BUDGET"
             --chunk_size "$CHUNK_SIZE"
             --rank "$RANK"
@@ -166,24 +160,28 @@ for mode_spec in "${MODES[@]}"; do
         echo ""
 
         if "${cmd[@]}"; then
-            # Move results from default output path to our structured dir
-            model_short="${MODEL_NAME##*/}"
+            # Count results written directly to cfg_dir
             for ds in "${datasets_to_run[@]}"; do
                 fname=$(result_filename "$ds")
-                src="archive/${model_short}/${ds}_${DATALEN}_${METHOD}_b${SPARSE_BUDGET}_c${CHUNK_SIZE}_x${GROUP_SIZE}_r${RANK}_k${RANK_K}_v${RANK_V}.jsonl"
-                dst="${cfg_dir}/${fname}"
-                if [[ -f "$src" ]]; then
-                    mv "$src" "$dst"
+                if is_complete "${cfg_dir}/${fname}"; then
                     ((completed_runs++))
                 else
-                    echo "  WARNING: expected result file not found: $src"
+                    echo "  WARNING: result missing after successful run: ${cfg_dir}/${fname}"
                     ((failed_runs++))
                 fi
             done
             echo "  [DONE] ${mode_name}/${config_name}"
         else
             echo "  [FAIL] ${mode_name}/${config_name} exited with error"
-            ((failed_runs += ${#datasets_to_run[@]}))
+            # Some datasets may have completed before the crash — count them
+            for ds in "${datasets_to_run[@]}"; do
+                fname=$(result_filename "$ds")
+                if is_complete "${cfg_dir}/${fname}"; then
+                    ((completed_runs++))
+                else
+                    ((failed_runs++))
+                fi
+            done
         fi
     done
 done

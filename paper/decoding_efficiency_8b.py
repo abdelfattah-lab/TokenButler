@@ -129,10 +129,12 @@ for label, method_data in data.items():
     cpu_data[label] = method_cpu
     color = COLORS.get(label, '#333333')
     marker = MARKERS.get(label, 'o')
+    linestyle = '--' if label == 'Oracle' else '-'
     zorder = zorders.get(label, 1)
 
     ax.loglog(method_cpu['context_length'], method_cpu['avg_decode_time_ms'],
-              marker + '-', linewidth=2.5, markersize=9, label=label, color=color,
+              marker=marker, linestyle=linestyle, linewidth=2.5, markersize=9,
+              label=label, color=color,
               markerfacecolor='white', markeredgewidth=2.5, markeredgecolor=color,
               zorder=zorder)
 
@@ -162,8 +164,9 @@ ax.set_xlabel('Context Length (tokens)', fontsize=28)
 ax.set_ylabel('Latency per Token (ms)', fontsize=28)
 
 # Highlight CPU region only
+ax.set_facecolor('#f2f7ff')
 ax.axvspan(x_left, x_right,
-           alpha=0.08, color='#1f77b4', zorder=0)
+           alpha=0.18, color='#a8c9ea', zorder=0)
 
 # Axis cosmetics
 ax.grid(True, which='major', alpha=0.3, linestyle='-')
@@ -185,8 +188,9 @@ for name in order:
         ordered_labels.append(name)
 
 legend = ax.legend(ordered_handles, ordered_labels,
-                    loc='upper left', frameon=True, fancybox=True,
-                    shadow=False, ncol=1, columnspacing=1.5,
+                    loc='lower center', bbox_to_anchor=(0.5, 1.02),
+                    frameon=True, fancybox=True,
+                    shadow=False, ncol=3, columnspacing=1.2,
                     handlelength=2.5, borderpad=0.8,
                     fontsize=22)
 legend.get_frame().set_facecolor('white')
@@ -195,13 +199,13 @@ legend.get_frame().set_edgecolor('#cccccc')
 legend.get_frame().set_linewidth(1)
 
 # Add CPU offloading label
-ax.text(0.98, 0.06, 'CPU Offloading Region', transform=ax.transAxes,
-         fontsize=24, color='#0000cc', fontweight='bold', ha='right', va='bottom',
-         style='italic', alpha=0.9)
+# ax.text(0.98, 0.06, 'CPU Offloading Region', transform=ax.transAxes,
+#          fontsize=24, color='#0000cc', fontweight='bold', ha='right', va='bottom',
+#          style='italic', alpha=0.9)
 
 # Speedup annotations removed as per user request
 
-plt.subplots_adjust(left=0.12, right=0.98, top=0.95, bottom=0.15)
+plt.subplots_adjust(left=0.12, right=0.98, top=0.84, bottom=0.15)
 
 save_plt_figure_result('decoding_performance_cpu', paper=True)
 

@@ -48,12 +48,13 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
             'predict_interval': predict_interval,
             'enable_neighbor_fetch': enable_neighbor_fetch,
         })
-    elif attn_mode == 'oracle':
+    elif attn_mode in ('oracle', 'oracle_cpu'):
         model_kwargs.update({
             'sparse_budget': sparse_budget,
             'chunk_size': 8,
-            'dDash': 16,  # Or whatever default
+            'dDash': 16,
             'oracle_random_indices': oracle_random_indices,
+            'predict_interval': predict_interval,
         })
     elif attn_mode == 'dsa':
         model_kwargs.update({

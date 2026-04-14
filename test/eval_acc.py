@@ -107,6 +107,12 @@ def parse_args() -> Namespace:
     p.add_argument("--no_prefill_cont_dense", action='store_true', default=False, help="Disable dense prediction during prefill_cont (use config's predict_interval instead of forcing i=1)")
     p.add_argument("--inference_mode", type=str, default="single_turn", choices=["single_turn", "multi_turn"],
                    help="Inference mode: single_turn (combined prompt) or multi_turn (prefill context, then query)")
+    p.add_argument("--sparse_turns", type=int, default=-1,
+                   help="Number of turns to use sparse attention (-1=all sparse). "
+                        "After this many turns, switch to dense attention for remaining turns.")
+    p.add_argument("--output_dir", type=str, default="",
+                   help="Override output directory for result files. "
+                        "If set, results are written here instead of the default archive/ path.")
 
     return p.parse_args()
 
@@ -160,6 +166,13 @@ if __name__ == '__main__':
 
     for dataset_name in dataset_names:
         dataset = Dataset(dataset_name, llm.tokenizer, datalen, num_samples, evaluator.dist_config.rank, evaluator.dist_config.world_size, inference_mode=args.inference_mode)
-        evaluator.test(llm, dataset, f"archive/{model_name.split('/')[-1]}/{dataset_name}_{datalen}_{args.method}_b{sparse_budget}_c{chunk_size}_x{args.group_size}_r{rank}_k{rank_k}_v{rank_v}.jsonl", args.method)
+        result_fname = f"{dataset_name}_{datalen}_{args.method}_b{sparse_budget}_c{chunk_size}_x{args.group_size}_r{rank}_k{rank_k}_v{rank_v}.jsonl"
+        if args.output_dir:
+            # Strip dataset subdirectory prefix (e.g. "ruler/") for flat output
+            result_fname = os.path.basename(result_fname)
+            result_path = os.path.join(args.output_dir, result_fname)
+        else:
+            result_path = f"archive/{model_name.split('/')[-1]}/{result_fname}"
+        evaluator.test(llm, dataset, result_path, args.method, sparse_turns=args.sparse_turns)
 
     evaluator.summarize()

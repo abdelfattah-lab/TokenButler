@@ -29,7 +29,7 @@ def run_benchmarks(args, csv_file):
     """
 
     # Configurations
-    context_lengths = [32768, 65536, 131072, 262144, 524288] # 32K, 64K, 128K, 256K, 512K
+    context_lengths = [32768, 65536, 131072, 262144, 524288, 1048576] # 32K, 64K, 128K, 256K, 512K, 1M
     if args.quick:
         context_lengths = [2048, 4096]
 
@@ -38,19 +38,36 @@ def run_benchmarks(args, csv_file):
 
     configs = [
         {'label': 'Dense', 'mode': 'full', 'mode_cpu': 'full_cpu', 'kwargs': {}},
-        {'label': 'KeySifter (i=1)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 2048, 'predictor_path': args.predictor_path}},
-        {'label': 'KeySifter (i=8+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 2048, 'predictor_path': args.predictor_path, 'predict_interval': 8, 'enable_neighbor_fetch': True}},
-        {'label': 'DSA (i=1)', 'mode': 'dsa', 'mode_cpu': 'dsa', 'kwargs': {'sparse_budget': 2048}},
-        {'label': 'DSA (i=8+nb)', 'mode': 'dsa', 'mode_cpu': 'dsa', 'kwargs': {'sparse_budget': 2048, 'predict_interval': 8, 'enable_neighbor_fetch': True}},
-        {'label': 'Oracle', 'mode': 'oracle', 'mode_cpu': 'oracle_cpu', 'kwargs': {'sparse_budget': 2048, 'oracle_random_indices': True}},
+        {'label': 'KeySifter (i=1)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 8192, 'predictor_path': args.predictor_path}},
+        {'label': 'KeySifter (i=2+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 8192, 'predictor_path': args.predictor_path, 'predict_interval': 2, 'enable_neighbor_fetch': True}},
+        {'label': 'KeySifter (i=4+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 8192, 'predictor_path': args.predictor_path, 'predict_interval': 4, 'enable_neighbor_fetch': True}},
+        {'label': 'KeySifter (i=8+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 8192, 'predictor_path': args.predictor_path, 'predict_interval': 8, 'enable_neighbor_fetch': True}},
+        {'label': 'KeySifter (i=16+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'kwargs': {'sparse_budget': 8192, 'predictor_path': args.predictor_path, 'predict_interval': 16, 'enable_neighbor_fetch': True}},
+        {'label': 'Oracle', 'mode': 'oracle', 'mode_cpu': 'oracle_cpu', 'kwargs': {'sparse_budget': 8192, 'oracle_random_indices': True}},
     ]
 
     results = {cfg['label']: {'x': [], 'y': []} for cfg in configs}
 
-    # Initialize CSV file with header
-    with open(csv_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['label', 'context_length', 'mode', 'avg_decode_time_ms', 'status'])
+    # Load existing CSV results for resume support
+    completed = set()
+    if os.path.exists(csv_file):
+        with open(csv_file, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('status') == 'success':
+                    key = (row['label'], int(row['context_length']))
+                    completed.add(key)
+                    label = row['label']
+                    if label in results:
+                        results[label]['x'].append(int(row['context_length']))
+                        results[label]['y'].append(float(row['avg_decode_time_ms']))
+        if completed:
+            print(f"{colored(f'Resuming: {len(completed)} results loaded from {csv_file}', 'cyan')}")
+    else:
+        # Initialize CSV file with header
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['label', 'context_length', 'mode', 'avg_decode_time_ms', 'status'])
     print(f"{colored(f'Results will be written to: {csv_file}', 'green')}")
 
     for ctx_len in context_lengths:
@@ -63,6 +80,14 @@ def run_benchmarks(args, csv_file):
 
         for cfg in configs:
             label = cfg['label']
+            # Skip already-completed configurations (resume support)
+            if (label, ctx_len) in completed:
+                print(f"  Skipping {label} at {ctx_len} (already completed)")
+                continue
+            # Skip Dense at contexts > 262144 (OOM-kills the process on 48GB GPU)
+            if label == 'Dense' and ctx_len > 262144:
+                print(f"  Skipping {label} at {ctx_len} (would OOM on GPU)")
+                continue
             # Select appropriate mode based on context length
             mode = cfg['mode_cpu'] if use_cpu_offload else cfg['mode']
             print(f"  Running {label} (mode: {mode})...")
@@ -77,10 +102,13 @@ def run_benchmarks(args, csv_file):
                 pi = kwargs.get('predict_interval', 1)
                 enf = kwargs.get('enable_neighbor_fetch', False)
 
+                # Use fewer decode steps for CPU-offloaded contexts (very slow)
+                gen_len = 128 if use_cpu_offload else args.gen_length
+
                 res = benchmark_model(
                     attn_mode=mode,
                     prompt_length=ctx_len,
-                    gen_length=args.gen_length,
+                    gen_length=gen_len,
                     sparse_budget=sb,
                     predictor_path=pp,
                     oracle_random_indices=ori,
@@ -151,8 +179,27 @@ def main():
     parser.add_argument('--predictor-path', type=str, default='', help='Path to KeySifter weights (empty for random weights)')
     parser.add_argument('--output', type=str, default='decoding_time_vs_context.png', help='Output image file')
     parser.add_argument('--csv', type=str, default=f'decoding_time_vs_context_{int(time.time())}.csv', help='Output CSV file for incremental results')
+    parser.add_argument('--plot-only', action='store_true', help='Only generate plot from existing CSV (no benchmarking)')
 
     args = parser.parse_args()
+
+    if args.plot_only:
+        # Load results from CSV and plot without running benchmarks
+        results = {}
+        with open(args.csv, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('status') != 'success':
+                    continue
+                label = row['label']
+                if label not in results:
+                    results[label] = {'x': [], 'y': []}
+                results[label]['x'].append(int(row['context_length']))
+                results[label]['y'].append(float(row['avg_decode_time_ms']))
+        total_loaded = sum(len(v['x']) for v in results.values())
+        print(f"{colored(f'Loaded {total_loaded} results from {args.csv}', 'green')}")
+        plot_results(results, args.output)
+        return
 
     # Check if weights exist (only warn if path was explicitly provided)
     if args.predictor_path and not os.path.exists(args.predictor_path):

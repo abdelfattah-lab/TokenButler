@@ -37,6 +37,8 @@ class OracleCache:
         producer_frequency: int = 4, # Kept for API compatibility, unused
         random_indices: bool = True,
         page_size: int = 1,
+        predict_interval: int = 1,
+        enable_neighbor_fetch: bool = False,
     ) -> None:
         """
         Args:
@@ -50,6 +52,8 @@ class OracleCache:
             producer_frequency: Unused
             random_indices: If True, select random indices. If False, select first k contiguous indices.
             page_size: Size of contiguous pages to select randomly.
+            predict_interval: Refresh sparse selection every N decode steps (1 = every step).
+            enable_neighbor_fetch: Unused (for API compatibility).
         """
         self.config = config
         self.batch_size = batch_size
@@ -67,6 +71,8 @@ class OracleCache:
         self.producer_frequency = producer_frequency # Unused
         self.random_indices = random_indices
         self.page_size = page_size
+        self.predict_interval = predict_interval
+        self._cached_position_ids = None  # Cached position IDs for predict_interval > 1
         
         # Local window to always include (similar to ShadowKV)
         self.local_window = 32  # Always include last N tokens
@@ -256,24 +262,55 @@ class OracleCache:
         start_layer_idx: int,
     ):
         """
-        No-op for OracleCache since all data is already on GPU.
-        
-        Args:
-            hidden_states: [bsz, 1, hidden_size] - current hidden states (unused)
-            start_layer_idx: Starting layer index for this producer group (unused)
+        Pre-fill GPU buffer with sparse K/V for a group of layers.
+        Respects predict_interval: on skipped steps, buffer is reused as-is.
         """
-        pass
+        # Prediction stride: skip on non-stride tokens, reuse previous buffer
+        if self.predict_interval > 1 and self._cached_position_ids is not None:
+            non_dense_offset = self.gen_offset - 1
+            if non_dense_offset > 0 and non_dense_offset % self.predict_interval != 0:
+                return
+
+        # Generate new position IDs
+        dummy_query = torch.zeros(
+            self.batch_size, self.num_key_value_heads, 1, self.head_dim,
+            device=self.device, dtype=self.dtype
+        )
+        position_ids = self._generate_position_ids(dummy_query)
+
+        if self.predict_interval > 1:
+            self._cached_position_ids = position_ids
+
+        if position_ids.numel() == 0:
+            return
+
+        num_selected = position_ids.shape[-1]
+        index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+        sparse_start = self.local_window
+
+        consumer_start = start_layer_idx
+        consumer_end = min(start_layer_idx + self.producer_frequency, self.num_hidden_layers)
+
+        for layer_idx in range(consumer_start, consumer_end):
+            torch.gather(self.k_cache[layer_idx], dim=2, index=index,
+                         out=self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected])
+            torch.gather(self.v_cache[layer_idx], dim=2, index=index,
+                         out=self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected])
     
     def get_retrieval_position_ids(
         self,
         layer_idx: int,
         query_states: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Get position IDs for sparse attention - Random or First-K selection for Oracle.
-        """
+        """Return cached position IDs (buffer already filled by prefetch_layer_group)."""
+        return self._cached_position_ids if self._cached_position_ids is not None else torch.zeros(
+            query_states.shape[0], self.num_key_value_heads, 0, device=self.device, dtype=torch.long
+        )
+
+    def _generate_position_ids(self, query_states: torch.Tensor) -> torch.Tensor:
+        """Generate fresh position IDs for sparse attention."""
         bsz = query_states.shape[0]
-        
+
         if self.random_indices:
             # Random selection
             local_start = max(0, self.kv_offset - self.local_window)
@@ -332,7 +369,7 @@ class OracleCache:
             ).unsqueeze(0).unsqueeze(0).expand(bsz, self.num_key_value_heads, -1)
 
         return position_ids
-    
+
     def get_key_cache(
         self,
         layer_idx: int,
@@ -340,45 +377,17 @@ class OracleCache:
         rope_func: Callable = None,
         cos_sin_cache: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Gather selected keys from cache (already RoPEd).
-        Uses gather to simulate realistic sparse retrieval overhead.
-        """
+        """Return key cache from pre-filled buffer."""
         num_selected = position_ids.shape[-1]
-        
-        index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        sparse_start = self.local_window
-        
-        torch.gather(
-            self.k_cache[layer_idx],
-            dim=2,
-            index=index,
-            out=self.k_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
-        )
-        
         total_len = self.local_window + num_selected
         return self.k_cache_buffer[layer_idx, :, :, :total_len]
-    
+
     def get_value_cache(
         self,
         layer_idx: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Gather selected values from cache.
-        Uses gather to simulate realistic sparse retrieval overhead.
-        """
+        """Return value cache from pre-filled buffer."""
         num_selected = position_ids.shape[-1]
-        
-        index = position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        sparse_start = self.local_window
-        
-        torch.gather(
-            self.v_cache[layer_idx],
-            dim=2,
-            index=index,
-            out=self.v_cache_buffer[layer_idx, :, :, sparse_start:sparse_start + num_selected]
-        )
-        
         total_len = self.local_window + num_selected
         return self.v_cache_buffer[layer_idx, :, :, :total_len]
