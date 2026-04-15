@@ -3,7 +3,7 @@
 #
 # Evaluates on 10 datasets: N-S1, N-S2, N-MK1, N-MK2, N-MQ, N-MV, QA-1, QA-2, VT, FWE
 # Model: Llama-3.1-8B-Instruct
-# Context: 65K tokens, Sparse budget: 2048
+# Context: 64K tokens, Sparse budget: 8192
 #
 # Prerequisites:
 #   1. Download predictor weights: bash scripts/download_weights.sh
@@ -21,7 +21,7 @@ python test/eval_acc.py \
     --method KeySifter \
     --datalen 65536 \
     --dataset_name "$DATASETS" \
-    --sparse_budget 2048 \
+    --sparse_budget 8192 \
     --chunk_size 8 \
     --rank 160 \
     --predictor_path L3_8Bi_d16_i512_pf4.pt \

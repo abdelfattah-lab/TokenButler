@@ -458,7 +458,7 @@ class LLM:
                 start = i*prefill_chunk_size
                 end = (i+1)*prefill_chunk_size
                 output[:, start:end] = self.post_attention_compute(hidden_states[:, start:end], residual[:, start:end], buffer)
-            
+
             hidden_states = output
 
         else:

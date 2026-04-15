@@ -43,7 +43,7 @@ python test/eval_acc.py \
     --method KeySifter \
     --datalen 65536 \
     --dataset_name ruler/niah_single_1 \
-    --sparse_budget 2048 \
+    --sparse_budget 8192 \
     --chunk_size 8 \
     --rank 160 \
     --predictor_path L3_8Bi_d16_i512_pf4.pt \
@@ -56,7 +56,7 @@ python test/eval_acc.py \
 
 ### Accuracy on RULER Benchmark
 
-Evaluates TokenButler on 10 RULER datasets (N-S1, N-S2, N-MK1, N-MK2, N-MQ, N-MV, QA-1, QA-2, VT, FWE) with Llama-3.1-8B-Instruct at 65K context length:
+Evaluates TokenButler on 10 RULER datasets (N-S1, N-S2, N-MK1, N-MK2, N-MQ, N-MV, QA-1, QA-2, VT, FWE) with Llama-3.1-8B-Instruct at 64K context length:
 
 ```bash
 bash examples/tokenbutler_accuracy.sh

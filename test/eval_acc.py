@@ -113,6 +113,9 @@ def parse_args() -> Namespace:
     p.add_argument("--output_dir", type=str, default="",
                    help="Override output directory for result files. "
                         "If set, results are written here instead of the default archive/ path.")
+    p.add_argument("--prefill_chunk_size", type=int, default=0,
+                   help="Chunk size for chunked prefill to avoid OOM on long contexts. "
+                        "0 = no chunking (default). Recommended: 8192 for 48GB GPUs.")
 
     return p.parse_args()
 
@@ -156,6 +159,10 @@ if __name__ == '__main__':
               sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd,
               predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim,
               predict_interval=args.predict_interval, enable_neighbor_fetch=args.enable_neighbor_fetch)
+
+    # Enable chunked prefill if requested (to avoid OOM on long contexts)
+    if args.prefill_chunk_size > 0:
+        llm.set_prefill_chunk_size(args.prefill_chunk_size)
 
     # Set prefill_cont_dense on the kv_cache
     if args.no_prefill_cont_dense and hasattr(llm.kv_cache, 'prefill_cont_dense'):

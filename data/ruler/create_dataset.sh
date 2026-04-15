@@ -10,6 +10,7 @@
 
 # Model and Tokenizer
 SEQ_LENGTHS=(
+    32768
     65536
     131072
     262144
