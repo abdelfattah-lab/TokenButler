@@ -8,9 +8,11 @@ import sys
 CSV_FILE = 'test/output/efficiency_budget8K_1M/decoding_time_vs_context.csv'
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PREDICTOR = os.path.join(ROOT, 'L3_8Bi_d16_i512_pf4.pt')
-PYTHON = os.path.join(os.environ.get('CONDA_PREFIX', ''), 'bin', 'python')
+# Prefer the interpreter running this script (handles uv/venv cases where
+# CONDA_PREFIX may point to an unrelated system conda install).
+PYTHON = sys.executable
 if not os.path.exists(PYTHON):
-    PYTHON = sys.executable
+    PYTHON = os.path.join(os.environ.get('CONDA_PREFIX', ''), 'bin', 'python')
 
 # Load completed configs
 completed = set()
