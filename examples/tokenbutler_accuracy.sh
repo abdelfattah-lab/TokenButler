@@ -18,7 +18,7 @@ DATASETS="ruler/niah_single_1,ruler/niah_single_2,ruler/niah_multikey_1,ruler/ni
 
 python test/eval_acc.py \
     --model_name meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --method KeySifter \
+    --method TokenButler \
     --datalen 65536 \
     --dataset_name "$DATASETS" \
     --sparse_budget 8192 \
@@ -27,7 +27,7 @@ python test/eval_acc.py \
     --predictor_path L3_8Bi_d16_i512_pf4.pt \
     --dDash 16 \
     --producer_frequency 4 \
-    --keysifter_intermediate_dim 512
+    --tokenbutler_intermediate_dim 512
 
 echo ""
 echo "Results saved to archive/Meta-Llama-3.1-8B-Instruct/"

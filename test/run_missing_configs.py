@@ -14,6 +14,8 @@ PYTHON = sys.executable
 if not os.path.exists(PYTHON):
     PYTHON = os.path.join(os.environ.get('CONDA_PREFIX', ''), 'bin', 'python')
 
+CSV_HEADER = ['label', 'context_length', 'mode', 'decode_time_ms', 'status']
+
 # Load completed configs
 completed = set()
 if os.path.exists(CSV_FILE):
@@ -22,17 +24,21 @@ if os.path.exists(CSV_FILE):
         for row in reader:
             if row.get('status') == 'success':
                 completed.add((row['label'], int(row['context_length'])))
+else:
+    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+    with open(CSV_FILE, 'w', newline='') as f:
+        csv.writer(f).writerow(CSV_HEADER)
 
 print(f"Already completed: {len(completed)} configs")
 
 # All configs to run
 configs = [
     {'label': 'Dense', 'mode': 'full', 'mode_cpu': 'full_cpu', 'sparse_budget': 8192, 'predict_interval': 1, 'enable_neighbor_fetch': False, 'oracle_random_indices': True},
-    {'label': 'KeySifter (i=1)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'sparse_budget': 8192, 'predict_interval': 1, 'enable_neighbor_fetch': False, 'oracle_random_indices': True},
-    {'label': 'KeySifter (i=2+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'sparse_budget': 8192, 'predict_interval': 2, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
-    {'label': 'KeySifter (i=4+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'sparse_budget': 8192, 'predict_interval': 4, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
-    {'label': 'KeySifter (i=8+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'sparse_budget': 8192, 'predict_interval': 8, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
-    {'label': 'KeySifter (i=16+nb)', 'mode': 'keysifter', 'mode_cpu': 'keysifter_cpu', 'sparse_budget': 8192, 'predict_interval': 16, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
+    {'label': 'TokenButler (i=1)', 'mode': 'tokenbutler', 'mode_cpu': 'tokenbutler_cpu', 'sparse_budget': 8192, 'predict_interval': 1, 'enable_neighbor_fetch': False, 'oracle_random_indices': True},
+    {'label': 'TokenButler (i=2+nb)', 'mode': 'tokenbutler', 'mode_cpu': 'tokenbutler_cpu', 'sparse_budget': 8192, 'predict_interval': 2, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
+    {'label': 'TokenButler (i=4+nb)', 'mode': 'tokenbutler', 'mode_cpu': 'tokenbutler_cpu', 'sparse_budget': 8192, 'predict_interval': 4, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
+    {'label': 'TokenButler (i=8+nb)', 'mode': 'tokenbutler', 'mode_cpu': 'tokenbutler_cpu', 'sparse_budget': 8192, 'predict_interval': 8, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
+    {'label': 'TokenButler (i=16+nb)', 'mode': 'tokenbutler', 'mode_cpu': 'tokenbutler_cpu', 'sparse_budget': 8192, 'predict_interval': 16, 'enable_neighbor_fetch': True, 'oracle_random_indices': True},
     {'label': 'Oracle (random)', 'mode': 'oracle', 'mode_cpu': 'oracle_cpu', 'sparse_budget': 8192, 'predict_interval': 1, 'enable_neighbor_fetch': False, 'oracle_random_indices': True},
     {'label': 'Oracle (contiguous)', 'mode': 'oracle', 'mode_cpu': 'oracle_cpu', 'sparse_budget': 8192, 'predict_interval': 1, 'enable_neighbor_fetch': False, 'oracle_random_indices': False},
     {'label': 'Oracle (random, i=16)', 'mode': 'oracle', 'mode_cpu': 'oracle_cpu', 'sparse_budget': 8192, 'predict_interval': 16, 'enable_neighbor_fetch': False, 'oracle_random_indices': True},
@@ -60,7 +66,7 @@ for ctx_len in context_lengths:
 import sys
 sys.path.insert(0, '.')
 sys.path.insert(0, 'test')
-from benchmark_keysifter import benchmark_model
+from benchmark_tokenbutler import benchmark_model
 
 res = benchmark_model(
     attn_mode='{mode}',

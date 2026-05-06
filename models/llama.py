@@ -33,7 +33,7 @@ from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_si
 from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
 from .merge_configs import generate_consecutive_palu_config
-from .keysifter_predictor import load_keysifter_predictor
+from .tokenbutler_predictor import load_tokenbutler_predictor
 
 class LlamaLayer:
     def __init__(self, layer_idx) -> None:
@@ -99,13 +99,13 @@ class Llama(LLM):
         rank_v: int = 576,
         fake_svd: bool = False,
         profile_layers: int = 0,
-        # KeySifter
+        # TokenButler
         predictor_path: str = "",
         dDash: int = 16,
         producer_frequency: int = 4,
-        keysifter_intermediate_dim: int = 1024,
-        local_window: int = 512,  # Number of recent tokens to always keep (matching KeySifter baseline)
-        min_sparse_index: int = 128,  # Number of sink tokens to always keep (matching KeySifter baseline)
+        tokenbutler_intermediate_dim: int = 1024,
+        local_window: int = 512,  # Number of recent tokens to always keep (matching TokenButler baseline)
+        min_sparse_index: int = 128,  # Number of sink tokens to always keep (matching TokenButler baseline)
         quantize_int8: bool = False,  # Enable INT8 quantization for k_proj_cache
         predict_interval: int = 1,  # Predict important tokens every N decode tokens (1 = baseline)
         enable_neighbor_fetch: bool = False,  # Enable neighbor fetching with 2x sparse buffer
@@ -160,17 +160,17 @@ class Llama(LLM):
 
         self.fake_svd = fake_svd
         
-        # Initialize KeySifter predictor if needed
-        self.keysifter_predictor = None
+        # Initialize TokenButler predictor if needed
+        self.tokenbutler_predictor = None
         self.producer_frequency = producer_frequency
-        if attn_mode.lower() in ('keysifter', 'keysifter_cpu'):
-            self.keysifter_predictor = load_keysifter_predictor(
+        if attn_mode.lower() in ('tokenbutler', 'tokenbutler_cpu', 'hisparse_tokenbutler', 'hisparse_tokenbutler_cpu'):
+            self.tokenbutler_predictor = load_tokenbutler_predictor(
                 config=self.config,
                 predictor_path=predictor_path,
                 num_heads=self.num_heads,  # Use attention heads (not KV heads) to match training
                 producer_frequency=producer_frequency,
                 dDash=dDash,
-                intermediate_dim=keysifter_intermediate_dim,
+                intermediate_dim=tokenbutler_intermediate_dim,
                 device=device,
                 dtype=dtype,
             )
@@ -181,7 +181,7 @@ class Llama(LLM):
             self.config,
             rank=rank,
             merge_config=self.merge_config,
-            keysifter_predictor=self.keysifter_predictor,
+            tokenbutler_predictor=self.tokenbutler_predictor,
             producer_frequency=producer_frequency,
             dDash=dDash,
             oracle_random_indices=oracle_random_indices,

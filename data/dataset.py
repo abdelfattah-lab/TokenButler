@@ -279,7 +279,7 @@ class Dataset:
                 return tokenized_prompts, gt
             else:
                 for i in range(self.num_samples):
-                    # Check for explicit context/query fields first (KeySifter approach)
+                    # Check for explicit context/query fields first (TokenButler approach)
                     if 'context' in dataset[i] and 'query' in dataset[i]:
                         context = dataset[i]['context']
                         query = dataset[i]['query']

@@ -1,8 +1,8 @@
 ################################################################################
 #
-# KeySifter Predictor Integration for xKV
+# TokenButler Predictor Integration for xKV
 # 
-# This module ports the TokenImportancePredictorAttentive from KeySifter
+# This module ports the TokenImportancePredictorAttentive from TokenButler
 # for use with the xKV sparse attention system.
 #
 ################################################################################
@@ -14,7 +14,7 @@ import math
 from typing import Optional, Tuple
 
 
-class KeySifterPredictor(nn.Module):
+class TokenButlerPredictor(nn.Module):
     """
     Token importance predictor that learns to predict which KV cache tokens 
     are most relevant for a given query, enabling sparse attention during decode.
@@ -76,7 +76,7 @@ class KeySifterPredictor(nn.Module):
         self.num_key_value_groups = num_heads // self.num_key_value_heads
 
         # --- IMPORTANT ---
-        # Baseline KeySifter has one predictor *per producer layer* (layers 0, G, 2G, ...),
+        # Baseline TokenButler has one predictor *per producer layer* (layers 0, G, 2G, ...),
         # i.e. Q-MLP weights are *not* shared across producers.
         # Your previous xKV port loaded only producer 0 weights → large accuracy drop.
         self.producer_frequency = self.num_hidden_layers
@@ -238,7 +238,7 @@ class KeySifterPredictor(nn.Module):
         return importance_scores
 
 
-def load_keysifter_predictor(
+def load_tokenbutler_predictor(
     config,
     predictor_path: str,
     num_heads: int,
@@ -247,11 +247,11 @@ def load_keysifter_predictor(
     intermediate_dim: int = 512,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
-) -> KeySifterPredictor:
+) -> TokenButlerPredictor:
     """
-    Load a trained KeySifter predictor from checkpoint.
+    Load a trained TokenButler predictor from checkpoint.
     
-    The checkpoint format from KeySifter training is:
+    The checkpoint format from TokenButler training is:
     {
         'model_state_dict': [  # List of state_dicts, one per producer layer
             {  # Producer layer 0 (serves layers 0, 1, 2, 3)
@@ -279,9 +279,9 @@ def load_keysifter_predictor(
         dtype: Data type
         
     Returns:
-        Initialized KeySifterPredictor with loaded weights
+        Initialized TokenButlerPredictor with loaded weights
     """
-    predictor = KeySifterPredictor(
+    predictor = TokenButlerPredictor(
         config=config,
         pred_hid_size=config.hidden_size,
         num_heads=num_heads,
@@ -301,7 +301,7 @@ def load_keysifter_predictor(
         else:
             # Assume it's a direct state_dict
             predictor.load_state_dict(checkpoint, strict=False)
-            print(f"Loaded KeySifter predictor from {predictor_path}")
+            print(f"Loaded TokenButler predictor from {predictor_path}")
             predictor = predictor.to(device).to(dtype)
             predictor.eval()
             return predictor
@@ -424,9 +424,9 @@ def load_keysifter_predictor(
         
         # Assign aggregated key_cache_proj
         predictor.key_cache_proj.data.copy_(merged_key_proj)
-        print(f"Loaded KeySifter predictor from {predictor_path}")
+        print(f"Loaded TokenButler predictor from {predictor_path}")
     else:
-        print("Initialized KeySifter predictor with random weights")
+        print("Initialized TokenButler predictor with random weights")
     
     predictor = predictor.to(device).to(dtype)
     predictor.eval()

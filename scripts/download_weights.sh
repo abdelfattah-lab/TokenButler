@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WEIGHTS_FILE="L3_8Bi_d16_i512_pf4.pt"
-REPO_ID="AhmedAE/xKV-Llama-3.1-8B-Instruct"
+REPO_ID="Alwahsh/Meta-Llama-3.1-8B-Instruct-Butler"
 
 if [ -f "$WEIGHTS_FILE" ]; then
     echo "Weights already exist at $WEIGHTS_FILE"

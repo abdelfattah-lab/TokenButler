@@ -16,7 +16,7 @@ class OracleCache:
     """
     Oracle KV Cache for benchmarking upper bound performance.
     
-    This class mimics the interface of KeySifterCache/ShadowKV but skips:
+    This class mimics the interface of TokenButlerCache/ShadowKV but skips:
         - Key projection
         - Importance scoring
         - Predictor usage

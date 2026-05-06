@@ -115,7 +115,7 @@ def score_int8_kernel(
     tl.store(out_ptrs, scores.to(Out_ptr.dtype.element_ty), mask=mask_n)
 
 
-def keysifter_score_int8_triton(q, k, dDash=16):
+def tokenbutler_score_int8_triton(q, k, dDash=16):
     """
     Compute dot product scores between Q and K using Triton Int8 kernel.
     

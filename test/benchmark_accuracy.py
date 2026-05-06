@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Accuracy benchmark for KeySifter configurations.
+Accuracy benchmark for TokenButler configurations.
 
 Runs three configs (baseline, interval=8, interval=8+neighbor) across RULER
 datasets and prints a comparison table.
@@ -73,7 +73,7 @@ CONFIGS = {
 
 # Fixed model/eval params
 MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-METHOD = "KeySifter"
+METHOD = "TokenButler"
 DATALEN = 32768
 SPARSE_BUDGET = 2048
 CHUNK_SIZE = 8
@@ -113,7 +113,7 @@ def run_config(config_name, config, num_samples, output_dir, datasets):
         "--group_size", str(GROUP_SIZE),
         "--dDash", str(DDASH),
         "--producer_frequency", str(PRODUCER_FREQ),
-        "--keysifter_intermediate_dim", str(INTERMEDIATE_DIM),
+        "--tokenbutler_intermediate_dim", str(INTERMEDIATE_DIM),
         "--predictor_path", PREDICTOR_PATH,
         "--predict_interval", str(config["predict_interval"]),
     ]
@@ -188,7 +188,7 @@ def print_table(results, total_elapsed, datasets):
 
     # Header
     print(f"\n{'='*80}")
-    print(f"  KeySifter Accuracy Benchmark Results")
+    print(f"  TokenButler Accuracy Benchmark Results")
     print(f"{'='*80}\n")
 
     header = f"| {'Dataset':<18} |"
@@ -226,7 +226,7 @@ def print_table(results, total_elapsed, datasets):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark KeySifter accuracy across configurations")
+    parser = argparse.ArgumentParser(description="Benchmark TokenButler accuracy across configurations")
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode: 15 samples per dataset")
     parser.add_argument("--num_samples", type=int, default=-1,
@@ -297,7 +297,7 @@ def main():
     # Save the table data as MD file
     md_path = output_dir / "results.md"
     with open(md_path, "w") as f:
-        f.write(f"# KeySifter Accuracy Benchmark Results\n\n")
+        f.write(f"# TokenButler Accuracy Benchmark Results\n\n")
         f.write(f"**Model:** {MODEL_NAME}\n\n")
         f.write(f"**Method:** {METHOD}\n\n")
         f.write(f"**Datasets:** {', '.join([ds.replace('ruler/', '') for ds in datasets])}\n\n")

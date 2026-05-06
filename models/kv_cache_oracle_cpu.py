@@ -33,7 +33,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         - Gather only selected K/V from CPU to GPU buffer (sparse transfer)
         - Run attention on GPU buffer
         
-    This class mimics the interface of KeySifterCache_CPU but skips:
+    This class mimics the interface of TokenButlerCache_CPU but skips:
         - Key projection
         - Importance scoring
         - Predictor usage
@@ -362,7 +362,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
             hidden_states: [bsz, 1, hidden_size] - current hidden states (unused for Oracle)
             start_layer_idx: Starting layer index for this producer group
         """
-        # Layer 0 uses full dense attention (matching KeySifter CPU behavior).
+        # Layer 0 uses full dense attention (matching TokenButler CPU behavior).
         # Other layers use sparse selection.
 
         # Prediction stride: skip on non-stride tokens, reuse previous buffer.
@@ -423,7 +423,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         """
         Get key cache for attention computation.
 
-        Layer 0: full dense cache transferred from CPU (matching KeySifter CPU).
+        Layer 0: full dense cache transferred from CPU (matching TokenButler CPU).
         Other layers: sparse attention from GPU buffer.
         """
         kv_len = self.kv_offset
@@ -445,7 +445,7 @@ class OracleCache_CPU(CPUOffloadCacheBase):
         """
         Get value cache for attention computation.
 
-        Layer 0: full dense cache transferred from CPU (matching KeySifter CPU).
+        Layer 0: full dense cache transferred from CPU (matching TokenButler CPU).
         Other layers: sparse attention from GPU buffer.
         """
         kv_len = self.kv_offset

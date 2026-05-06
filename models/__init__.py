@@ -19,8 +19,8 @@ from .glm import GLM
 from .llama import Llama
 from .qwen import Qwen2
 from .phi3 import Phi3
-from .keysifter_predictor import KeySifterPredictor, load_keysifter_predictor
-from .kv_cache_keysifter import KeySifterCache
+from .tokenbutler_predictor import TokenButlerPredictor, load_tokenbutler_predictor
+from .kv_cache_tokenbutler import TokenButlerCache
 from .kv_cache_dsa import DSACache, LightningIndexer
 
 def choose_model_class(model_name):

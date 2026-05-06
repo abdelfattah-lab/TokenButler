@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark KeySifter vs Full Attention for runtime efficiency.
+Benchmark TokenButler vs Full Attention for runtime efficiency.
 Tests prefill and decode performance across different sequence lengths.
 """
 
@@ -37,14 +37,14 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
         'attn_mode': attn_mode,
     }
 
-    if attn_mode == 'keysifter':
+    if attn_mode == 'tokenbutler':
         model_kwargs.update({
             'sparse_budget': sparse_budget,
             'chunk_size': 8,
             'rank': 160,
             'dDash': 16,
             'producer_frequency': 4,
-            'keysifter_intermediate_dim': 512,
+            'tokenbutler_intermediate_dim': 512,
             'predictor_path': predictor_path,
             'predict_interval': predict_interval,
             'enable_neighbor_fetch': enable_neighbor_fetch,
@@ -258,25 +258,25 @@ def benchmark_model(attn_mode, prompt_length, gen_length, sparse_budget=512, pre
 
 
 def plot_decode_breakdown(results_list, output_file='decode_breakdown.png'):
-    """Plot decode stage time breakdown for KeySifter."""
-    # Filter for KeySifter or Oracle results
+    """Plot decode stage time breakdown for TokenButler."""
+    # Filter for TokenButler or Oracle results
     # Oracle results might not have detailed sample info if we skipped predictor, 
     # but let's see if we added sample collection logic for it. The benchmark_model code collects samples regardless of mode.
     # So both should have sample_info.
-    keysifter_results = [r for r in results_list 
-                         if (r['attn_mode'] == 'keysifter' or r['attn_mode'] == 'oracle') and r.get('sample_info')]
+    tokenbutler_results = [r for r in results_list 
+                         if (r['attn_mode'] == 'tokenbutler' or r['attn_mode'] == 'oracle') and r.get('sample_info')]
     
-    if not keysifter_results:
-        print("No KeySifter results with timing breakdown found.")
+    if not tokenbutler_results:
+        print("No TokenButler results with timing breakdown found.")
         return
     
     # Create figure with subplots
-    n_configs = len(keysifter_results)
+    n_configs = len(tokenbutler_results)
     fig, axes = plt.subplots(1, n_configs, figsize=(6*n_configs, 5))
     if n_configs == 1:
         axes = [axes]
     
-    for idx, result in enumerate(keysifter_results):
+    for idx, result in enumerate(tokenbutler_results):
         ax = axes[idx]
         sample_info = result['sample_info']
         
@@ -292,7 +292,7 @@ def plot_decode_breakdown(results_list, output_file='decode_breakdown.png'):
         h2d_ms = result.get('kv_h2d_time', 0) * 1000
         
         # Create bar chart
-        components = ['get_ctx\n(KeySifter)', 'inference\n(Model)', 'overhead']
+        components = ['get_ctx\n(TokenButler)', 'inference\n(Model)', 'overhead']
         times = [get_ctx_ms, inference_ms, overhead_ms]
         colors = ['#FF6B6B', '#4ECDC4', '#95E1D3']
         
@@ -382,10 +382,10 @@ def print_comparison(results_list):
 
 def main():
     print(colored("="*80, 'cyan'))
-    print(colored("KeySifter vs Full Attention - Runtime Efficiency Benchmark", 'cyan', attrs=['bold']))
+    print(colored("TokenButler vs Full Attention - Runtime Efficiency Benchmark", 'cyan', attrs=['bold']))
     print(colored("="*80, 'cyan'))
 
-    # Path to trained KeySifter weights
+    # Path to trained TokenButler weights
     weights_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'L3_8Bi_d16_i512_pf4.pt')
 
     # Test configurations
@@ -413,12 +413,12 @@ def main():
         # Wait a bit between tests
         time.sleep(2)
 
-        # Test KeySifter with trained weights
+        # Test TokenButler with trained weights
         try:
-            result = benchmark_model('keysifter', prompt_len, gen_len, sparse_budget=1024, predictor_path=weights_path)
+            result = benchmark_model('tokenbutler', prompt_len, gen_len, sparse_budget=1024, predictor_path=weights_path)
             all_results.append(result)
         except Exception as e:
-            print(f"KeySifter failed: {e}")
+            print(f"TokenButler failed: {e}")
 
         # Test Oracle (Random)
         try:

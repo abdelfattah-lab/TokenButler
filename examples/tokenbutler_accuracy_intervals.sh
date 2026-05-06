@@ -5,7 +5,7 @@
 # Intervals > 1 use neighbor fetching for improved accuracy.
 #
 # Model: Llama-3.1-8B-Instruct
-# Context: 65K tokens, Sparse budget: 2048
+# Context: 65K tokens, Sparse budget: 8192
 #
 # Prerequisites:
 #   1. Download predictor weights: bash scripts/download_weights.sh
@@ -19,16 +19,16 @@ cd "$(dirname "$0")/.."
 DATASETS="ruler/niah_single_1,ruler/niah_single_2,ruler/niah_multikey_1,ruler/niah_multikey_2,ruler/niah_multiquery,ruler/niah_multivalue,ruler/qa_1,ruler/qa_2,ruler/vt,ruler/fwe"
 
 COMMON_ARGS="--model_name meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --method KeySifter \
+    --method TokenButler \
     --datalen 65536 \
     --dataset_name $DATASETS \
-    --sparse_budget 2048 \
+    --sparse_budget 8192 \
     --chunk_size 8 \
     --rank 160 \
     --predictor_path L3_8Bi_d16_i512_pf4.pt \
     --dDash 16 \
     --producer_frequency 4 \
-    --keysifter_intermediate_dim 512"
+    --tokenbutler_intermediate_dim 512"
 
 echo "=== Interval 1 (baseline, no neighbor fetch) ==="
 python test/eval_acc.py $COMMON_ARGS --predict_interval 1

@@ -6,7 +6,7 @@ Faithful to the original DeepSeek-V3.2 design:
 - Each layer selects its own top-k tokens (no cross-layer sharing)
 - Single global ranking per layer (shared across all attention heads)
 
-Buffer layout (same as KeySifterCache):
+Buffer layout (same as TokenButlerCache):
   [sink_tokens | local_window (circular) | sparse_selected]
 """
 
@@ -85,7 +85,7 @@ class DSACache:
     """
     DeepSeek Sparse Attention KV cache — faithful to original design.
 
-    Key differences from KeySifterCache:
+    Key differences from TokenButlerCache:
     - Per-layer indexer (every layer runs its own scoring independently)
     - No producer/consumer grouping for selection
     - Each layer has its own indexer key cache and selects its own top-k

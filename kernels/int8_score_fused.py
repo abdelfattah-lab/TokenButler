@@ -1,5 +1,5 @@
 """
-Fused INT8 Scoring Kernel for KeySifter
+Fused INT8 Scoring Kernel for TokenButler
 
 This kernel loads INT8 K values, dequantizes on-the-fly, and computes dot products
 with Q values, avoiding the creation of a full bfloat16 copy of K.
@@ -149,7 +149,7 @@ def test_score_int8_fused():
 
     print("Testing fused INT8 score kernel...")
 
-    # Test dimensions matching KeySifter
+    # Test dimensions matching TokenButler
     B, L, H, G, D = 1, 4, 8, 4, 16
     Limit = 32000
 

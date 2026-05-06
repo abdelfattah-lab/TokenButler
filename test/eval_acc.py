@@ -96,11 +96,11 @@ def parse_args() -> Namespace:
     p.add_argument("--rank_k", type=int, default=96)
     p.add_argument("--rank_v", type=int, default=144)
     p.add_argument("--fake_svd", action='store_true', help="Use fake SVD.")
-    # KeySifter args
-    p.add_argument("--predictor_path", type=str, default="", help="Path to KeySifter predictor weights (.pt file)")
-    p.add_argument("--dDash", type=int, default=32, help="Reduced dimension for KeySifter importance computation")
-    p.add_argument("--producer_frequency", type=int, default=4, help="Number of layers served by one KeySifter predictor")
-    p.add_argument("--keysifter_intermediate_dim", type=int, default=512, help="KeySifter MLP intermediate dimension")
+    # TokenButler args
+    p.add_argument("--predictor_path", type=str, default="", help="Path to TokenButler predictor weights (.pt file)")
+    p.add_argument("--dDash", type=int, default=32, help="Reduced dimension for TokenButler importance computation")
+    p.add_argument("--producer_frequency", type=int, default=4, help="Number of layers served by one TokenButler predictor")
+    p.add_argument("--tokenbutler_intermediate_dim", type=int, default=512, help="TokenButler MLP intermediate dimension")
     p.add_argument("--predict_interval", type=int, default=1, help="Predict important tokens every N decode tokens (1=every token, baseline)")
     p.add_argument("--enable_neighbor_fetch", action='store_true', default=False, help="Enable neighbor fetching with 2x sparse buffer")
     p.add_argument("--force_query_prediction", action='store_true', default=False, help="Force prediction at the start of each new query in multi-turn (refreshes sparse selection immediately)")
@@ -116,6 +116,9 @@ def parse_args() -> Namespace:
     p.add_argument("--prefill_chunk_size", type=int, default=0,
                    help="Chunk size for chunked prefill to avoid OOM on long contexts. "
                         "0 = no chunking (default). Recommended: 8192 for 48GB GPUs.")
+    # HiSparse args
+    p.add_argument("--page_size", type=int, default=1,
+                   help="Page size for HiSparse page-wise selection. 1 = token-wise (default).")
 
     return p.parse_args()
 
@@ -139,7 +142,7 @@ if __name__ == '__main__':
     predictor_path = args.predictor_path
     dDash = args.dDash
     producer_frequency = args.producer_frequency
-    keysifter_intermediate_dim = args.keysifter_intermediate_dim
+    tokenbutler_intermediate_dim = args.tokenbutler_intermediate_dim
 
     seed_everything(42)
     dist_config = init_dist()
@@ -157,8 +160,8 @@ if __name__ == '__main__':
 
     llm = LLM(model_name=model_name, batch_size=batch_size, device=dist_config.device, max_length=datalen+2048, attn_mode=args.method, dtype=dtype,
               sparse_budget=sparse_budget, chunk_size=chunk_size, rank=rank, minference=minference, rank_k=rank_k, rank_v=rank_v, group_size=group_size, fake_svd=fake_svd,
-              predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, keysifter_intermediate_dim=keysifter_intermediate_dim,
-              predict_interval=args.predict_interval, enable_neighbor_fetch=args.enable_neighbor_fetch)
+              predictor_path=predictor_path, dDash=dDash, producer_frequency=producer_frequency, tokenbutler_intermediate_dim=tokenbutler_intermediate_dim,
+              predict_interval=args.predict_interval, enable_neighbor_fetch=args.enable_neighbor_fetch, page_size=args.page_size)
 
     # Enable chunked prefill if requested (to avoid OOM on long contexts)
     if args.prefill_chunk_size > 0:

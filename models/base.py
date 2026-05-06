@@ -32,8 +32,8 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 from .kv_cache_xkv import ShadowKVCache_xKey, ShadowKVCache_xKV, ShadowKVCache_xKey_CPU, ShadowKVCache_xKV_CPU
-from .kv_cache_keysifter import KeySifterCache
-from .kv_cache_keysifter_cpu import KeySifterCache_CPU
+from .kv_cache_tokenbutler import TokenButlerCache
+from .kv_cache_tokenbutler_cpu import TokenButlerCache_CPU
 from .kv_cache_cpu import KV_Cache_CPU
 from .kv_cache_oracle import OracleCache
 from .kv_cache_oracle_cpu import OracleCache_CPU
@@ -60,7 +60,7 @@ class LLM:
         """
         self.prefill_chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
 
-    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, keysifter_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096, predict_interval: int = 1, enable_neighbor_fetch: bool = False):
+    def init_kv_cache(self, sparse_budget: int, chunk_size: int, config, rank: int, merge_config: xKVConfig, tokenbutler_predictor=None, producer_frequency: int = 4, dDash: int = 16, oracle_random_indices: bool = True, page_size: int = 1, local_window: int = 512, min_sparse_index: int = 128, quantize_int8: bool = False, cpu_chunk_size: int = 4096, predict_interval: int = 1, enable_neighbor_fetch: bool = False):
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -75,12 +75,12 @@ class LLM:
             self.kv_cache = ShadowKVCache_xKey_CPU(config, merge_config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, chunk_size=chunk_size)
         elif self.attn_mode.lower() == 'shadowkv_xkv_cpu':
             self.kv_cache = ShadowKVCache_xKV_CPU(config, merge_config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size, sparse_budget=sparse_budget, chunk_size=chunk_size)
-        elif self.attn_mode.lower() == 'keysifter':
-            if keysifter_predictor is None:
-                raise ValueError("KeySifter mode requires a predictor. Pass keysifter_predictor to init_kv_cache.")
-            self.kv_cache = KeySifterCache(
+        elif self.attn_mode.lower() == 'tokenbutler':
+            if tokenbutler_predictor is None:
+                raise ValueError("TokenButler mode requires a predictor. Pass tokenbutler_predictor to init_kv_cache.")
+            self.kv_cache = TokenButlerCache(
                 config,
-                predictor=keysifter_predictor,
+                predictor=tokenbutler_predictor,
                 max_length=self.max_length,
                 device=self.device,
                 dtype=self.dtype,
@@ -93,6 +93,50 @@ class LLM:
                 quantize_int8=quantize_int8,
                 predict_interval=predict_interval,
                 enable_neighbor_fetch=enable_neighbor_fetch,
+            )
+        elif self.attn_mode.lower() == 'hisparse_tokenbutler':
+            if tokenbutler_predictor is None:
+                raise ValueError("HiSparseTokenButler mode requires a predictor. Pass tokenbutler_predictor to init_kv_cache.")
+            from sglang_hisparse.hisparse_cache import HiSparseTokenButlerCache
+            self.kv_cache = HiSparseTokenButlerCache(
+                config,
+                predictor=tokenbutler_predictor,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
+                quantize_int8=quantize_int8,
+                predict_interval=predict_interval,
+                enable_neighbor_fetch=enable_neighbor_fetch,
+                page_size=page_size,
+                share_pages_across_heads=True,
+            )
+        elif self.attn_mode.lower() == 'hisparse_tokenbutler_cpu':
+            if tokenbutler_predictor is None:
+                raise ValueError("HiSparseTokenButler_CPU mode requires a predictor. Pass tokenbutler_predictor to init_kv_cache.")
+            from sglang_hisparse.hisparse_cache_cpu import HiSparseTokenButlerCache_CPU
+            self.kv_cache = HiSparseTokenButlerCache_CPU(
+                config,
+                predictor=tokenbutler_predictor,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
+                chunk_size=chunk_size,
+                producer_frequency=producer_frequency,
+                local_window=local_window,
+                min_sparse_index=min_sparse_index,
+                quantize_int8=quantize_int8,
+                predict_interval=predict_interval,
+                enable_neighbor_fetch=enable_neighbor_fetch,
+                page_size=page_size,
+                share_pages_across_heads=True,
             )
         elif self.attn_mode.lower() == 'dsa':
             from models.kv_cache_dsa import DSACache, LightningIndexer
@@ -131,12 +175,12 @@ class LLM:
                 page_size=page_size,
                 predict_interval=predict_interval,
             )
-        elif self.attn_mode.lower() == 'keysifter_cpu':
-            if keysifter_predictor is None:
-                raise ValueError("KeySifter CPU mode requires a predictor. Pass keysifter_predictor to init_kv_cache.")
-            self.kv_cache = KeySifterCache_CPU(
+        elif self.attn_mode.lower() == 'tokenbutler_cpu':
+            if tokenbutler_predictor is None:
+                raise ValueError("TokenButler CPU mode requires a predictor. Pass tokenbutler_predictor to init_kv_cache.")
+            self.kv_cache = TokenButlerCache_CPU(
                 config,
-                predictor=keysifter_predictor,
+                predictor=tokenbutler_predictor,
                 max_length=self.max_length,
                 device=self.device,
                 dtype=self.dtype,
@@ -246,7 +290,7 @@ class LLM:
 
     @torch.inference_mode()
     def prefill_cont(self, input_ids: torch.LongTensor):
-        if isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+        if isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
             # Process tokens one by one to maintain causality.
             # The decode path's update_kv_cache + flash_attn_with_kvcache assumes single-token input;
             # batching multiple tokens causes q[0] to attend to future tokens via k_cache.
@@ -318,15 +362,15 @@ class LLM:
         elif isinstance(self.kv_cache, ShadowKVCache) or isinstance(self.kv_cache, ShadowKVCache_CPU) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey) or isinstance(self.kv_cache, ShadowKVCache_xKV) or \
              isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU) or \
-             isinstance(self.kv_cache, KeySifterCache) or isinstance(self.kv_cache, KeySifterCache_CPU) or \
+             isinstance(self.kv_cache, TokenButlerCache) or isinstance(self.kv_cache, TokenButlerCache_CPU) or \
              isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU) or \
              isinstance(self.kv_cache, DSACache):
 
-            # Prefill: use for long sequences OR first pass of short sequences with KeySifter/Oracle/DSA
+            # Prefill: use for long sequences OR first pass of short sequences with TokenButler/Oracle/DSA
             # NOTE: When using chunked prefill, each chunk goes through this prefill path separately.
             # The decode path below (q_len == 1) is completely unaffected by chunking.
-            is_keysifter_first_pass = (isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache))) and self.kv_cache.prefill_len == 0
-            if q_len > 1024 or is_keysifter_first_pass: # prefill
+            is_tokenbutler_first_pass = (isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache))) and self.kv_cache.prefill_len == 0
+            if q_len > 1024 or is_tokenbutler_first_pass: # prefill
                 with self._maybe_record_function("batch_prefill"):
                     # svd unrope key and save
                     if isinstance(self.kv_cache, ShadowKVCache_xKey):
@@ -335,7 +379,7 @@ class LLM:
                         self.kv_cache.get_svd(key_states, value_states, layer_idx, fake_svd=self.fake_svd)
                     elif isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                         self.kv_cache.get_svd(key_states, value_states, layer_idx)
-                    elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+                    elif isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
                         # Store un-RoPEd keys and compute projections of keys for importance scoring (skipped for Oracle/DSA)
                         self.kv_cache.get_svd(key_states, layer_idx)
                     else:
@@ -357,16 +401,16 @@ class LLM:
                 with self._maybe_record_function("update_kv_cache"):
                     self.kv_cache.update_kv_cache(key_states, value_states, layer_idx)
 
-                # KeySifter: compute importance queries and refetch for layer group at producer layers
+                # TokenButler: compute importance queries and refetch for layer group at producer layers
                 # Note: layer 0 also needs to run predictor for layers 1-3, so don't skip it here
                 if isinstance(self.kv_cache, DSACache):
                     # DSA: run indexer at every layer (faithful to original DSA paper)
                     with self._maybe_record_function("dsa_prefetch"):
                         self.kv_cache.prefetch_single_layer(residual, layer_idx)
-                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU)):
+                elif isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU)):
                     producer_frequency = self.kv_cache.producer_frequency
                     if layer_idx % producer_frequency == 0:
-                        with self._maybe_record_function("keysifter_prefetch"):
+                        with self._maybe_record_function("tokenbutler_prefetch"):
                             # hidden_states here is the residual (pre-attention), we need to pass it
                             self.kv_cache.prefetch_layer_group(residual, layer_idx)
                 elif isinstance(self.kv_cache, OracleCache) or isinstance(self.kv_cache, OracleCache_CPU):
@@ -381,15 +425,15 @@ class LLM:
                     position_ids = self.kv_cache.get_retrieval_position_ids(layer_idx=layer_idx, query_states=query_states)
 
                 # multi-stream
-                if not isinstance(self.kv_cache, (ShadowKVCache_xKV_CPU, KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+                if not isinstance(self.kv_cache, (ShadowKVCache_xKV_CPU, TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
                     curr_stream = torch.cuda.current_stream()
                     get_value_stream = self.kv_cache.copy_stream
 
                 if isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_value_cache_xKV_cpu"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids, self.cos_sin_cache)
-                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
-                    with self._maybe_record_function("get_value_cache_keysifter_or_oracle"):
+                elif isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+                    with self._maybe_record_function("get_value_cache_tokenbutler_or_oracle"):
                         value_states = self.kv_cache.get_value_cache(layer_idx, position_ids)
                 else:
                     with self._maybe_record_function("get_value_cache_offload_stream"):
@@ -401,8 +445,8 @@ class LLM:
                 if isinstance(self.kv_cache, ShadowKVCache_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKey_CPU) or isinstance(self.kv_cache, ShadowKVCache_xKV_CPU):
                     with self._maybe_record_function("get_key_cache"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single, cos_sin_cache=self.cos_sin_cache)
-                elif isinstance(self.kv_cache, (KeySifterCache, KeySifterCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
-                    with self._maybe_record_function("get_key_cache_keysifter_or_oracle"):
+                elif isinstance(self.kv_cache, (TokenButlerCache, TokenButlerCache_CPU, OracleCache, OracleCache_CPU, DSACache)):
+                    with self._maybe_record_function("get_key_cache_tokenbutler_or_oracle"):
                         key_states = self.kv_cache.get_key_cache(layer_idx=layer_idx, position_ids=position_ids, rope_func=self.apply_rotary_pos_emb_single)
                 else:
                     with self._maybe_record_function("get_key_cache"):
